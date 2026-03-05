@@ -62,6 +62,10 @@ Usage
 #include "pimpleSingleRegionControl.H"
 #include "setDeltaT.H"
 
+#ifdef FOAM_USE_DMR
+    #include "foamDmr.H"
+#endif
+
 using namespace Foam;
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
@@ -76,6 +80,20 @@ int main(int argc, char *argv[])
     );
 
     #include "setRootCase.H"
+
+    #ifdef FOAM_USE_DMR
+    // --- DMR: Initialize dynamic resource management ---
+    // On first run (reconfig_count == 0): does nothing special.
+    // On restart (reconfig_count > 0): OpenFOAM handles restart via
+    // "startFrom latestTime" in controlDict.
+    DMR_AUTO(
+        dmr_init(argc, argv),
+        (void)NULL,                 // checkpoint: not needed at init
+        (void)NULL,                 // restart: OpenFOAM handles via latestTime
+        (void)NULL                  // finalize: not needed at init
+    );
+    #endif
+
     #include "createTime.H"
 
     // Read the solverName from the optional solver entry in controlDict
@@ -116,6 +134,28 @@ int main(int argc, char *argv[])
     setDeltaT(runTime, solver);
 
     // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+    #ifdef FOAM_USE_DMR
+    // --- DMR: Configure policy bounds (read from controlDict) ---
+    const label dmrMinNodes =
+        runTime.controlDict().lookupOrDefault("dmrMinNodes", 1);
+    const label dmrMaxNodes =
+        runTime.controlDict().lookupOrDefault("dmrMaxNodes", 1);
+
+    dmr_set_policy_min_nodes(dmrMinNodes);
+    dmr_set_policy_max_nodes(dmrMaxNodes);
+
+    Info<< "DMR: policy min=" << dmrMinNodes
+        << " max=" << dmrMaxNodes << nl;
+
+    // How often to check for reconfiguration (in time steps)
+    const label dmrCheckInterval =
+        runTime.controlDict().lookupOrDefault("dmrCheckInterval", 100);
+
+    Info<< "DMR: check interval=" << dmrCheckInterval << " steps" << nl;
+
+    label dmrStepCounter = 0;
+    #endif
 
     Info<< nl << "Starting time loop\n" << endl;
 
@@ -192,12 +232,41 @@ int main(int argc, char *argv[])
 
         runTime.write();
 
+        #ifdef FOAM_USE_DMR
+        // --- DMR: Check for reconfiguration every dmrCheckInterval steps ---
+        dmrStepCounter++;
+        if (dmrStepCounter >= dmrCheckInterval)
+        {
+            dmrStepCounter = 0;
+
+            Info<< "DMR: Checking for reconfiguration..." << nl;
+
+            // ROUND_POLICY = debug policy, cycles node count up/down.
+            // For production, switch to CE_POLICY (TALP communication
+            // efficiency). If DMR decides to reconfigure:
+            //   checkpoint: runTime.writeNow() writes all fields
+            //   then the application relaunches with new process count.
+            //   OpenFOAM restarts from latestTime automatically.
+            DMR_AUTO(
+                dmr_check(ROUND_POLICY),
+                runTime.writeNow(),         // checkpoint: write current state
+                (void)NULL,                 // restart: not used here
+                (void)NULL                  // finalize: not used here
+            );
+        }
+        #endif
+
         Info<< "ExecutionTime = " << runTime.elapsedCpuTime() << " s"
             << "  ClockTime = " << runTime.elapsedClockTime() << " s"
             << nl << endl;
     }
 
     Info<< "End\n" << endl;
+
+    #ifdef FOAM_USE_DMR
+    // --- DMR: Clean shutdown ---
+    DMR_AUTO(dmr_finalize(), (void)NULL, (void)NULL, (void)NULL);
+    #endif
 
     return 0;
 }

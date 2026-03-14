@@ -64,6 +64,7 @@ Usage
 
 #ifdef FOAM_USE_DMR
     #include "foamDmr.H"
+    #include "foamDmrRedist.H"
 #endif
 
 using namespace Foam;
@@ -79,20 +80,40 @@ int main(int argc, char *argv[])
         "Solver name"
     );
 
-    #include "setRootCase.H"
-
     #ifdef FOAM_USE_DMR
     // --- DMR: Initialize dynamic resource management ---
-    // On first run (reconfig_count == 0): does nothing special.
-    // On restart (reconfig_count > 0): OpenFOAM handles restart via
-    // "startFrom latestTime" in controlDict.
+    // Must run BEFORE setRootCase.H because argList validates that the
+    // processor count matches decomposeParDict. On DMR restart the count
+    // has changed, so dmrRestart() must update the dict first.
+    //
+    // DMR requires MPI to be already initialized, so we call MPI_Init here.
+    // OpenFOAM's UPstream::init (inside setRootCase.H) will detect that
+    // MPI is already initialized and skip the duplicate MPI_Init.
+    {
+        int provided;
+        MPI_Init_thread(&argc, &argv, MPI_THREAD_SINGLE, &provided);
+    }
+
+    // Parse -case from argv (OpenFOAM's argList is not constructed yet).
+    std::string dmrCasePath = ".";
+    for (int i = 1; i < argc - 1; ++i)
+    {
+        if (std::string(argv[i]) == "-case")
+        {
+            dmrCasePath = argv[i + 1];
+            break;
+        }
+    }
+
     DMR_AUTO(
         dmr_init(argc, argv),
-        (void)NULL,                 // checkpoint: not needed at init
-        (void)NULL,                 // restart: OpenFOAM handles via latestTime
-        (void)NULL                  // finalize: not needed at init
+        (void)NULL,                    // checkpoint: not needed at init
+        dmrRestart(dmrCasePath),       // restart: decompose for new proc count
+        (void)NULL                     // finalize: not needed at init
     );
     #endif
+
+    #include "setRootCase.H"
 
     #include "createTime.H"
 
@@ -136,21 +157,14 @@ int main(int argc, char *argv[])
     // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
     #ifdef FOAM_USE_DMR
-    // --- DMR: Configure policy bounds (read from controlDict) ---
-    const label dmrMinNodes =
-        runTime.controlDict().lookupOrDefault("dmrMinNodes", 1);
-    const label dmrMaxNodes =
-        runTime.controlDict().lookupOrDefault("dmrMaxNodes", 1);
-
-    dmr_set_policy_min_nodes(dmrMinNodes);
-    dmr_set_policy_max_nodes(dmrMaxNodes);
-
-    Info<< "DMR: policy min=" << dmrMinNodes
-        << " max=" << dmrMaxNodes << nl;
-
-    // How often to check for reconfiguration (in time steps)
-    const label dmrCheckInterval =
-        runTime.controlDict().lookupOrDefault("dmrCheckInterval", 100);
+    // --- DMR: Policy (min/max nodes, inhibitor, PPN) is configured via
+    //     environment variables and read by the DMR library directly.
+    //     Only the check interval is application-specific. ---
+    const label dmrCheckInterval = []()
+    {
+        const char* env = std::getenv("DMR_CHECK_INTERVAL");
+        return env ? std::atoi(env) : 100;
+    }();
 
     Info<< "DMR: check interval=" << dmrCheckInterval << " steps" << nl;
 
@@ -249,7 +263,7 @@ int main(int argc, char *argv[])
             //   OpenFOAM restarts from latestTime automatically.
             DMR_AUTO(
                 dmr_check(ROUND_POLICY),
-                runTime.writeNow(),         // checkpoint: write current state
+                dmrCheckpoint(runTime),     // checkpoint: write + reconstruct
                 (void)NULL,                 // restart: not used here
                 (void)NULL                  // finalize: not used here
             );

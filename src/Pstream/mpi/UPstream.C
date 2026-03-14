@@ -63,19 +63,26 @@ void Foam::UPstream::addValidParOptions(HashTable<string>& validParOptions)
 
 bool Foam::UPstream::init(int& argc, char**& argv, const bool needsThread)
 {
-    // MPI_Init(&argc, &argv);
+    // Skip MPI_Init if already initialized (e.g. by DMR's dmr_init)
+    int mpiAlreadyInitialized;
+    MPI_Initialized(&mpiAlreadyInitialized);
+
     int provided_thread_support;
-    MPI_Init_thread
-    (
-        &argc,
-        &argv,
+
+    if (!mpiAlreadyInitialized)
+    {
+        MPI_Init_thread
         (
-            needsThread
-          ? MPI_THREAD_MULTIPLE
-          : MPI_THREAD_SINGLE
-        ),
-        &provided_thread_support
-    );
+            &argc,
+            &argv,
+            (
+                needsThread
+              ? MPI_THREAD_MULTIPLE
+              : MPI_THREAD_SINGLE
+            ),
+            &provided_thread_support
+        );
+    }
 
     // int numprocs;
     // MPI_Comm_size(MPI_COMM_WORLD, &numprocs);

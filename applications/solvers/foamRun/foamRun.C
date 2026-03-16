@@ -111,6 +111,17 @@ int main(int argc, char *argv[])
         dmrRestart(dmrCasePath),       // restart: decompose for new proc count
         (void)NULL                     // finalize: not needed at init
     );
+
+    // Configure DMR policy from environment variables.
+    // The Docker DMR library (v2.0.0) does not read these env vars
+    // natively, so we bridge them to the C API here.
+    {
+        const char* envMax = std::getenv("DMR_DEFAULT_POLICY_MAX");
+        if (envMax) dmr_set_policy_max_nodes(std::atoi(envMax));
+
+        const char* envMin = std::getenv("DMR_DEFAULT_POLICY_MIN");
+        if (envMin) dmr_set_policy_min_nodes(std::atoi(envMin));
+    }
     #endif
 
     #include "setRootCase.H"

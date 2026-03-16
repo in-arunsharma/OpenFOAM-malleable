@@ -64,8 +64,12 @@ inline void dmrCheckpoint(Foam::Time& runTime)
 
         Info<< "DMR: Reconstructing to serial..." << nl;
 
+        // Use -newTimes so ALL intermediate writes (writeInterval)
+        // are reconstructed to serial, not just the latest.
+        // -rm then removes processor dirs.  Previous checkpoint
+        // times already in serial are skipped (efficient).
         const std::string reconstructCmd =
-            "reconstructPar -case " + casePath + " -latestTime -rm";
+            "reconstructPar -case " + casePath + " -newTimes -rm";
 
         const int ret = ::system(reconstructCmd.c_str());
 
@@ -113,6 +117,23 @@ inline void dmrRestart(const std::string& casePath)
             std::fprintf(stderr, "DMR: FATAL — failed to update "
                 "decomposeParDict (exit code %d)\n", ret);
             MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        // Ensure startFrom is set to latestTime so the restarted solver
+        // picks up from the checkpoint, not from time 0.
+        const std::string ctrlDictPath = casePath + "/system/controlDict";
+
+        const std::string sedStartFrom =
+            "sed -i 's/startFrom[[:space:]].*/"
+            "startFrom       latestTime;/' "
+            + ctrlDictPath;
+
+        ret = ::system(sedStartFrom.c_str());
+
+        if (ret != 0)
+        {
+            std::fprintf(stderr, "DMR: WARNING — failed to update "
+                "startFrom in controlDict (exit code %d)\n", ret);
         }
 
         std::fprintf(stderr, "DMR: Decomposing for %d processes...\n",

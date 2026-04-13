@@ -62,6 +62,11 @@ Usage
 #include "pimpleSingleRegionControl.H"
 #include "setDeltaT.H"
 
+#ifdef FOAM_USE_DMR
+    #include "foamDmr.H"
+    #include "foamDmrRedist.H"
+#endif
+
 using namespace Foam;
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
@@ -75,7 +80,52 @@ int main(int argc, char *argv[])
         "Solver name"
     );
 
+    #ifdef FOAM_USE_DMR
+    // --- DMR: Initialize dynamic resource management ---
+    // Must run BEFORE setRootCase.H because argList validates that the
+    // processor count matches decomposeParDict. On DMR restart the count
+    // has changed, so dmrRestart() must update the dict first.
+    //
+    // DMR requires MPI to be already initialized, so we call MPI_Init here.
+    // OpenFOAM's UPstream::init (inside setRootCase.H) will detect that
+    // MPI is already initialized and skip the duplicate MPI_Init.
+    {
+        int provided;
+        MPI_Init_thread(&argc, &argv, MPI_THREAD_SINGLE, &provided);
+    }
+
+    // Parse -case from argv (OpenFOAM's argList is not constructed yet).
+    std::string dmrCasePath = ".";
+    for (int i = 1; i < argc - 1; ++i)
+    {
+        if (std::string(argv[i]) == "-case")
+        {
+            dmrCasePath = argv[i + 1];
+            break;
+        }
+    }
+
+    DMR_AUTO(
+        dmr_init(argc, argv),
+        (void)NULL,                    // checkpoint: not needed at init
+        dmrRestart(dmrCasePath),       // restart: decompose for new proc count
+        (void)NULL                     // finalize: not needed at init
+    );
+
+    // Configure DMR policy from environment variables.
+    // The Docker DMR library (v2.0.0) does not read these env vars
+    // natively, so we bridge them to the C API here.
+    {
+        const char* envMax = std::getenv("DMR_DEFAULT_POLICY_MAX");
+        if (envMax) dmr_set_policy_max_nodes(std::atoi(envMax));
+
+        const char* envMin = std::getenv("DMR_DEFAULT_POLICY_MIN");
+        if (envMin) dmr_set_policy_min_nodes(std::atoi(envMin));
+    }
+    #endif
+
     #include "setRootCase.H"
+
     #include "createTime.H"
 
     // Read the solverName from the optional solver entry in controlDict
@@ -116,6 +166,21 @@ int main(int argc, char *argv[])
     setDeltaT(runTime, solver);
 
     // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+    #ifdef FOAM_USE_DMR
+    // --- DMR: Policy (min/max nodes, inhibitor, PPN) is configured via
+    //     environment variables and read by the DMR library directly.
+    //     Only the check interval is application-specific. ---
+    const label dmrCheckInterval = []()
+    {
+        const char* env = std::getenv("DMR_CHECK_INTERVAL");
+        return env ? std::atoi(env) : 100;
+    }();
+
+    Info<< "DMR: check interval=" << dmrCheckInterval << " steps" << nl;
+
+    label dmrStepCounter = 0;
+    #endif
 
     Info<< nl << "Starting time loop\n" << endl;
 
@@ -192,12 +257,41 @@ int main(int argc, char *argv[])
 
         runTime.write();
 
+        #ifdef FOAM_USE_DMR
+        // --- DMR: Check for reconfiguration every dmrCheckInterval steps ---
+        dmrStepCounter++;
+        if (dmrStepCounter >= dmrCheckInterval)
+        {
+            dmrStepCounter = 0;
+
+            Info<< "DMR: Checking for reconfiguration..." << nl;
+
+            // ROUND_POLICY = debug policy, cycles node count up/down.
+            // For production, switch to CE_POLICY (TALP communication
+            // efficiency). If DMR decides to reconfigure:
+            //   checkpoint: runTime.writeNow() writes all fields
+            //   then the application relaunches with new process count.
+            //   OpenFOAM restarts from latestTime automatically.
+            DMR_AUTO(
+                dmr_check(ROUND_POLICY),
+                dmrCheckpoint(runTime),     // checkpoint: write + reconstruct
+                (void)NULL,                 // restart: not used here
+                (void)NULL                  // finalize: not used here
+            );
+        }
+        #endif
+
         Info<< "ExecutionTime = " << runTime.elapsedCpuTime() << " s"
             << "  ClockTime = " << runTime.elapsedClockTime() << " s"
             << nl << endl;
     }
 
     Info<< "End\n" << endl;
+
+    #ifdef FOAM_USE_DMR
+    // --- DMR: Clean shutdown ---
+    DMR_AUTO(dmr_finalize(), (void)NULL, (void)NULL, (void)NULL);
+    #endif
 
     return 0;
 }

@@ -72,7 +72,7 @@ inline void dmrCheckpoint(Foam::Time& runTime)
             "reconstructPar -case " + casePath + " -newTimes -rm";
 
         const int ret = ::system(reconstructCmd.c_str());
-
+        
         if (ret != 0)
         {
             FatalErrorInFunction
@@ -117,6 +117,22 @@ inline void dmrRestart(const std::string& casePath)
             std::fprintf(stderr, "DMR: FATAL — failed to update "
                 "decomposeParDict (exit code %d)\n", ret);
             MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        // Force scotch decomposer so any numberOfSubdomains works.
+        // Geometric decomposers (hierarchical, simple) require matching
+        // n-coefficients that would break when DMR changes the count.
+        const std::string sedDecomp =
+            "sed -i 's/decomposer[[:space:]].*/"
+            "decomposer      scotch;/' "
+            + dictPath;
+
+        ret = ::system(sedDecomp.c_str());
+
+        if (ret != 0)
+        {
+            std::fprintf(stderr, "DMR: WARNING — failed to update "
+                "decomposer to scotch (exit code %d)\n", ret);
         }
 
         // Ensure startFrom is set to latestTime so the restarted solver

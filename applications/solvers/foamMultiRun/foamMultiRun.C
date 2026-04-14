@@ -86,12 +86,22 @@ Usage
 #include "pimpleMultiRegionControl.H"
 #include "setDeltaT.H"
 
+#ifdef FOAM_USE_DMR
+    #define DMR_ALL_REGIONS true
+    #include "foamDmr.H"
+    #include "foamDmrRedist.H"
+#endif
+
 using namespace Foam;
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 int main(int argc, char *argv[])
 {
+    #ifdef FOAM_USE_DMR
+    #include "dmrInit.H"
+    #endif
+
     #include "setRootCase.H"
     #include "createTime.H"
 
@@ -241,12 +251,20 @@ int main(int argc, char *argv[])
 
         runTime.write();
 
+        #ifdef FOAM_USE_DMR
+        #include "dmrCheck.H"
+        #endif
+
         Info<< "ExecutionTime = " << runTime.elapsedCpuTime() << " s"
             << "  ClockTime = " << runTime.elapsedClockTime() << " s"
             << nl << endl;
     }
 
     Info<< "End\n" << endl;
+
+    #ifdef FOAM_USE_DMR
+    #include "dmrFinalize.H"
+    #endif
 
     return 0;
 }

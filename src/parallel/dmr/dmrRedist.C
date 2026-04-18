@@ -351,111 +351,56 @@ void dmrDecomposeInProcess(const std::string& casePath, bool allRegions)
     {
         const std::string restartTime = dmrFindLatestTime(casePath);
 
-        if (allRegions)
+        // Decompose using decomposePar as a subprocess.
+        //
+        // Three attempts at in-process decompose (using the libparallel OF API
+        // with parRun=false, both inside and outside DMR_AUTO) all failed with
+        // MPI_ERR_TRUNCATE on MPI_COMM_FOAM during the subsequent Time()
+        // construction.  The root cause is an unidentified side-effect of the
+        // in-process OF API calls on OpenMPI's internal state.  The subprocess
+        // approach is immune because the child process runs in a completely
+        // isolated MPI environment and exits cleanly before the parent's
+        // MPI_COMM_FOAM is created.  In-process decompose is documented as
+        // future work (see docs/futureConsiderations/).
+        //
+        // Flag rationale (see FOAMMULTIRUN_TEST_FINDINGS.md for details):
+        //   -time <T>      decompose only the restart time step (correctly
+        //                  decomposes moved polyMesh/points for dynamic mesh)
+        //   -cellProc      required for NCC cyclic patches (nFaces 0 in serial)
+        //   -allRegions    decompose all regions for foamMultiRun
+        //   -force         remove any pre-existing processorN directories
+        std::fprintf
+        (
+            stderr,
+            "DMR: Decomposing for %d procs (time=%s)...\n",
+            newSize,
+            restartTime.c_str()
+        );
+
+        const std::string decomposeCmd =
+            "decomposePar"
+            " -force"
+            " -time " + restartTime +
+            " -cellProc"
+          + (allRegions ? " -allRegions" : "")
+          + " -case " + casePath
+          + " > /tmp/dmr_decompose.log 2>&1";
+
+        const int ret = std::system(decomposeCmd.c_str());
+
+        if (ret != 0)
         {
-            // Multi-region: in-process region enumeration requires a solver
-            // runTime object, which is not available here.  Fall back to the
-            // subprocess approach so foamMultiRun cases are not broken.
             std::fprintf
             (
                 stderr,
-                "DMR: Multi-region — subprocess decompose for %d procs (time=%s).\n",
-                newSize,
-                restartTime.c_str()
+                "DMR: FATAL — decomposePar failed (exit %d);"
+                " see /tmp/dmr_decompose.log\n",
+                ret
             );
-
-            const std::string decomposeCmd =
-                "decomposePar"
-                " -force"
-                " -time " + restartTime +
-                " -cellProc"
-                " -allRegions"
-                " -case " + casePath
-              + " > /tmp/dmr_decompose.log 2>&1";
-
-            const int ret = std::system(decomposeCmd.c_str());
-
-            if (ret != 0)
-            {
-                std::fprintf
-                (
-                    stderr,
-                    "DMR: FATAL — decomposePar failed (exit %d);"
-                    " see /tmp/dmr_decompose.log\n",
-                    ret
-                );
-                MPI_Abort(MPI_COMM_WORLD, 1);
-            }
+            MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        else
-        {
-            // Single-region: in-process decompose using the OpenFOAM API.
-            //
-            // DMR_INTERCOMM has been freed before this function is called.
-            // With parRun=false, UPstream::allocateCommunicator does NOT call
-            // MPI_Comm_create and freeCommunicator does NOT call MPI_Comm_free
-            // — the OpenMPI context ID pool is completely unaffected.
-            // All I/O goes directly to the shared filesystem.
-            std::fprintf
-            (
-                stderr,
-                "DMR: In-process decompose for %d procs (time=%s)...\n",
-                newSize,
-                restartTime.c_str()
-            );
 
-            const bool savedParRun = Pstream::parRun();
-            Pstream::parRun() = false;
-
-            {
-                const fileName foamCase(casePath);
-                const wordList regionNames(1, polyMesh::defaultRegion);
-
-                processorRunTimes procTimes
-                (
-                    Time::controlDictName,
-                    foamCase.path(),
-                    foamCase.name(),
-                    false,
-                    processorRunTimes::nProcsFrom::decomposeParDict
-                );
-
-                multiDomainDecomposition regionMeshes
-                (
-                    procTimes,
-                    word::null,
-                    regionNames
-                );
-
-                // Read the complete (serial) mesh and build the decomposition
-                // map in memory.
-                regionMeshes.readDecompose(false);
-
-                // Advance to the restart time so decomposed fields land in
-                // the correct time directory.
-                const instantList completeTimes =
-                    procTimes.completeTime().times();
-                instant restartInst("0");
-                forAll(completeTimes, timei)
-                {
-                    if (completeTimes[timei].name() == word(restartTime))
-                    {
-                        restartInst = completeTimes[timei];
-                        break;
-                    }
-                }
-                procTimes.setTime(restartInst, 0);
-
-                // Update decomposition for the restart time (handles mesh
-                // motion — writes moved points per processor), then write all
-                // processor directories to disk.
-                regionMeshes.readUpdateDecompose();
-                regionMeshes.writeProcs(false);
-            }
-
-            Pstream::parRun() = savedParRun;
-            std::fprintf(stderr, "DMR: In-process decompose complete.\n");
-        }
+        std::fprintf(stderr, "DMR: Decomposition complete.\n");
     }
 
     // Barrier: all new-group ranks synchronise before proceeding to

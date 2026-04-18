@@ -176,11 +176,25 @@ namespace Foam
 // allRegions  : true for foamMultiRun multi-region cases.
 void dmrCheckpoint(Time& runTime, bool allRegions = false);
 
-// Called by NEW processes at startup, BEFORE setRootCase.H.
-// Updates dicts and decomposes the serial case for the new process count.
+// Phase 1 — called by NEW processes inside DMR_AUTO (before dmr_reconfigure).
+// Only updates decomposeParDict and controlDict; sets the dmrRestartPending_
+// flag.  No decomposition is done here — DMR_INTERCOMM is still live.
 // casePath   : absolute path to the case directory (std::string).
 // allRegions : true for foamMultiRun multi-region cases.
 void dmrRestart(const std::string& casePath, bool allRegions = false);
+
+// Phase 2 — called by NEW processes AFTER DMR_AUTO (after dmr_reconfigure has
+// freed DMR_INTERCOMM).  Decomposes the serial case for the new process count.
+// Single-region: uses the in-process OpenFOAM decomposition API.
+// Multi-region : falls back to a decomposePar subprocess.
+// No-op if dmrRestartPending_ is false (fresh start, no reconfiguration).
+// casePath   : absolute path to the case directory (std::string).
+// allRegions : true for foamMultiRun multi-region cases.
+void dmrDecomposeInProcess
+(
+    const std::string& casePath,
+    bool allRegions = false
+);
 
 } // End namespace Foam
 

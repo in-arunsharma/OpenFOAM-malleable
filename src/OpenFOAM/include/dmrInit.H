@@ -55,4 +55,10 @@ if (dmrEnabled)
         const char* envMin = std::getenv("DMR_DEFAULT_POLICY_MIN");
         if (envMin) dmr_set_policy_min_nodes(std::atoi(envMin));
     }
+
+    // Phase 2 restart: in-process decompose for the new process count.
+    // Runs AFTER DMR_AUTO so DMR_INTERCOMM has already been freed by
+    // dmr_reconfigure().  MPI_COMM_WORLD is clean at this point.
+    // No-op on fresh starts (dmrRestartPending_ is false).
+    Foam::dmrDecomposeInProcess(dmrCasePath, dmrAllRegions);
 }

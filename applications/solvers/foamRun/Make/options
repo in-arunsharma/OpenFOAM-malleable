@@ -3,11 +3,12 @@ DMR_LIB :=
 
 ifneq (,$(wildcard $(DMR_PATH)/include/dmr.h))
 DMR_INC = -I$(DMR_PATH)/include -I$(MPI_ARCH_PATH)/include -DFOAM_USE_DMR
-DMR_LIB = -L$(DMR_PATH)/lib -ldmr
+DMR_LIB = -L$(DMR_PATH)/lib -ldmr -lfoamDmr
 endif
 
 EXE_INC = \
     -I$(LIB_SRC)/finiteVolume/lnInclude \
+    -I$(LIB_SRC)/parallel/dmr/lnInclude \
     $(DMR_INC)
 
 EXE_LIBS = \

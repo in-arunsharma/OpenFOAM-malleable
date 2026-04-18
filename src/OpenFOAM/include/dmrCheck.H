@@ -28,7 +28,7 @@ if (dmrEnabled)
 
         // Skip if the simulation is about to end — avoid a pointless
         // reconstruct+decompose on the final step.
-        if (runTime.timeOutputValue() >= runTime.endTime().value())
+        if (runTime.userTimeValue() >= runTime.endTime().value())
         {
             Info<< "DMR: At endTime, skipping reconfiguration check."
                 << nl;

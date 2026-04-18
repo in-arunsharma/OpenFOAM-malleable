@@ -1,0 +1,24 @@
+DMR_INC :=
+DMR_LIB :=
+
+ifneq (,$(wildcard $(DMR_PATH)/include/dmr.h))
+DMR_INC = -I$(DMR_PATH)/include -DFOAM_USE_DMR
+DMR_LIB = -L$(DMR_PATH)/lib -ldmr
+endif
+
+EXE_INC = \
+    -I$(LIB_SRC)/finiteVolume/lnInclude \
+    -I$(LIB_SRC)/meshTools/lnInclude \
+    -I$(LIB_SRC)/parallel/parallel/lnInclude \
+    -I$(LIB_SRC)/parallel/decompose/decompositionMethods/lnInclude \
+    -I$(LIB_SRC)/generic/genericFvFields/lnInclude \
+    -I$(MPI_ARCH_PATH)/include \
+    $(DMR_INC)
+
+LIB_LIBS = \
+    -lfiniteVolume \
+    -lmeshTools \
+    -lparallel \
+    -ldecompositionMethods \
+    -lgenericFvFields \
+    $(DMR_LIB)

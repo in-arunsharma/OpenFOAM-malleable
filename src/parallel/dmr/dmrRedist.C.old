@@ -379,6 +379,54 @@ void dmrRestart(const std::string& casePath, bool /*allRegions*/)
             // write the processor mesh directories to disk.
             regionMeshes.readUpdateDecompose();
             regionMeshes.writeProcs(false);
+
+            // Decompose FV fields (volume internal, volume, surface) for the
+            // restart time, mirroring what `decomposePar` itself does and what
+            // the symmetric dmrCheckpoint reconstruct path does via
+            // fvFieldReconstructor.  Without this, the new processor*
+            // directories contain a mesh but no fields, and the restarting
+            // solver has nothing to pick up.
+            forAll(regionNames, regioni)
+            {
+                const RegionRef<domainDecomposition> meshes =
+                    regionMeshes[regioni];
+
+                IOobjectList objects
+                (
+                    meshes().completeMesh(),
+                    procTimes.completeTime().name()
+                );
+
+                if (fvFieldDecomposer::decomposes(objects))
+                {
+                    fvFieldDecomposer fvDecomposer
+                    (
+                        meshes().completeMesh(),
+                        meshes().procMeshes(),
+                        meshes().procFaceAddressing(),
+                        meshes().procCellAddressing(),
+                        meshes().procFaceAddressingBf()
+                    );
+
+                    #define DO_FV_VOL_INTERNAL(Type, nullArg)               \
+                        fvDecomposer                                         \
+                           .decomposeVolInternalFields<Type>(objects);
+                    FOR_ALL_FIELD_TYPES(DO_FV_VOL_INTERNAL)
+                    #undef DO_FV_VOL_INTERNAL
+
+                    #define DO_FV_VOL(Type, nullArg)                        \
+                        fvDecomposer                                         \
+                           .decomposeVolFields<Type>(objects);
+                    FOR_ALL_FIELD_TYPES(DO_FV_VOL)
+                    #undef DO_FV_VOL
+
+                    #define DO_FV_SURFACE(Type, nullArg)                    \
+                        fvDecomposer                                         \
+                           .decomposeFvSurfaceFields<Type>(objects);
+                    FOR_ALL_FIELD_TYPES(DO_FV_SURFACE)
+                    #undef DO_FV_SURFACE
+                }
+            }
         }
 
         Pstream::parRun() = savedParRun;

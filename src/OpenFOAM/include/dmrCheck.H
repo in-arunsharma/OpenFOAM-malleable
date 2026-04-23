@@ -19,7 +19,9 @@ if (dmrEnabled)
         }
         dmrCheckInterval = std::atoi(env);
         Info<< "DMR: check interval=" << dmrCheckInterval
-            << " steps" << nl;
+            << " steps, policy="
+            << (dmrPolicy == CE_POLICY ? "CE" : "ROUND")
+            << nl;
     }
 
     if (++dmrStepCounter >= dmrCheckInterval)
@@ -38,8 +40,8 @@ if (dmrEnabled)
             Info<< "DMR: Checking for reconfiguration..." << nl;
 
             DMR_AUTO(
-                dmr_check(ROUND_POLICY),
-                dmrCheckpoint(runTime, dmrAllRegions),
+                dmr_check(dmrPolicy),
+                Foam::dmrCheckpoint(runTime, dmrAllRegions),
                 (void)NULL,
                 (void)NULL
             );

@@ -24,223 +24,213 @@ License
 \*---------------------------------------------------------------------------*/
 
 #include "dmrRedist.H"
-
-#include "IOobjectList.H"
-#include "HashSet.H"
-#include "processorRunTimes.H"
-#include "multiDomainDecomposition.H"
-#include "domainDecomposition.H"
-#include "fvFieldReconstructor.H"
-#include "fvFieldDecomposer.H"
-#include "polyMesh.H"
 #include "Pstream.H"
-#include "fileOperation.H"
-#include "fieldTypes.H"
 
+#include <dmr.h>
 #include <mpi.h>
-#include <sys/stat.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 namespace Foam
 {
 
-// Module-level flag: set by dmrRestart(), consumed by dmrDecomposeInProcess().
-// True only on the new process group, only after a DMR reconfiguration.
-// Allows dmrDecomposeInProcess() to distinguish a restart from a fresh start.
-static bool dmrRestartPending_ = false;
+// Run an external command, stream its output to <case>/logs/<logName>,
+// and abort the whole job on non-zero exit.  Only called by master rank.
+static void dmrRunOrAbort
+(
+    const std::string& casePath,
+    const std::string& logName,
+    const std::string& utilityArgs
+)
+{
+    const std::string logPath = casePath + "/logs/" + logName;
+
+    const std::string cmd =
+        "mkdir -p '" + casePath + "/logs' && "
+      + utilityArgs + " > '" + logPath + "' 2>&1";
+
+    const int ret = std::system(cmd.c_str());
+
+    if (ret != 0)
+    {
+        std::fprintf
+        (
+            stderr,
+            "DMR: FATAL — '%s' exited with status %d; see '%s'.\n",
+            utilityArgs.c_str(), ret, logPath.c_str()
+        );
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
+
+
+// Update a single entry in a case dictionary via foamDictionary.
+// Aborts the job on failure — the restart cannot proceed with stale dicts.
+static void dmrSetDictEntry
+(
+    const std::string& casePath,
+    const std::string& dictRelPath,
+    const std::string& entry,
+    const std::string& value
+)
+{
+    const std::string cmd =
+        "foamDictionary -entry " + entry + " -set '" + value + "'"
+      + " '" + casePath + "/" + dictRelPath + "'";
+
+    dmrRunOrAbort(casePath, "dmr_foamDictionary.log", cmd);
+}
+
+
+// Append one row to <case>/logs/dmr_analytics.csv.
+// Writes the CSV header on first call (file position 0).
+// Only called by master rank.
+static void dmrWriteAnalytics
+(
+    const std::string& casePath,
+    const DMRAnalytics& a,
+    const char* phase
+)
+{
+    const std::string csvPath = casePath + "/logs/dmr_analytics.csv";
+
+    FILE* f = std::fopen(csvPath.c_str(), "a");
+    if (!f)
+    {
+        std::fprintf
+        (
+            stderr,
+            "DMR: warning — cannot open '%s' for analytics logging.\n",
+            csvPath.c_str()
+        );
+        return;
+    }
+
+    // Write header only when the file is newly created (append position == 0).
+    if (std::ftell(f) == 0)
+    {
+        std::fprintf
+        (
+            f,
+            "phase,event_time,event,world_size,node_count,"
+            "reconfiguration_time_s,communication_efficiency,pending_nodes\n"
+        );
+    }
+
+    std::fprintf
+    (
+        f,
+        "%s,%.3f,%s,%d,%d,%.4f,%.4f,%d\n",
+        phase,
+        a.event_time,
+        dmr_get_analytics_event_str(a.event),
+        a.world_size,
+        a.node_count,
+        a.reconfiguration_time,
+        a.communication_efficiency,
+        a.pending_nodes
+    );
+
+    std::fclose(f);
+}
+
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 void dmrCheckpoint(Time& runTime, bool allRegions)
 {
-    // All ranks flush their fields to disk before rank 0 reconstructs.
-    // This mirrors the write() that the solver already issued, but ensures
-    // any pending output is committed even if the solver skipped the step.
-    runTime.writeNow();
+    // Determine before writing whether this is a DMR-forced checkpoint (i.e.
+    // not a natural writeInterval boundary).  We mark forced dirs with a
+    // sentinel file so they can be deleted once a newer checkpoint exists —
+    // they are DMR artefacts, not meaningful simulation output.
+    const bool isDmrForced = !runTime.writeTime();
 
-    // Barrier: wait for all parallel writes to land on disk.
+    // All ranks flush their fields to disk before rank 0 reconstructs.
+    // Check the return value: Time::writeNow() returns false if any I/O in
+    // the write path failed (disk full, permissions, truncated files), and
+    // a partial write would silently corrupt the next restart.  We agree
+    // across ranks via MPI_Allreduce(MIN) — a single rank failing is enough
+    // to abort the whole job before master opens the processor dirs.
+    const int writeOK = runTime.writeNow() ? 1 : 0;
+    int writeOKAll = 0;
+    MPI_Allreduce(&writeOK, &writeOKAll, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+
+    if (!writeOKAll)
+    {
+        if (Pstream::master())
+        {
+            std::fprintf
+            (
+                stderr,
+                "DMR: FATAL — runTime.writeNow() failed on at least one"
+                " rank at t=%s; aborting to avoid a corrupt checkpoint.\n",
+                runTime.name().c_str()
+            );
+        }
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    // Wait for all parallel writes to land before rank 0 opens them.
     MPI_Barrier(MPI_COMM_WORLD);
 
     if (Pstream::master())
     {
-        Info<< "DMR: Reconstructing to serial..." << nl;
+        const std::string casePath = runTime.globalPath();
+        const std::string timeName = runTime.name();
 
-        // Disable MPI mode immediately — any OF API call with parRun==true
-        // inside a master-only block will issue MPI collectives that the
-        // waiting ranks (at the barrier above) do not participate in, causing
-        // deadlock.  With parRun==false, OF falls back to direct file I/O.
-        // The shared Docker volume makes this safe: all nodes see the same
-        // filesystem, and rank 0 is the only writer during reconstruction.
-        const bool savedParRun = Pstream::parRun();
-        Pstream::parRun() = false;
+        Info<< "DMR: Reconstructing processor directories..." << nl;
 
-        // In a parallel run, runTime.path()   = rootPath/caseName
-        //                                       = .../cavity/processor0  (local)
-        //                 runTime.globalPath() = rootPath/globalCaseName
-        //                                       = .../cavity             (global)
-        // All reconstruction I/O targets the GLOBAL case root.
-        const fileName globalCasePath = runTime.globalPath();
-        const fileName globalCaseName = runTime.globalCaseName();
+        // reconstructPar flags:
+        //   -newTimes   only merge time dirs not already present in serial
+        //   -rm         remove processor*/<time> after successful merge
+        //   -allRegions multi-region for foamMultiRun
+        std::string cmd =
+            "reconstructPar -newTimes -rm -case '" + casePath + "'";
+        if (allRegions) cmd += " -allRegions";
 
-        // Count processor dirs with POSIX stat() — no OF API, no MPI.
-        int nProcDirs = 0;
+        dmrRunOrAbort(casePath, "dmr_reconstruct.log", cmd);
+
+        Info<< "DMR: Reconstruction complete." << nl;
+
+        // ---- Sentinel-based checkpoint cleanup ----------------------------
+        // Touch a hidden marker in the reconstructed time dir.  Then sweep
+        // out any older marker dirs, keeping only this (newest) one on disk.
+        // sort -V: version-style sort (0.1 < 1.0 < 10.0) — correct for OF
+        // time names.  head -n -1: drop the last (newest) line.
+        // xargs -r: skip execution entirely when stdin is empty (GNU xargs).
+        if (isDmrForced)
         {
-            const std::string caseStr(globalCasePath.c_str());
-            struct ::stat st;
-            while
+            const std::string sentinel =
+                casePath + "/" + timeName + "/.dmr_checkpoint";
+            if (FILE* s = std::fopen(sentinel.c_str(), "w"))
+                std::fclose(s);
+
+            std::system
             (
-                ::stat
-                (
-                    (caseStr + "/processor" + std::to_string(nProcDirs)).c_str(),
-                    &st
-                ) == 0
-             && S_ISDIR(st.st_mode)
-            )
-            {
-                ++nProcDirs;
-            }
+                ("find '" + casePath + "' -maxdepth 2"
+                 " -name '.dmr_checkpoint' -printf '%h\\n'"
+                 " | sort -V | head -n -1"
+                 " | xargs -r -I{} rm -rf '{}'").c_str()
+            );
         }
 
-        const wordList regionNames =
-            allRegions
-          ? runTime.regionNames()
-          : wordList(1, polyMesh::defaultRegion);
-
-        if (nProcDirs == 0)
+        // ---- Analytics ---------------------------------------------------
+        // dmr_get_analytics() fills per-reconfiguration metrics that are
+        // only available on rank 0.  Log to CSV for the overhead analysis.
+        DMRAnalytics analytics;
+        if (dmr_get_analytics(&analytics) == DMR_SUCCESS)
         {
-            WarningInFunction
-                << "DMR: no processor directories found in '"
-                << globalCasePath << "' — nothing to reconstruct." << nl;
+            dmrWriteAnalytics(casePath, analytics, "checkpoint");
         }
-        else
-        {
-            // Build run-time objects using the proc count from decomposeParDict
-            // (which still holds the pre-reconfiguration value).
-            // Use rootPath + globalCaseName (not caseName which includes
-            // "processorN" suffix in a parallel run).
-            processorRunTimes procTimes
-            (
-                Time::controlDictName,
-                runTime.rootPath(),
-                globalCaseName,
-                false,                                  // no function objects
-                processorRunTimes::nProcsFrom::decomposeParDict
-            );
-
-            // Build the multi-region decomposition object.
-            // meshPath = word::null → default (constant/polyMesh).
-            multiDomainDecomposition regionMeshes
-            (
-                procTimes,
-                word::null,
-                regionNames
-            );
-
-            // Read processor meshes; reconstruct serial mesh if needed.
-            regionMeshes.readReconstruct(false);
-
-            // Reconstruct fields for every time present in processor dirs.
-            const instantList times = procTimes.proc0Time().times();
-
-            forAll(times, timei)
-            {
-                procTimes.setTime(times[timei], timei);
-
-                Info<< "DMR: Reconstructing time "
-                    << times[timei].name() << nl;
-
-                // Update meshes for topology/motion changes.
-                regionMeshes.readUpdateReconstruct();
-
-                // Write the reconstructed (serial) mesh.
-                regionMeshes.writeComplete(false);
-
-                // Reconstruct FV fields region by region.
-                forAll(regionNames, regioni)
-                {
-                    const RegionRef<domainDecomposition> meshes =
-                        regionMeshes[regioni];
-
-                    IOobjectList objects
-                    (
-                        meshes().procMeshes()[0],
-                        procTimes.proc0Time().name()
-                    );
-
-                    if
-                    (
-                        fvFieldReconstructor::reconstructs
-                        (
-                            objects,
-                            wordHashSet()
-                        )
-                    )
-                    {
-                        fvFieldReconstructor fvReconstructor
-                        (
-                            meshes().completeMesh(),
-                            meshes().procMeshes(),
-                            meshes().procFaceAddressing(),
-                            meshes().procCellAddressing(),
-                            meshes().procFaceAddressingBf()
-                        );
-
-                        #define DO_FV_INTERNAL(Type, nullArg)               \
-                            fvReconstructor                                  \
-                               .reconstructVolInternalFields<Type>           \
-                                (objects, wordHashSet());
-                        FOR_ALL_FIELD_TYPES(DO_FV_INTERNAL)
-                        #undef DO_FV_INTERNAL
-
-                        #define DO_FV_VOL(Type, nullArg)                    \
-                            fvReconstructor                                  \
-                               .reconstructVolFields<Type>                   \
-                                (objects, wordHashSet());
-                        FOR_ALL_FIELD_TYPES(DO_FV_VOL)
-                        #undef DO_FV_VOL
-
-                        #define DO_FV_SURFACE(Type, nullArg)                \
-                            fvReconstructor                                  \
-                               .reconstructFvSurfaceFields<Type>             \
-                                (objects, wordHashSet());
-                        FOR_ALL_FIELD_TYPES(DO_FV_SURFACE)
-                        #undef DO_FV_SURFACE
-                    }
-                }
-            }
-
-            // Remove all processor* directories now that the serial case
-            // is complete.  The DMR new-process set will re-decompose.
-            // Use globalCasePath — runTime.path() is the local processor path.
-
-            const fileNameList dirs
-            (
-                fileHandler().readDir(globalCasePath, fileType::directory)
-            );
-
-            forAll(dirs, diri)
-            {
-                const fileName& d = dirs[diri];
-
-                // Match "processor<integer>" directories only.
-                if (d.find("processor") == 0)
-                {
-                    fileName num(d.substr(9));
-                    label proci = -1;
-                    if (Foam::read(num.c_str(), proci))
-                    {
-                        fileHandler().rmDir(globalCasePath/d);
-                    }
-                }
-            }
-
-            Info<< "DMR: Reconstruction complete." << nl;
-        }
-
-        // Restore MPI mode — covers both the warning and reconstruction paths.
-        Pstream::parRun() = savedParRun;
     }
+
+    // Barrier: keep old-group ranks in lockstep before they exit DMR_AUTO
+    // and proceed into MPI_Finalize via dmr_reconfigure().
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 
@@ -248,15 +238,9 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
 
 void dmrRestart(const std::string& casePath, bool allRegions)
 {
-    // Phase 1 of the two-phase restart — called inside DMR_AUTO, while
-    // DMR_INTERCOMM is still live.  Only perform fast, MPI-free work here:
-    // update the two config files so the new decomposition uses the correct
-    // process count, then set the pending flag so dmrDecomposeInProcess()
-    // (Phase 2, called AFTER DMR_AUTO) knows it must decompose.
-    //
-    // No MPI_Barrier here — dmr_reconfigure() (called by DMR_AUTO immediately
-    // after this function returns) handles the inter-group synchronisation.
-    // The real barrier is inside dmrDecomposeInProcess().
+    // Called by the NEW process group inside DMR_AUTO.  The child processes
+    // spawned here run in isolated MPI environments, so there is no
+    // interaction with DMR_INTERCOMM — a single-phase restart is safe.
 
     int newSize, myRank;
     MPI_Comm_size(MPI_COMM_WORLD, &newSize);
@@ -267,144 +251,121 @@ void dmrRestart(const std::string& casePath, bool allRegions)
         std::fprintf
         (
             stderr,
-            "DMR: Restarting with %d processes (dicts update, decompose deferred).\n",
+            "DMR: Restarting with %d processes.\n",
             newSize
         );
 
         // ---- Update decomposeParDict ----------------------------------------
 
-        const std::string dictPath = casePath + "/system/decomposeParDict";
-
-        if
+        // numberOfSubdomains must match the new process count.
+        dmrSetDictEntry
         (
-           !dmrReplaceLine
-            (
-                dictPath,
-                "numberOfSubdomains",
-                "numberOfSubdomains  " + std::to_string(newSize) + ";"
-            )
-        )
-        {
-            std::fprintf
-            (
-                stderr,
-                "DMR: FATAL — failed to update numberOfSubdomains\n"
-            );
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
+            casePath,
+            "system/decomposeParDict",
+            "numberOfSubdomains",
+            std::to_string(newSize)
+        );
 
         // Force scotch: geometric decomposers (hierarchical, simple) require
-        // n-coefficients that break when DMR changes the process count.
-        if (!dmrReplaceLine(dictPath, "decomposer", "decomposer      scotch;"))
-        {
-            // Older-style dicts may use 'method' instead of 'decomposer'
-            dmrReplaceLine(dictPath, "method", "method          scotch;");
-        }
-
-        // ---- Update controlDict ---------------------------------------------
-
-        const std::string ctrlDictPath = casePath + "/system/controlDict";
-
-        if
+        // n-coefficients that do not hold when DMR changes the process count.
+        dmrSetDictEntry
         (
-           !dmrReplaceLine
-            (
-                ctrlDictPath,
-                "startFrom",
-                "startFrom       latestTime;"
-            )
-        )
+            casePath,
+            "system/decomposeParDict",
+            "decomposer",
+            "scotch"
+        );
+
+        // ---- Update controlDict --------------------------------------------
+
+        dmrSetDictEntry
+        (
+            casePath,
+            "system/controlDict",
+            "startFrom",
+            "latestTime"
+        );
+
+        // ---- Decompose serial case for the new process count ---------------
+
+        // decomposePar flags:
+        //   -force       remove any pre-existing processor* before decomposing
+        //   -latestTime  decompose only the restart time (picks up moved
+        //                polyMesh/points for dynamic mesh cases)
+        //   -cellProc    required for NCC cyclic patches (nFaces is 0 in
+        //                serial, so cellProc must be regenerated)
+        //   -allRegions  multi-region for foamMultiRun
+        std::string cmd =
+            "decomposePar -force -latestTime -cellProc"
+            " -case '" + casePath + "'";
+        if (allRegions) cmd += " -allRegions";
+
+        dmrRunOrAbort(casePath, "dmr_decompose.log", cmd);
+
+        std::fprintf(stderr, "DMR: Decomposition complete.\n");
+
+        // ---- Analytics ---------------------------------------------------
+        DMRAnalytics analytics;
+        if (dmr_get_analytics(&analytics) == DMR_SUCCESS)
         {
-            std::fprintf
-            (
-                stderr,
-                "DMR: WARNING — could not set startFrom in controlDict\n"
-            );
+            dmrWriteAnalytics(casePath, analytics, "restart");
         }
     }
 
-    // All ranks set the flag so dmrDecomposeInProcess() knows this is a
-    // restart (not a fresh start where it would be a no-op).
-    dmrRestartPending_ = true;
+    // All NEW-group ranks synchronise before proceeding to setRootCase.H,
+    // which re-initialises OpenFOAM in parallel mode on the new world.
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-void dmrDecomposeInProcess(const std::string& casePath, bool allRegions)
+void dmrFinalize(const std::string& casePath, bool allRegions)
 {
-    // Phase 2 of the two-phase restart — called AFTER DMR_AUTO returns.
-    // By this point dmr_reconfigure() has already freed DMR_INTERCOMM and
-    // MPI_COMM_WORLD is in a clean state with only the new process group.
-    //
-    // For fresh starts (no prior reconfiguration) dmrRestartPending_ is false
-    // and this function is a no-op.
+    // Called after dmr_finalize() — DMR is no longer active at this point,
+    // so no analytics call here.  Merge any remaining processor dirs into
+    // the serial case, then sweep all DMR-forced checkpoint dirs that were
+    // never superseded by a natural write.
 
-    if (!dmrRestartPending_) return;
-    dmrRestartPending_ = false;
+    MPI_Barrier(MPI_COMM_WORLD);
 
-    int newSize, myRank;
-    MPI_Comm_size(MPI_COMM_WORLD, &newSize);
-    MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
-
-    if (myRank == 0)
+    if (Pstream::master())
     {
-        const std::string restartTime = dmrFindLatestTime(casePath);
+        Info<< "DMR: Final reconstruction to serial..." << nl;
 
-        // Decompose using decomposePar as a subprocess.
-        //
-        // Three attempts at in-process decompose (using the libparallel OF API
-        // with parRun=false, both inside and outside DMR_AUTO) all failed with
-        // MPI_ERR_TRUNCATE on MPI_COMM_FOAM during the subsequent Time()
-        // construction.  The root cause is an unidentified side-effect of the
-        // in-process OF API calls on OpenMPI's internal state.  The subprocess
-        // approach is immune because the child process runs in a completely
-        // isolated MPI environment and exits cleanly before the parent's
-        // MPI_COMM_FOAM is created.  In-process decompose is documented as
-        // future work (see docs/futureConsiderations/).
-        //
-        // Flag rationale (see FOAMMULTIRUN_TEST_FINDINGS.md for details):
-        //   -time <T>      decompose only the restart time step (correctly
-        //                  decomposes moved polyMesh/points for dynamic mesh)
-        //   -cellProc      required for NCC cyclic patches (nFaces 0 in serial)
-        //   -allRegions    decompose all regions for foamMultiRun
-        //   -force         remove any pre-existing processorN directories
-        std::fprintf
-        (
-            stderr,
-            "DMR: Decomposing for %d procs (time=%s)...\n",
-            newSize,
-            restartTime.c_str()
-        );
+        std::string cmd =
+            "reconstructPar -newTimes -rm -case '" + casePath + "'";
+        if (allRegions) cmd += " -allRegions";
 
-        const std::string decomposeCmd =
-            "decomposePar"
-            " -force"
-            " -time " + restartTime +
-            " -cellProc"
-          + (allRegions ? " -allRegions" : "")
-          + " -case " + casePath
-          + " > /tmp/dmr_decompose.log 2>&1";
+        const std::string logPath = casePath + "/logs/dmr_final.log";
+        const std::string fullCmd =
+            "mkdir -p '" + casePath + "/logs' && "
+          + cmd + " > '" + logPath + "' 2>&1";
 
-        const int ret = std::system(decomposeCmd.c_str());
+        const int ret = std::system(fullCmd.c_str());
 
         if (ret != 0)
         {
-            std::fprintf
-            (
-                stderr,
-                "DMR: FATAL — decomposePar failed (exit %d);"
-                " see /tmp/dmr_decompose.log\n",
-                ret
-            );
-            MPI_Abort(MPI_COMM_WORLD, 1);
+            WarningInFunction
+                << "DMR: final reconstructPar failed (exit " << ret
+                << "). Processor directories may remain; see "
+                << logPath.c_str() << nl;
+        }
+        else
+        {
+            Info<< "DMR: Final reconstruction complete." << nl;
         }
 
-        std::fprintf(stderr, "DMR: Decomposition complete.\n");
+        // Remove all remaining DMR-forced checkpoint dirs.  These are
+        // superseded by whatever the time loop wrote at or before endTime.
+        std::system
+        (
+            ("find '" + casePath + "' -maxdepth 2"
+             " -name '.dmr_checkpoint' -printf '%h\\n'"
+             " | xargs -r -I{} rm -rf '{}'").c_str()
+        );
     }
 
-    // Barrier: all new-group ranks synchronise before proceeding to
-    // setRootCase.H, which re-initialises OpenFOAM in parallel mode.
     MPI_Barrier(MPI_COMM_WORLD);
 }
 

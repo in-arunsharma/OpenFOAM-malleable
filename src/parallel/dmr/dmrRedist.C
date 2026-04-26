@@ -24,7 +24,11 @@ License
 \*---------------------------------------------------------------------------*/
 
 #include "dmrRedist.H"
+#include "OSspecific.H"
 #include "Pstream.H"
+#include "IFstream.H"
+#include "OFstream.H"
+#include "dictionary.H"
 
 #include <mpi.h>
 #include <glob.h>
@@ -32,6 +36,7 @@ License
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,7 +46,72 @@ License
 namespace Foam
 {
 
-// Run an external command, stream its output to <case>/logs/<logName>,
+// Whether DMR-internal subprocess logging is enabled.  The FOAM_ prefix
+// marks this as an OpenFOAM-side hook control (vs the DMR_ namespace which
+// belongs to the BSC DMR library itself).  Default on; set FOAM_DMR_LOG=0
+// to silence the per-utility logs entirely.
+static bool dmrLogEnabled()
+{
+    static const bool enabled = []()
+    {
+        const char* env = std::getenv("FOAM_DMR_LOG");
+        return !env || std::string(env) != "0";
+    }();
+    return enabled;
+}
+
+
+// Resolve the redirect target for a single utility's output.  When logging
+// is enabled, returns <case>/log.dmr/<logName>; otherwise /dev/null.  The
+// folder name "log.dmr" is intentional: OpenFOAM's foamLog tool reserves
+// "logs/" for extracted residual data, and the leading "log." matches the
+// OF case-root convention (log.foamRun, log.blockMesh).
+static std::string dmrLogPath
+(
+    const std::string& casePath,
+    const std::string& logName
+)
+{
+    if (!dmrLogEnabled()) return "/dev/null";
+    return casePath + "/log.dmr/" + logName;
+}
+
+
+// Append one lifecycle event to log.dmr/dmr_lifecycle.log AND echo it
+// to stderr.  This consolidates the DMR-OF lifecycle messages (checkpoint
+// start/end, restart with N procs, finalize, ...) into a single file so
+// the user has all DMR-side state alongside reconstruct/decompose logs,
+// rather than scattered across slurm-N.out and slurm-N.err.  The stderr
+// echo preserves live visibility.  Each line is wall-clock timestamped
+// in UTC ISO-8601 form so it can be cross-referenced with the
+// [DMR ANALYTICS] events emitted by the DMR library itself.
+static void dmrLifecycleLog
+(
+    const std::string& casePath,
+    const std::string& msg
+)
+{
+    // Live echo to stderr, regardless of FOAM_DMR_LOG.  The whole point
+    // of the lifecycle log is to surface what DMR is doing — silencing
+    // it entirely would defeat the purpose.
+    std::fprintf(stderr, "DMR: %s\n", msg.c_str());
+
+    if (!dmrLogEnabled()) return;
+
+    Foam::mkDir(casePath + "/log.dmr");
+    const std::string logPath = casePath + "/log.dmr/dmr_lifecycle.log";
+    if (FILE* f = std::fopen(logPath.c_str(), "a"))
+    {
+        const auto now = std::time(nullptr);
+        char ts[32];
+        std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&now));
+        std::fprintf(f, "%s  %s\n", ts, msg.c_str());
+        std::fclose(f);
+    }
+}
+
+
+// Run a single utility as a subprocess, append its output to the DMR log,
 // and abort the whole job on non-zero exit.  Only called by master rank.
 static void dmrRunOrAbort
 (
@@ -50,12 +120,16 @@ static void dmrRunOrAbort
     const std::string& utilityArgs
 )
 {
-    const std::string logPath = casePath + "/logs/" + logName;
+    if (dmrLogEnabled())
+    {
+        Foam::mkDir(casePath + "/log.dmr");
+    }
 
-    // Append rather than overwrite so successive reconfigs keep their logs.
+    const std::string logPath = dmrLogPath(casePath, logName);
+
+    // Append so successive reconfigs accumulate in one file per utility.
     const std::string cmd =
-        "mkdir -p '" + casePath + "/logs' && "
-      + utilityArgs + " >> '" + logPath + "' 2>&1";
+        utilityArgs + " >> '" + logPath + "' 2>&1";
 
     const int ret = std::system(cmd.c_str());
 
@@ -72,21 +146,128 @@ static void dmrRunOrAbort
 }
 
 
-// Update a single entry in a case dictionary via foamDictionary.
-// Aborts the job on failure — the restart cannot proceed with stale dicts.
-static void dmrSetDictEntry
+// Replace one entry of an OpenFOAM case dictionary, in process.  Reads the
+// dict from disk preserving its FoamFile header, calls dict.set() (which
+// adds-or-overwrites), and writes it back.  Aborts on read/write failure —
+// the restart cannot proceed with stale dicts.
+//
+// Replaces three foamDictionary subprocess spawns per reconfig.  The
+// dictionary class auto-handles the FoamFile sub-entry because we read
+// with keepHeader=true and write with subDict=false.
+template<class T>
+static void dmrUpdateDictEntry
 (
-    const std::string& casePath,
-    const std::string& dictRelPath,
-    const std::string& entry,
-    const std::string& value
+    const std::string& filePath,
+    const std::string& key,
+    const T& value
 )
 {
-    const std::string cmd =
-        "foamDictionary -entry " + entry + " -set '" + value + "'"
-      + " '" + casePath + "/" + dictRelPath + "'";
+    Foam::dictionary dict;
 
-    dmrRunOrAbort(casePath, "dmr_foamDictionary.log", cmd);
+    {
+        Foam::IFstream is(filePath);
+        if (!is.good())
+        {
+            std::fprintf
+            (
+                stderr,
+                "DMR: FATAL — cannot read '%s' for entry '%s'.\n",
+                filePath.c_str(), key.c_str()
+            );
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        dict.read(is, /* keepHeader = */ true);
+    }
+
+    dict.set(Foam::word(key), value);
+
+    {
+        Foam::OFstream os(filePath);
+        if (!os.good())
+        {
+            std::fprintf
+            (
+                stderr,
+                "DMR: FATAL — cannot write '%s' for entry '%s'.\n",
+                filePath.c_str(), key.c_str()
+            );
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        // subDict=false → no outer { }, this is a top-level dict.
+        dict.write(os, /* subDict = */ false);
+    }
+
+    // Record the change in log.dmr/dmr_dict_updates.log so a user can see
+    // what dmrRestart modified between reconfigs without diff-ing the
+    // dicts themselves.  One line per update: <file> set <key> = <value>.
+    if (dmrLogEnabled())
+    {
+        // Derive case path from the dict file path (strip the system/<dict>
+        // tail).  The log goes alongside dmr_reconstruct.log etc.
+        const auto sysPos = filePath.rfind("/system/");
+        const std::string casePath =
+            sysPos != std::string::npos ? filePath.substr(0, sysPos) : ".";
+        Foam::mkDir(casePath + "/log.dmr");
+        const std::string updatesLog = casePath + "/log.dmr/dmr_dict_updates.log";
+        if (FILE* f = std::fopen(updatesLog.c_str(), "a"))
+        {
+            Foam::OStringStream oss;
+            oss << value;
+            std::fprintf
+            (
+                f,
+                "%s  set  %s = %s\n",
+                filePath.c_str(),
+                key.c_str(),
+                oss.str().c_str()
+            );
+            std::fclose(f);
+        }
+    }
+}
+
+
+// Find the latest time directory in the case (largest float-parsed name).
+// Used by dmrRestart to pass an explicit -time to decomposePar so that
+// moving-mesh cases correctly re-decompose <time>/polyMesh/points instead
+// of the (-latestTime + -copyZero) path that copies serial points verbatim.
+// Returns the directory basename (e.g. "0.085"), or empty string if none
+// found — the caller is expected to abort in that case.
+static std::string dmrLatestTimeName(const std::string& casePath)
+{
+    // Glob direct children whose names start with a digit.  This matches
+    // OpenFOAM time names ("0", "0.05", "1.5", "100", ...) and excludes
+    // "constant", "system", "processor*", "log.dmr", etc.
+    const std::string pattern = casePath + "/[0-9]*";
+    glob_t g;
+    if (glob(pattern.c_str(), 0, nullptr, &g) != 0)
+    {
+        return "";
+    }
+
+    double maxT = -1.0;
+    std::string maxName;
+    for (size_t i = 0; i < g.gl_pathc; ++i)
+    {
+        std::string p(g.gl_pathv[i]);
+        const auto slash = p.find_last_of('/');
+        const std::string name = p.substr(slash + 1);
+        try
+        {
+            const double t = std::stod(name);
+            if (t > maxT)
+            {
+                maxT = t;
+                maxName = name;
+            }
+        }
+        catch (const std::exception&)
+        {
+            // Not a numeric dir — skip.
+        }
+    }
+    globfree(&g);
+    return maxName;
 }
 
 
@@ -133,7 +314,13 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
         const std::string casePath = runTime.globalPath();
         const std::string timeName = runTime.name();
 
-        Info<< "DMR: Reconstructing processor directories..." << nl;
+        dmrLifecycleLog
+        (
+            casePath,
+            "Checkpoint at t=" + timeName
+          + (isDmrForced ? " (DMR-forced)" : " (writeInterval)")
+        );
+        dmrLifecycleLog(casePath, "Reconstructing processor directories...");
 
         // reconstructPar flags:
         //   -newTimes   only merge time dirs not already present in serial
@@ -145,16 +332,29 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
 
         dmrRunOrAbort(casePath, "dmr_reconstruct.log", cmd);
 
-        Info<< "DMR: Reconstruction complete." << nl;
+        // Cheap insurance against filesystem coherence quirks before the
+        // new process group's decomposePar reads what we just wrote.  On
+        // POSIX-coherent filesystems (GPFS, Lustre, local ext4) this is a
+        // no-op for our case.  On Docker bind mounts we observed write
+        // visibility delays — sync() forces buffered writes to be flushed.
+        ::sync();
+
+        dmrLifecycleLog(casePath, "Reconstruction complete.");
 
         // ---- Sentinel-based checkpoint cleanup ----------------------------
-        // Touch a hidden marker in the reconstructed time dir, then sweep
-        // out any older marker dirs, keeping only this (newest) one on disk.
+        //
+        // SAFETY NOTE on deleting the previous sentinel: the data at the
+        // older sentinel time was already loaded into the new process
+        // group's memory at the previous reconfig, the simulation has
+        // advanced past it (in memory) before this reconfig fires, and
+        // the just-touched newer sentinel is what restart-from-disk would
+        // pick up.  So the older dir is no longer a useful restart anchor;
+        // removing it from disk does not lose simulation history.
         //
         // OF time names are decimals (e.g. "0.085", "0.17") and must be
-        // compared as floats — version sort is wrong here because it splits
-        // at '.' and compares each segment as an integer, so version sort
-        // would order "0.17" before "0.085" (since 17 < 85).
+        // compared as floats — version sort would order "0.17" before
+        // "0.085" (since version sort segments at '.' and compares each
+        // segment as an integer: 17 < 85).
         if (isDmrForced)
         {
             const std::string sentinel =
@@ -163,9 +363,9 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
                 std::fclose(s);
 
             // Glob every sentinel-bearing time dir, parse time as double,
-            // sort, and remove all but the newest.  rm -rf via std::system
-            // is the only shell-out left — there is no portable C++14
-            // recursive remove (std::filesystem is C++17).
+            // sort, and remove all but the newest.  Foam::rmDir is the
+            // OpenFOAM-internal recursive remove (POSIX-backed), avoiding
+            // a subprocess fork per cleanup.
             const std::string pattern = casePath + "/*/.dmr_checkpoint";
             glob_t g;
             if (glob(pattern.c_str(), 0, nullptr, &g) == 0)
@@ -195,7 +395,7 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
                 // Drop the newest (last after ascending sort), remove rest.
                 for (size_t i = 0; i + 1 < dirs.size(); ++i)
                 {
-                    std::system(("rm -rf '" + dirs[i].second + "'").c_str());
+                    Foam::rmDir(dirs[i].second);
                 }
             }
         }
@@ -221,61 +421,83 @@ void dmrRestart(const std::string& casePath, bool allRegions)
 
     if (myRank == 0)
     {
-        std::fprintf
+        dmrLifecycleLog
         (
-            stderr,
-            "DMR: Restarting with %d processes.\n",
-            newSize
+            casePath,
+            "Restarting with " + std::to_string(newSize) + " processes."
         );
 
         // ---- Update decomposeParDict ----------------------------------------
+        //
+        // In-process via Foam::dictionary IO — replaces three foamDictionary
+        // subprocess spawns.  Faster (no fork+exec ×3) and surfaces parse
+        // errors as proper OF FATAL ERRORs with line numbers, instead of
+        // foamDictionary silently truncating the file (which is what we hit
+        // when the case template had `location system;` unquoted).
+
+        const std::string decomposeParDict =
+            casePath + "/system/decomposeParDict";
 
         // numberOfSubdomains must match the new process count.
-        dmrSetDictEntry
-        (
-            casePath,
-            "system/decomposeParDict",
-            "numberOfSubdomains",
-            std::to_string(newSize)
-        );
+        dmrUpdateDictEntry(decomposeParDict, "numberOfSubdomains", label(newSize));
 
         // Force scotch: geometric decomposers (hierarchical, simple) require
         // n-coefficients that do not hold when DMR changes the process count.
-        dmrSetDictEntry
-        (
-            casePath,
-            "system/decomposeParDict",
-            "decomposer",
-            "scotch"
-        );
+        dmrUpdateDictEntry(decomposeParDict, "decomposer", word("scotch"));
 
         // ---- Update controlDict --------------------------------------------
 
-        dmrSetDictEntry
+        dmrUpdateDictEntry
         (
-            casePath,
-            "system/controlDict",
+            casePath + "/system/controlDict",
             "startFrom",
-            "latestTime"
+            word("latestTime")
         );
 
-        // ---- Decompose serial case for the new process count ---------------
+        // TODO multi-region: foamMultiRun cases may have per-region
+        // system/<region>/decomposeParDict and system/<region>/controlDict.
+        // For -allRegions decomposition the root system/decomposeParDict is
+        // what controls subdomain count, so the above is sufficient for the
+        // cases tested in FOAMMULTIRUN_TEST_FINDINGS.md.  Per-region
+        // overrides not handled here.
 
+        // ---- Decompose serial case for the new process count ---------------
+        //
         // decomposePar flags:
-        //   -force       remove any pre-existing processor* before decomposing
-        //   -latestTime  decompose only the restart time (picks up moved
-        //                polyMesh/points for dynamic mesh cases)
-        //   -cellProc    required for NCC cyclic patches (nFaces is 0 in
-        //                serial, so cellProc must be regenerated)
-        //   -allRegions  multi-region for foamMultiRun
+        //   -force      remove any pre-existing processor* before decomposing
+        //   -time <T>   decompose specifically at time T.  Pass an explicit
+        //               time rather than -latestTime because moving-mesh
+        //               cases (constant/dynamicMeshDict, <time>/polyMesh/
+        //               points written) need points decomposed not copied.
+        //               -latestTime with default behaviour falls back to the
+        //               serial points → all processors get the full point
+        //               set → face area mismatch at processor boundaries
+        //               → crash.  See FOAMMULTIRUN_TEST_FINDINGS.md.  -time
+        //               is universally correct for static and dynamic mesh.
+        //   -cellProc   required for NCC cyclic patches (nFaces is 0 in
+        //               serial, so cellProc must be regenerated)
+        //   -allRegions multi-region for foamMultiRun
+
+        const std::string restartTime = dmrLatestTimeName(casePath);
+        if (restartTime.empty())
+        {
+            std::fprintf
+            (
+                stderr,
+                "DMR: FATAL — no time directories found in '%s'.\n",
+                casePath.c_str()
+            );
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
         std::string cmd =
-            "decomposePar -force -latestTime -cellProc"
-            " -case '" + casePath + "'";
+            "decomposePar -force -time " + restartTime + " -cellProc"
+          + " -case '" + casePath + "'";
         if (allRegions) cmd += " -allRegions";
 
         dmrRunOrAbort(casePath, "dmr_decompose.log", cmd);
 
-        std::fprintf(stderr, "DMR: Decomposition complete.\n");
+        dmrLifecycleLog(casePath, "Decomposition complete.");
     }
 
     // All NEW-group ranks synchronise before proceeding to setRootCase.H,
@@ -289,40 +511,62 @@ void dmrRestart(const std::string& casePath, bool allRegions)
 void dmrFinalize(const std::string& casePath, bool allRegions)
 {
     // Called after dmr_finalize().  Merge any remaining processor dirs
-    // into the serial case, then sweep all DMR-forced checkpoint dirs
-    // that were never superseded by a natural write.
+    // into the serial case, sweep DMR-forced sentinels, and remove the
+    // processor* directories now that the run is complete.
 
     MPI_Barrier(MPI_COMM_WORLD);
 
     if (Pstream::master())
     {
-        Info<< "DMR: Final reconstruction to serial..." << nl;
+        dmrLifecycleLog(casePath, "Final reconstruction to serial...");
 
         std::string cmd =
             "reconstructPar -newTimes -rm -case '" + casePath + "'";
         if (allRegions) cmd += " -allRegions";
 
-        const std::string logPath = casePath + "/logs/dmr_final.log";
-        const std::string fullCmd =
-            "mkdir -p '" + casePath + "/logs' && "
-          + cmd + " >> '" + logPath + "' 2>&1";
-
+        // dmrRunOrAbort would MPI_Abort on failure, but here we want a
+        // softer landing — the simulation has already finished, so a
+        // failure should leave processor* dirs in place for inspection
+        // rather than killing the job.
+        if (dmrLogEnabled())
+        {
+            Foam::mkDir(casePath + "/log.dmr");
+        }
+        const std::string logPath = dmrLogPath(casePath, "dmr_final.log");
+        const std::string fullCmd = cmd + " >> '" + logPath + "' 2>&1";
         const int ret = std::system(fullCmd.c_str());
 
         if (ret != 0)
         {
             WarningInFunction
                 << "DMR: final reconstructPar failed (exit " << ret
-                << "). Processor directories may remain; see "
-                << logPath.c_str() << nl;
+                << "). Processor directories preserved for inspection; "
+                << "see " << logPath.c_str() << nl;
         }
         else
         {
-            Info<< "DMR: Final reconstruction complete." << nl;
+            dmrLifecycleLog(casePath, "Final reconstruction complete.");
+
+            // ---- processor* cleanup ---------------------------------------
+            // Only delete on successful reconstruction.  After a clean
+            // finish the case is ready for serial post-processing and
+            // processor* dirs are dead weight.  On failure we keep them
+            // so the user can debug the parallel state.
+            glob_t pg;
+            const std::string ppattern = casePath + "/processor*";
+            if (glob(ppattern.c_str(), GLOB_ONLYDIR, nullptr, &pg) == 0)
+            {
+                for (size_t i = 0; i < pg.gl_pathc; ++i)
+                {
+                    Foam::rmDir(pg.gl_pathv[i]);
+                }
+                globfree(&pg);
+            }
         }
 
-        // Remove all remaining DMR-forced checkpoint dirs.  These are
-        // superseded by whatever the time loop wrote at or before endTime.
+        // Remove all remaining DMR-forced sentinel dirs.  These are
+        // superseded by whatever the time loop wrote at or before endTime
+        // (or by the final reconstructPar above).
         const std::string pattern = casePath + "/*/.dmr_checkpoint";
         glob_t g;
         if (glob(pattern.c_str(), 0, nullptr, &g) == 0)
@@ -332,7 +576,7 @@ void dmrFinalize(const std::string& casePath, bool allRegions)
             {
                 std::string p(g.gl_pathv[i]);
                 p.resize(p.size() - suffix.size());
-                std::system(("rm -rf '" + p + "'").c_str());
+                Foam::rmDir(p);
             }
             globfree(&g);
         }

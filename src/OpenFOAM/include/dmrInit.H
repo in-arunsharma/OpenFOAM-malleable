@@ -1,11 +1,15 @@
 // DMR initialisation — include before setRootCase.H.
 // For multi-region (foamMultiRun), define DMR_ALL_REGIONS true first.
 //
-// Runtime control:
+// Runtime control (OpenFOAM-side hooks):
 //   FOAM_DMR_ENABLED=1       activates DMR (required even when compiled in)
+//   FOAM_DMR_LOG=1           write DMR-internal subprocess output to
+//                            <case>/log.dmr/ (default on; set 0 to silence)
 //   DMR_CHECK_INTERVAL       steps between reconfiguration checks
-//   DMR_DEFAULT_POLICY_MIN   node lower bound
-//   DMR_DEFAULT_POLICY_MAX   node upper bound
+//
+// DMR-library knobs (DMR_DEFAULT_POLICY_MIN, DMR_DEFAULT_POLICY_MAX,
+// DMR_PRINT_ANALYTICS, DMR_DEBUG_LEVEL, DMR_PROCS_PER_NODE, ...) are read
+// directly by the DMR library and need no OpenFOAM-side bridging.
 
 #ifndef DMR_ALL_REGIONS
 #define DMR_ALL_REGIONS false
@@ -48,21 +52,11 @@ if (dmrEnabled)
 
     // DMR_AUTO phases: init / running / restart / cleanup.
     // On restart, dmrRestart() updates the case dicts and decomposes for the
-    // new process count, all via subprocess — safe to run inside DMR_AUTO.
+    // new process count — safe to run inside DMR_AUTO.
     DMR_AUTO(
         dmr_init(argc, argv),
         (void)NULL,
         Foam::dmrRestart(dmrCasePath, dmrAllRegions),
         (void)NULL
     );
-
-    // Bridge environment variables to the DMR C API.
-    // The Docker DMR library (v2.0.0) does not read these natively.
-    {
-        const char* envMax = std::getenv("DMR_DEFAULT_POLICY_MAX");
-        if (envMax) dmr_set_policy_max_nodes(std::atoi(envMax));
-
-        const char* envMin = std::getenv("DMR_DEFAULT_POLICY_MIN");
-        if (envMin) dmr_set_policy_min_nodes(std::atoi(envMin));
-    }
 }

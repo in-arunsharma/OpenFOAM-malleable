@@ -26,12 +26,15 @@ License
 #include "dmrRedist.H"
 #include "Pstream.H"
 
-#include <dmr.h>
 #include <mpi.h>
+#include <glob.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <utility>
+#include <vector>
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -49,9 +52,10 @@ static void dmrRunOrAbort
 {
     const std::string logPath = casePath + "/logs/" + logName;
 
+    // Append rather than overwrite so successive reconfigs keep their logs.
     const std::string cmd =
         "mkdir -p '" + casePath + "/logs' && "
-      + utilityArgs + " > '" + logPath + "' 2>&1";
+      + utilityArgs + " >> '" + logPath + "' 2>&1";
 
     const int ret = std::system(cmd.c_str());
 
@@ -83,59 +87,6 @@ static void dmrSetDictEntry
       + " '" + casePath + "/" + dictRelPath + "'";
 
     dmrRunOrAbort(casePath, "dmr_foamDictionary.log", cmd);
-}
-
-
-// Append one row to <case>/logs/dmr_analytics.csv.
-// Writes the CSV header on first call (file position 0).
-// Only called by master rank.
-static void dmrWriteAnalytics
-(
-    const std::string& casePath,
-    const DMRAnalytics& a,
-    const char* phase
-)
-{
-    const std::string csvPath = casePath + "/logs/dmr_analytics.csv";
-
-    FILE* f = std::fopen(csvPath.c_str(), "a");
-    if (!f)
-    {
-        std::fprintf
-        (
-            stderr,
-            "DMR: warning — cannot open '%s' for analytics logging.\n",
-            csvPath.c_str()
-        );
-        return;
-    }
-
-    // Write header only when the file is newly created (append position == 0).
-    if (std::ftell(f) == 0)
-    {
-        std::fprintf
-        (
-            f,
-            "phase,event_time,event,world_size,node_count,"
-            "reconfiguration_time_s,communication_efficiency,pending_nodes\n"
-        );
-    }
-
-    std::fprintf
-    (
-        f,
-        "%s,%.3f,%s,%d,%d,%.4f,%.4f,%d\n",
-        phase,
-        a.event_time,
-        dmr_get_analytics_event_str(a.event),
-        a.world_size,
-        a.node_count,
-        a.reconfiguration_time,
-        a.communication_efficiency,
-        a.pending_nodes
-    );
-
-    std::fclose(f);
 }
 
 
@@ -197,11 +148,13 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
         Info<< "DMR: Reconstruction complete." << nl;
 
         // ---- Sentinel-based checkpoint cleanup ----------------------------
-        // Touch a hidden marker in the reconstructed time dir.  Then sweep
+        // Touch a hidden marker in the reconstructed time dir, then sweep
         // out any older marker dirs, keeping only this (newest) one on disk.
-        // sort -V: version-style sort (0.1 < 1.0 < 10.0) — correct for OF
-        // time names.  head -n -1: drop the last (newest) line.
-        // xargs -r: skip execution entirely when stdin is empty (GNU xargs).
+        //
+        // OF time names are decimals (e.g. "0.085", "0.17") and must be
+        // compared as floats — version sort is wrong here because it splits
+        // at '.' and compares each segment as an integer, so version sort
+        // would order "0.17" before "0.085" (since 17 < 85).
         if (isDmrForced)
         {
             const std::string sentinel =
@@ -209,22 +162,42 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
             if (FILE* s = std::fopen(sentinel.c_str(), "w"))
                 std::fclose(s);
 
-            std::system
-            (
-                ("find '" + casePath + "' -maxdepth 2"
-                 " -name '.dmr_checkpoint' -printf '%h\\n'"
-                 " | sort -V | head -n -1"
-                 " | xargs -r -I{} rm -rf '{}'").c_str()
-            );
-        }
+            // Glob every sentinel-bearing time dir, parse time as double,
+            // sort, and remove all but the newest.  rm -rf via std::system
+            // is the only shell-out left — there is no portable C++14
+            // recursive remove (std::filesystem is C++17).
+            const std::string pattern = casePath + "/*/.dmr_checkpoint";
+            glob_t g;
+            if (glob(pattern.c_str(), 0, nullptr, &g) == 0)
+            {
+                const std::string suffix = "/.dmr_checkpoint";
+                std::vector<std::pair<double, std::string>> dirs;
+                dirs.reserve(g.gl_pathc);
+                for (size_t i = 0; i < g.gl_pathc; ++i)
+                {
+                    std::string p(g.gl_pathv[i]);
+                    p.resize(p.size() - suffix.size());
+                    const auto slash = p.find_last_of('/');
+                    const std::string tName = p.substr(slash + 1);
+                    try
+                    {
+                        dirs.emplace_back(std::stod(tName), p);
+                    }
+                    catch (const std::exception&)
+                    {
+                        // Non-numeric dir name — skip rather than crash.
+                    }
+                }
+                globfree(&g);
 
-        // ---- Analytics ---------------------------------------------------
-        // dmr_get_analytics() fills per-reconfiguration metrics that are
-        // only available on rank 0.  Log to CSV for the overhead analysis.
-        DMRAnalytics analytics;
-        if (dmr_get_analytics(&analytics) == DMR_SUCCESS)
-        {
-            dmrWriteAnalytics(casePath, analytics, "checkpoint");
+                std::sort(dirs.begin(), dirs.end());
+
+                // Drop the newest (last after ascending sort), remove rest.
+                for (size_t i = 0; i + 1 < dirs.size(); ++i)
+                {
+                    std::system(("rm -rf '" + dirs[i].second + "'").c_str());
+                }
+            }
         }
     }
 
@@ -303,13 +276,6 @@ void dmrRestart(const std::string& casePath, bool allRegions)
         dmrRunOrAbort(casePath, "dmr_decompose.log", cmd);
 
         std::fprintf(stderr, "DMR: Decomposition complete.\n");
-
-        // ---- Analytics ---------------------------------------------------
-        DMRAnalytics analytics;
-        if (dmr_get_analytics(&analytics) == DMR_SUCCESS)
-        {
-            dmrWriteAnalytics(casePath, analytics, "restart");
-        }
     }
 
     // All NEW-group ranks synchronise before proceeding to setRootCase.H,
@@ -322,10 +288,9 @@ void dmrRestart(const std::string& casePath, bool allRegions)
 
 void dmrFinalize(const std::string& casePath, bool allRegions)
 {
-    // Called after dmr_finalize() — DMR is no longer active at this point,
-    // so no analytics call here.  Merge any remaining processor dirs into
-    // the serial case, then sweep all DMR-forced checkpoint dirs that were
-    // never superseded by a natural write.
+    // Called after dmr_finalize().  Merge any remaining processor dirs
+    // into the serial case, then sweep all DMR-forced checkpoint dirs
+    // that were never superseded by a natural write.
 
     MPI_Barrier(MPI_COMM_WORLD);
 
@@ -340,7 +305,7 @@ void dmrFinalize(const std::string& casePath, bool allRegions)
         const std::string logPath = casePath + "/logs/dmr_final.log";
         const std::string fullCmd =
             "mkdir -p '" + casePath + "/logs' && "
-          + cmd + " > '" + logPath + "' 2>&1";
+          + cmd + " >> '" + logPath + "' 2>&1";
 
         const int ret = std::system(fullCmd.c_str());
 
@@ -358,12 +323,19 @@ void dmrFinalize(const std::string& casePath, bool allRegions)
 
         // Remove all remaining DMR-forced checkpoint dirs.  These are
         // superseded by whatever the time loop wrote at or before endTime.
-        std::system
-        (
-            ("find '" + casePath + "' -maxdepth 2"
-             " -name '.dmr_checkpoint' -printf '%h\\n'"
-             " | xargs -r -I{} rm -rf '{}'").c_str()
-        );
+        const std::string pattern = casePath + "/*/.dmr_checkpoint";
+        glob_t g;
+        if (glob(pattern.c_str(), 0, nullptr, &g) == 0)
+        {
+            const std::string suffix = "/.dmr_checkpoint";
+            for (size_t i = 0; i < g.gl_pathc; ++i)
+            {
+                std::string p(g.gl_pathv[i]);
+                p.resize(p.size() - suffix.size());
+                std::system(("rm -rf '" + p + "'").c_str());
+            }
+            globfree(&g);
+        }
     }
 
     MPI_Barrier(MPI_COMM_WORLD);

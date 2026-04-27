@@ -26,9 +26,6 @@ License
 #include "dmrRedist.H"
 #include "OSspecific.H"
 #include "Pstream.H"
-#include "IFstream.H"
-#include "OFstream.H"
-#include "dictionary.H"
 
 #include <mpi.h>
 #include <glob.h>
@@ -157,85 +154,29 @@ static int dmrRunOrAbort
 }
 
 
-// Replace one entry of an OpenFOAM case dictionary, in process.  Reads
-// the dict from disk preserving its FoamFile header, calls dict.set()
-// (which adds-or-overwrites), and writes it back.  Aborts on read/write
-// failure — the restart cannot proceed with stale dicts.
+// Update a single entry in a case dictionary by calling foamDictionary.
+// We tried doing this in-process via Foam::dictionary read/write, but the
+// in-process round-trip silently produced a no-op write on multi-region
+// controlDicts that contain a regionSolvers sub-dictionary plus a
+// leading C++ comment block.  foamDictionary handles every dict format
+// the user might bring uniformly, so it is safer to keep the subprocess
+// even though it costs three fork+exec per reconfiguration.
 //
-// Replaces three foamDictionary subprocess spawns per reconfig.  The
-// dictionary class auto-handles the FoamFile sub-entry because we read
-// with keepHeader=true and write with subDict=false (i.e. without an
-// outer { } wrapper since this is a top-level dict).
-//
-// The casePath is taken explicitly rather than inferred from filePath
-// so the dict-update audit log can be written alongside the other DMR
-// logs without string parsing.
-template<class T>
+// Aborts on subprocess failure: a stale dict at the start of the new
+// process group would corrupt every subsequent reconfiguration.
 static void dmrUpdateDictEntry
 (
     const std::string& casePath,
-    const std::string& filePath,
-    const std::string& key,
-    const T& value
+    const std::string& dictRelPath,
+    const std::string& entry,
+    const std::string& value
 )
 {
-    Foam::dictionary dict;
+    const std::string cmd =
+        "foamDictionary -entry " + entry + " -set '" + value + "'"
+      + " '" + casePath + "/" + dictRelPath + "'";
 
-    {
-        Foam::IFstream is(filePath);
-        if (!is.good())
-        {
-            std::fprintf
-            (
-                stderr,
-                "DMR: FATAL — cannot read '%s' for entry '%s'.\n",
-                filePath.c_str(), key.c_str()
-            );
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-        dict.read(is, /* keepHeader = */ true);
-    }
-
-    dict.set(Foam::word(key), value);
-
-    {
-        Foam::OFstream os(filePath);
-        if (!os.good())
-        {
-            std::fprintf
-            (
-                stderr,
-                "DMR: FATAL — cannot write '%s' for entry '%s'.\n",
-                filePath.c_str(), key.c_str()
-            );
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-        dict.write(os, /* subDict = */ false);
-    }
-
-    // Audit trail: one line per dict update in log.dmr/dmr_dict_updates.log.
-    // Lets a reviewer see what dmrRestart modified between reconfigs
-    // without having to diff the dicts.
-    if (dmrLogEnabled())
-    {
-        Foam::mkDir(casePath + "/log.dmr");
-        const std::string updatesLog =
-            casePath + "/log.dmr/dmr_dict_updates.log";
-        if (FILE* f = std::fopen(updatesLog.c_str(), "a"))
-        {
-            Foam::OStringStream oss;
-            oss << value;
-            std::fprintf
-            (
-                f,
-                "%s  set  %s = %s\n",
-                filePath.c_str(),
-                key.c_str(),
-                oss.str().c_str()
-            );
-            std::fclose(f);
-        }
-    }
+    dmrRunOrAbort(casePath, "dmr_dict_updates.log", cmd);
 }
 
 
@@ -439,22 +380,13 @@ void dmrRestart(const std::string& casePath, bool allRegions)
             "Restarting with " + std::to_string(newSize) + " processes."
         );
 
-        // ---- Update decomposeParDict ----------------------------------------
-        //
-        // In-process via Foam::dictionary IO — replaces three foamDictionary
-        // subprocess spawns.  Faster (no fork+exec ×3) and surfaces parse
-        // errors as proper OF FATAL ERRORs with line numbers, instead of
-        // foamDictionary silently truncating the file (which is what we hit
-        // when the case template had `location system;` unquoted).
-
-        const std::string decomposeParDict =
-            casePath + "/system/decomposeParDict";
+        // ---- Update decomposeParDict ---------------------------------------
 
         // numberOfSubdomains must match the new process count.
         dmrUpdateDictEntry
         (
-            casePath, decomposeParDict,
-            "numberOfSubdomains", label(newSize)
+            casePath, "system/decomposeParDict",
+            "numberOfSubdomains", std::to_string(newSize)
         );
 
         // Force scotch: geometric decomposers (hierarchical, simple)
@@ -462,16 +394,16 @@ void dmrRestart(const std::string& casePath, bool allRegions)
         // process count.
         dmrUpdateDictEntry
         (
-            casePath, decomposeParDict,
-            "decomposer", word("scotch")
+            casePath, "system/decomposeParDict",
+            "decomposer", "scotch"
         );
 
         // ---- Update controlDict --------------------------------------------
 
         dmrUpdateDictEntry
         (
-            casePath, casePath + "/system/controlDict",
-            "startFrom", word("latestTime")
+            casePath, "system/controlDict",
+            "startFrom", "latestTime"
         );
 
         // TODO multi-region: foamMultiRun cases may have per-region

@@ -89,7 +89,7 @@ Usage
 #ifdef FOAM_USE_DMR
     #define DMR_ALL_REGIONS true
     #include "foamDmr.H"
-    #include "foamDmrRedist.H"
+    #include "dmrRedist.H"
 #endif
 
 using namespace Foam;

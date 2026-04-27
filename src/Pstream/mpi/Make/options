@@ -1,4 +1,9 @@
 -include $(GENERAL_RULES)/mplibType
 
-EXE_INC  = $(PFLAGS) $(PINC)
+DMR_INC :=
+ifneq (,$(wildcard $(DMR_PATH)/include/dmr.h))
+DMR_INC = -DFOAM_USE_DMR
+endif
+
+EXE_INC  = $(PFLAGS) $(PINC) $(DMR_INC)
 LIB_LIBS = $(PLIBS)

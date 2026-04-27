@@ -64,7 +64,7 @@ Usage
 
 #ifdef FOAM_USE_DMR
     #include "foamDmr.H"
-    #include "foamDmrRedist.H"
+    #include "dmrRedist.H"
 #endif
 
 using namespace Foam;

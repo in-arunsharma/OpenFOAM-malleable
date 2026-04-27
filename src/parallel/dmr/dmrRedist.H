@@ -22,18 +22,24 @@ License
     along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
 
 Description
-    Malleable checkpoint/restart helpers for DMR-enabled solvers.
+    Checkpoint/restart helpers for DMR-driven malleable solvers.
 
-    Both checkpoint and restart drive the stock OpenFOAM utilities
-    (reconstructPar, decomposePar, foamDictionary) through std::system().
-    Prior experiments with the in-process decomposition/reconstruction API
-    failed with MPI_ERR_TRUNCATE on the post-restart communicator; the
-    OpenFOAM Foundation has confirmed that in-process reuse across MPI
-    sessions is not supported.  The subprocess boundary is therefore the
-    intended pattern, not a workaround.
+    On reconfiguration, the OLD process group calls dmrCheckpoint() to
+    flush its fields and reconstruct them into a serial case on disk;
+    the NEW group calls dmrRestart() to update the case dictionaries and
+    decompose for the new process count.  After the time loop ends,
+    dmrFinalize() merges any leftover processor directories and removes
+    them.
 
-    Both functions are implemented in dmrRedist.C and compiled into
-    libfoamDmr, which is linked by foamRun and foamMultiRun.
+    reconstructPar and decomposePar are invoked as subprocesses (the
+    only path that works across MPI sessions; in-process reuse fails
+    with MPI_ERR_TRUNCATE on the post-restart communicator).  All other
+    operations (dictionary edits, directory removal, sentinel handling)
+    are performed in-process via Foam::dictionary, Foam::rmDir and the
+    POSIX glob API.
+
+    Implemented in dmrRedist.C and compiled into libfoamDmr, linked by
+    foamRun and foamMultiRun.
 
 \*---------------------------------------------------------------------------*/
 
@@ -61,10 +67,12 @@ void dmrCheckpoint(Time& runTime, bool allRegions = false);
 
 //- Called by NEW processes at startup (inside DMR_AUTO).
 //  Updates system/decomposeParDict (numberOfSubdomains, decomposer) and
-//  system/controlDict (startFrom latestTime) via foamDictionary, then
-//  decomposes the serial case for the new process count via a decomposePar
-//  subprocess.  Both steps are driven by the subprocess boundary — no
-//  OpenFOAM in-process calls.
+//  system/controlDict (startFrom latestTime) in process via Foam::dictionary,
+//  then decomposes the latest serial time directory for the new process
+//  count via a decomposePar subprocess.  decomposePar is invoked with
+//  -time <latest> rather than -latestTime so that moving-mesh cases
+//  re-decompose <time>/polyMesh/points correctly (see
+//  FOAMMULTIRUN_TEST_FINDINGS.md).
 //  \param casePath    Absolute path to the case directory.
 //  \param allRegions  True for foamMultiRun multi-region cases.
 void dmrRestart(const std::string& casePath, bool allRegions = false);

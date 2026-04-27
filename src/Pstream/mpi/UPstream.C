@@ -63,13 +63,23 @@ void Foam::UPstream::addValidParOptions(HashTable<string>& validParOptions)
 
 bool Foam::UPstream::init(int& argc, char**& argv, const bool needsThread)
 {
-    // Skip MPI_Init if already initialized (e.g. by DMR's dmr_init)
-    int mpiAlreadyInitialized;
-    MPI_Initialized(&mpiAlreadyInitialized);
-
     int provided_thread_support;
 
+#ifdef FOAM_USE_DMR
+    // When DMR is compiled in and active at runtime (FOAM_DMR_ENABLED=1),
+    // dmr_init() has already initialised MPI from dmrInit.H before
+    // setRootCase.H reaches us; calling MPI_Init_thread a second time
+    // would abort with MPI_ERR_INIT.  When DMR is compiled in but
+    // disabled at runtime (FOAM_DMR_ENABLED=0), dmrInit.H's
+    // `if (dmrEnabled)` block was skipped — no MPI pre-init happened —
+    // and the check below falls through to MPI_Init_thread normally.
+    // The MPI_Initialized() probe is thus self-gating: it covers both
+    // runtime configurations correctly.
+    int mpiAlreadyInitialized = 0;
+    MPI_Initialized(&mpiAlreadyInitialized);
+
     if (!mpiAlreadyInitialized)
+#endif
     {
         MPI_Init_thread
         (

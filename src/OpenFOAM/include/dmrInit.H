@@ -2,14 +2,16 @@
 // For multi-region (foamMultiRun), define DMR_ALL_REGIONS true first.
 //
 // Runtime control (OpenFOAM-side hooks):
-//   FOAM_DMR_ENABLED=1       activates DMR (required even when compiled in)
-//   FOAM_DMR_LOG=1           write DMR-internal subprocess output to
-//                            <case>/log.dmr/ (default on; set 0 to silence)
-//   DMR_CHECK_INTERVAL       steps between reconfiguration checks
+//   FOAM_DMR_ENABLED=1       activates DMR at runtime (required even when
+//                            the binary was compiled with -DFOAM_USE_DMR)
+//   FOAM_DMR_LOG=1           write DMR-internal subprocess and lifecycle
+//                            output to <case>/log.dmr/ (default on; set
+//                            FOAM_DMR_LOG=0 to silence)
 //
-// DMR-library knobs (DMR_DEFAULT_POLICY_MIN, DMR_DEFAULT_POLICY_MAX,
-// DMR_PRINT_ANALYTICS, DMR_DEBUG_LEVEL, DMR_PROCS_PER_NODE, ...) are read
-// directly by the DMR library and need no OpenFOAM-side bridging.
+// DMR-library knobs (DMR_DEFAULT_INHIBITOR for reconfiguration cadence,
+// DMR_DEFAULT_POLICY_MIN/MAX, DMR_PRINT_ANALYTICS, DMR_DEBUG_LEVEL,
+// DMR_PROCS_PER_NODE, ...) are read directly by the DMR library and
+// need no OpenFOAM-side bridging.
 
 #ifndef DMR_ALL_REGIONS
 #define DMR_ALL_REGIONS false

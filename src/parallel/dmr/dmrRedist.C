@@ -111,13 +111,22 @@ static void dmrLifecycleLog
 }
 
 
-// Run a single utility as a subprocess, append its output to the DMR log,
-// and abort the whole job on non-zero exit.  Only called by master rank.
-static void dmrRunOrAbort
+// Run a single utility as a subprocess, append its output to <case>/log.dmr/.
+// On non-zero exit:
+//   abortOnFailure = true  → MPI_Abort(MPI_COMM_WORLD, 1)
+//                            (used during checkpoint/restart, where a stale
+//                             case would corrupt the next reconfig)
+//   abortOnFailure = false → return the exit code, log a warning
+//                            (used in dmrFinalize, where the simulation
+//                             has already finished and the case state is
+//                             still valid for inspection)
+// Only called by master rank.
+static int dmrRunOrAbort
 (
     const std::string& casePath,
     const std::string& logName,
-    const std::string& utilityArgs
+    const std::string& utilityArgs,
+    const bool abortOnFailure = true
 )
 {
     if (dmrLogEnabled())
@@ -133,7 +142,7 @@ static void dmrRunOrAbort
 
     const int ret = std::system(cmd.c_str());
 
-    if (ret != 0)
+    if (ret != 0 && abortOnFailure)
     {
         std::fprintf
         (
@@ -143,20 +152,28 @@ static void dmrRunOrAbort
         );
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
+
+    return ret;
 }
 
 
-// Replace one entry of an OpenFOAM case dictionary, in process.  Reads the
-// dict from disk preserving its FoamFile header, calls dict.set() (which
-// adds-or-overwrites), and writes it back.  Aborts on read/write failure —
-// the restart cannot proceed with stale dicts.
+// Replace one entry of an OpenFOAM case dictionary, in process.  Reads
+// the dict from disk preserving its FoamFile header, calls dict.set()
+// (which adds-or-overwrites), and writes it back.  Aborts on read/write
+// failure — the restart cannot proceed with stale dicts.
 //
 // Replaces three foamDictionary subprocess spawns per reconfig.  The
 // dictionary class auto-handles the FoamFile sub-entry because we read
-// with keepHeader=true and write with subDict=false.
+// with keepHeader=true and write with subDict=false (i.e. without an
+// outer { } wrapper since this is a top-level dict).
+//
+// The casePath is taken explicitly rather than inferred from filePath
+// so the dict-update audit log can be written alongside the other DMR
+// logs without string parsing.
 template<class T>
 static void dmrUpdateDictEntry
 (
+    const std::string& casePath,
     const std::string& filePath,
     const std::string& key,
     const T& value
@@ -193,22 +210,17 @@ static void dmrUpdateDictEntry
             );
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        // subDict=false → no outer { }, this is a top-level dict.
         dict.write(os, /* subDict = */ false);
     }
 
-    // Record the change in log.dmr/dmr_dict_updates.log so a user can see
-    // what dmrRestart modified between reconfigs without diff-ing the
-    // dicts themselves.  One line per update: <file> set <key> = <value>.
+    // Audit trail: one line per dict update in log.dmr/dmr_dict_updates.log.
+    // Lets a reviewer see what dmrRestart modified between reconfigs
+    // without having to diff the dicts.
     if (dmrLogEnabled())
     {
-        // Derive case path from the dict file path (strip the system/<dict>
-        // tail).  The log goes alongside dmr_reconstruct.log etc.
-        const auto sysPos = filePath.rfind("/system/");
-        const std::string casePath =
-            sysPos != std::string::npos ? filePath.substr(0, sysPos) : ".";
         Foam::mkDir(casePath + "/log.dmr");
-        const std::string updatesLog = casePath + "/log.dmr/dmr_dict_updates.log";
+        const std::string updatesLog =
+            casePath + "/log.dmr/dmr_dict_updates.log";
         if (FILE* f = std::fopen(updatesLog.c_str(), "a"))
         {
             Foam::OStringStream oss;
@@ -439,19 +451,27 @@ void dmrRestart(const std::string& casePath, bool allRegions)
             casePath + "/system/decomposeParDict";
 
         // numberOfSubdomains must match the new process count.
-        dmrUpdateDictEntry(decomposeParDict, "numberOfSubdomains", label(newSize));
+        dmrUpdateDictEntry
+        (
+            casePath, decomposeParDict,
+            "numberOfSubdomains", label(newSize)
+        );
 
-        // Force scotch: geometric decomposers (hierarchical, simple) require
-        // n-coefficients that do not hold when DMR changes the process count.
-        dmrUpdateDictEntry(decomposeParDict, "decomposer", word("scotch"));
+        // Force scotch: geometric decomposers (hierarchical, simple)
+        // require n-coefficients that do not hold when DMR changes the
+        // process count.
+        dmrUpdateDictEntry
+        (
+            casePath, decomposeParDict,
+            "decomposer", word("scotch")
+        );
 
         // ---- Update controlDict --------------------------------------------
 
         dmrUpdateDictEntry
         (
-            casePath + "/system/controlDict",
-            "startFrom",
-            word("latestTime")
+            casePath, casePath + "/system/controlDict",
+            "startFrom", word("latestTime")
         );
 
         // TODO multi-region: foamMultiRun cases may have per-region
@@ -524,24 +544,19 @@ void dmrFinalize(const std::string& casePath, bool allRegions)
             "reconstructPar -newTimes -rm -case '" + casePath + "'";
         if (allRegions) cmd += " -allRegions";
 
-        // dmrRunOrAbort would MPI_Abort on failure, but here we want a
-        // softer landing — the simulation has already finished, so a
-        // failure should leave processor* dirs in place for inspection
-        // rather than killing the job.
-        if (dmrLogEnabled())
-        {
-            Foam::mkDir(casePath + "/log.dmr");
-        }
-        const std::string logPath = dmrLogPath(casePath, "dmr_final.log");
-        const std::string fullCmd = cmd + " >> '" + logPath + "' 2>&1";
-        const int ret = std::system(fullCmd.c_str());
+        // Soft fail: the simulation has already finished, so on
+        // reconstruct failure leave processor* dirs in place for
+        // inspection rather than killing the job.
+        const int ret =
+            dmrRunOrAbort(casePath, "dmr_final.log", cmd, /*abort=*/false);
 
         if (ret != 0)
         {
             WarningInFunction
                 << "DMR: final reconstructPar failed (exit " << ret
                 << "). Processor directories preserved for inspection; "
-                << "see " << logPath.c_str() << nl;
+                << "see " << dmrLogPath(casePath, "dmr_final.log").c_str()
+                << nl;
         }
         else
         {

@@ -1,50 +1,28 @@
 // DMR reconfiguration check — include after runTime.write().
-// Requires FOAM_DMR_ENABLED=1 and DMR_CHECK_INTERVAL to be set.
+//
+// dmr_check() is called every time step.  DMR's own inhibitor mechanism
+// (DMR_DEFAULT_INHIBITOR env var, or compile default, or the runtime
+// API dmr_set_reconf_step_inhibitor) decides how often the call actually
+// evaluates the policy.  Inhibited calls return immediately with a
+// counter compare; the policy and any reconfiguration only fire on the
+// (N+1)th call when the inhibitor is N.  This matches the BSC integration
+// pattern used by other malleable applications (e.g. Alya) and keeps the
+// cadence configuration in the DMR namespace, so OpenFOAM does not
+// duplicate state with the DMR library.
 
 if (dmrEnabled)
 {
-    static int dmrStepCounter = 0;
-    static int dmrCheckInterval = -1;
-
-    if (dmrCheckInterval < 0)
+    // Skip if the simulation has already reached endTime — a reconfig
+    // here would reconstruct + decompose with no further time stepping
+    // to amortise the cost.
+    if (runTime.userTimeValue() < runTime.endTime().value())
     {
-        const char* env = std::getenv("DMR_CHECK_INTERVAL");
-        if (!env || std::atoi(env) <= 0)
-        {
-            FatalErrorInFunction
-                << "DMR is enabled but DMR_CHECK_INTERVAL is not set.\n"
-                << "Export DMR_CHECK_INTERVAL=<N> (number of time steps "
-                << "between reconfiguration checks)."
-                << exit(FatalError);
-        }
-        dmrCheckInterval = std::atoi(env);
-        Info<< "DMR: check interval=" << dmrCheckInterval
-            << " steps, policy="
-            << (dmrPolicy == CE_POLICY ? "CE" : "ROUND")
-            << nl;
-    }
-
-    if (++dmrStepCounter >= dmrCheckInterval)
-    {
-        dmrStepCounter = 0;
-
-        // Skip if the simulation is about to end — avoid a pointless
-        // reconstruct+decompose on the final step.
-        if (runTime.userTimeValue() >= runTime.endTime().value())
-        {
-            Info<< "DMR: At endTime, skipping reconfiguration check."
-                << nl;
-        }
-        else
-        {
-            Info<< "DMR: Checking for reconfiguration..." << nl;
-
-            DMR_AUTO(
-                dmr_check(dmrPolicy),
-                Foam::dmrCheckpoint(runTime, dmrAllRegions),
-                (void)NULL,
-                (void)NULL
-            );
-        }
+        DMR_AUTO
+        (
+            dmr_check(dmrPolicy),
+            Foam::dmrCheckpoint(runTime, dmrAllRegions),
+            (void)NULL,
+            (void)NULL
+        );
     }
 }

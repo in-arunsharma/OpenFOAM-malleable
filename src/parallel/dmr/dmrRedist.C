@@ -442,12 +442,54 @@ void dmrRestart(const std::string& casePath, bool allRegions)
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
 
+        // For dynamic-mesh cases, OF only writes a `points` file at later
+        // times when only the points moved (no topology change).  Copy
+        // the missing topology files (boundary, faces, owner, neighbour,
+        // ...) from the most recent earlier time that has them, so
+        // decomposePar -time <restartTime> finds a complete polyMesh.
+        // No-op for static cases.
+        dmrEnsureFullPolyMesh(casePath, restartTime, allRegions);
+
         std::string cmd =
             "decomposePar -force -time " + restartTime + " -cellProc"
           + " -case '" + casePath + "'";
         if (allRegions) cmd += " -allRegions";
 
         dmrRunOrAbort(casePath, "dmr_decompose.log", cmd);
+
+        // Engine cases (e.g. tutorials/CHT/engine2Valve2D) keep extra
+        // sub-meshes under constant/meshes/<name> that decomposePar
+        // -allRegions does not visit.  Without re-decomposing them for
+        // the new process count, the cyclicAMI weights on the second
+        // reconfiguration end up being computed against a stale layout
+        // and decomposePar crashes inside fvMeshStitcher::connectThis
+        // with a 0/0 surface-interpolation weight.  Mirror the pattern
+        // used by the case's own Allrun: after the main decomposePar,
+        // loop over constant/meshes/* and decompose each sub-mesh
+        // explicitly.  No-op for cases that do not have sub-meshes.
+        const std::string subMeshGlob =
+            casePath + "/constant/meshes/*";
+        glob_t mg;
+        if (glob(subMeshGlob.c_str(), GLOB_ONLYDIR, nullptr, &mg) == 0)
+        {
+            for (size_t i = 0; i < mg.gl_pathc; ++i)
+            {
+                const std::string p(mg.gl_pathv[i]);
+                const auto slash = p.find_last_of('/');
+                const std::string meshName = p.substr(slash + 1);
+                // No -force here: OpenFOAM rejects `-force` combined with
+                // `-mesh` plus a single `-region` ("Cannot force the
+                // decomposition of a single region").  The main
+                // `decomposePar -force -allRegions` above has already
+                // cleared the processor* dirs, so each sub-mesh decompose
+                // can append its output without forcing.
+                const std::string mcmd =
+                    "decomposePar -mesh " + meshName
+                  + " -region fluid -case '" + casePath + "'";
+                dmrRunOrAbort(casePath, "dmr_decompose.log", mcmd);
+            }
+            globfree(&mg);
+        }
 
         dmrLifecycleLog(casePath, "Decomposition complete.");
     }
@@ -530,6 +572,130 @@ void dmrFinalize(const std::string& casePath, bool allRegions)
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
+}
+
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+void dmrEnsureFullPolyMesh
+(
+    const std::string& casePath,
+    const std::string& restartTime,
+    bool allRegions
+)
+{
+    if (!dmrHasDynamicMesh(casePath)) return;
+
+    // Files OF requires for a complete polyMesh at decomposition time.
+    // points is omitted because that is the file the dynamic-mesh writer
+    // emits at every changed-points time; it is what we want to keep.
+    static const std::vector<std::string> topologyFiles =
+        {"boundary", "faces", "owner", "neighbour", "faceZones"};
+
+    // Build the list of polyMesh dirs to inspect.
+    // - allRegions=false  → <case>/<time>/polyMesh
+    // - allRegions=true   → <case>/<time>/<region>/polyMesh for each
+    //                       region present at <time>
+    std::vector<std::string> polyMeshDirs;
+    if (!allRegions)
+    {
+        polyMeshDirs.push_back(casePath + "/" + restartTime + "/polyMesh");
+    }
+    else
+    {
+        const std::string regionGlob =
+            casePath + "/" + restartTime + "/*/polyMesh";
+        glob_t rg;
+        if (glob(regionGlob.c_str(), GLOB_ONLYDIR, nullptr, &rg) == 0)
+        {
+            for (size_t i = 0; i < rg.gl_pathc; ++i)
+            {
+                polyMeshDirs.emplace_back(rg.gl_pathv[i]);
+            }
+            globfree(&rg);
+        }
+    }
+
+    if (polyMeshDirs.empty()) return;
+
+    // Sorted list of all time directory names (ascending), used to walk
+    // backwards from restartTime when topology files are missing.
+    glob_t tg;
+    const std::string timeGlob = casePath + "/[0-9]*";
+    std::vector<std::pair<double, std::string>> times;
+    if (glob(timeGlob.c_str(), GLOB_ONLYDIR, nullptr, &tg) == 0)
+    {
+        for (size_t i = 0; i < tg.gl_pathc; ++i)
+        {
+            std::string p(tg.gl_pathv[i]);
+            const auto slash = p.find_last_of('/');
+            const std::string name = p.substr(slash + 1);
+            try { times.emplace_back(std::stod(name), name); }
+            catch (const std::exception&) {}
+        }
+        globfree(&tg);
+    }
+    std::sort(times.begin(), times.end());
+
+    double restartT = -1.0;
+    try { restartT = std::stod(restartTime); } catch (const std::exception&) {}
+
+    for (const auto& pmDir : polyMeshDirs)
+    {
+        // Region tag derived from the polyMesh path (e.g. ".../1/fluid/
+        // polyMesh" → region = "fluid"; ".../1/polyMesh" → region = "").
+        const std::string suffix = "/polyMesh";
+        const std::string parent =
+            pmDir.substr(0, pmDir.size() - suffix.size());
+        const std::string parentLeaf =
+            parent.substr(parent.find_last_of('/') + 1);
+        const bool perRegion = (parentLeaf != restartTime);
+        const std::string region = perRegion ? parentLeaf : std::string();
+
+        for (const auto& f : topologyFiles)
+        {
+            if (Foam::isFile(pmDir + "/" + f)) continue;
+
+            // Walk back through earlier times to find this file.
+            for (auto it = times.rbegin(); it != times.rend(); ++it)
+            {
+                if (it->first >= restartT) continue;
+                const std::string candidate =
+                    perRegion
+                  ? casePath + "/" + it->second + "/" + region
+                          + "/polyMesh/" + f
+                  : casePath + "/" + it->second + "/polyMesh/" + f;
+                if (Foam::isFile(candidate))
+                {
+                    const std::string cp =
+                        "cp '" + candidate + "' '" + pmDir + "/'";
+                    std::system(cp.c_str());
+                    break;
+                }
+            }
+        }
+    }
+}
+
+
+bool dmrHasDynamicMesh(const std::string& casePath)
+{
+    // Single-region case
+    if (Foam::isFile(casePath + "/constant/dynamicMeshDict"))
+    {
+        return true;
+    }
+
+    // Multi-region case: any constant/<region>/dynamicMeshDict
+    const std::string pattern = casePath + "/constant/*/dynamicMeshDict";
+    glob_t g;
+    bool found = false;
+    if (glob(pattern.c_str(), 0, nullptr, &g) == 0)
+    {
+        found = g.gl_pathc > 0;
+        globfree(&g);
+    }
+    return found;
 }
 
 

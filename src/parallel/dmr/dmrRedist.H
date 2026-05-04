@@ -85,6 +85,46 @@ void dmrRestart(const std::string& casePath, bool allRegions = false);
 //  \param allRegions  True for foamMultiRun multi-region cases.
 void dmrFinalize(const std::string& casePath, bool allRegions = false);
 
+//- For dynamic-mesh cases, ensure that the polyMesh directory at the
+//  restart time has a complete set of topology files (boundary, faces,
+//  owner, neighbour) so that decomposePar -time <restartTime> can
+//  proceed.  OpenFOAM's dynamic-mesh writer only emits a `points` file
+//  at later times when only the points moved (no topology change), so
+//  we walk back through time directories to find the most recent
+//  fully-defined polyMesh and copy its missing topology files into the
+//  restart time directory.  Operates on every region present.  No-op
+//  for cases without dynamic mesh.
+//  \param casePath     Absolute path to the case directory.
+//  \param restartTime  Basename of the restart time directory.
+//  \param allRegions   True for foamMultiRun multi-region cases.
+void dmrEnsureFullPolyMesh
+(
+    const std::string& casePath,
+    const std::string& restartTime,
+    bool allRegions = false
+);
+
+//- Returns true if the case has a dynamicMeshDict (single-region at
+//  constant/dynamicMeshDict, or multi-region at constant/<region>/
+//  dynamicMeshDict).  Used by dmrInit.H to decide whether DMR
+//  reconfigurations must be pinned to writeInterval boundaries.
+//
+//  Cases with cyclicAMI / nonConformalProcessorCyclic patches can reach
+//  zero geometric overlap at certain mesh positions (e.g. fully-closed
+//  engine valves).  OpenFOAM's normal time loop never recomputes the
+//  AMI weights from scratch at those positions because it advances
+//  incrementally; a DMR reconfiguration at an off-cadence step forces
+//  decomposePar to recompute from scratch and crashes with 0/0 in
+//  fvMeshStitcher::connectThis -> surfaceInterpolation::makeWeights.
+//
+//  By aligning DMR's checkpoint to the writeInterval boundaries that
+//  the case author has chosen as natural-write times, we inherit a
+//  fully consistent state (mesh stitched, AMI weights well-defined).
+//  Static-mesh cases have no such constraint and can reconfigure at
+//  any step.
+//  \param casePath  Absolute path to the case directory.
+bool dmrHasDynamicMesh(const std::string& casePath);
+
 } // End namespace Foam
 
 

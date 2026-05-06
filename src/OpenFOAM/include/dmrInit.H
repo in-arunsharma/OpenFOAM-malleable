@@ -37,23 +37,15 @@ const std::string dmrCasePath = [&](){
     return std::string(".");
 }();
 
-// Pin DMR reconfiguration to writeInterval boundaries when the case has
+// Pin DMR reconfiguration to writeTime boundaries when the case has
 // any dynamic mesh.  Cases with cyclicAMI / nonConformalProcessorCyclic
 // patches can hit zero-overlap geometry where decomposePar's from-scratch
-// stitcher computes 0/0 weights and crashes.  Aligning with writeInterval
+// stitcher computes 0/0 weights and crashes.  Aligning with writeTime
 // gives us a state the case author already vetted as fully consistent.
-// Static-mesh cases are unaffected and reconfigure on any step.
+// Static-mesh cases are unaffected and reconfigure on any step.  See
+// dmrCheck.H for the gating logic; cadence (DMR_DEFAULT_INHIBITOR) is
+// owned entirely by DMR's inhibitor in both cases.
 const bool dmrDynamicMesh = Foam::dmrHasDynamicMesh(dmrCasePath);
-
-// On dynamic-mesh cases we throttle dmr_check() with our own OpenFOAM-side
-// counter ticked at runTime.writeTime().  We still want the user-facing
-// semantics of DMR_DEFAULT_INHIBITOR to be uniform ("skip N opportunities
-// before checking"), so we read the value once here and apply it to our
-// counter.  See dmrCheck.H for the gating logic.
-const int dmrDynInhibitor = [](){
-    const char* env = std::getenv("DMR_DEFAULT_INHIBITOR");
-    return env ? std::atoi(env) : 0;
-}();
 
 // Reconfiguration policy.  ROUND_POLICY deterministically cycles through
 // N_min..N_max by doubling, then resets — used for debugging and validation
@@ -72,10 +64,9 @@ if (dmrEnabled)
 
     if (dmrDynamicMesh)
     {
-        Info<< "DMR: dynamic mesh detected. Reconfiguration is pinned"
-            << " to writeInterval boundaries; an OpenFOAM-side counter"
-            << " honours DMR_DEFAULT_INHIBITOR=" << dmrDynInhibitor
-            << " (skip N writeIntervals between checks)." << nl;
+        Info<< "DMR: dynamic mesh detected. dmr_check() is called only at"
+            << " runTime.outputTime() boundaries; cadence within that"
+            << " stream is governed by DMR_DEFAULT_INHIBITOR." << nl;
     }
 
     // DMR_AUTO phases: init / running / restart / cleanup.
@@ -87,13 +78,4 @@ if (dmrEnabled)
         Foam::dmrRestart(dmrCasePath, dmrAllRegions),
         (void)NULL
     );
-
-    // For dynamic-mesh cases, throttling is done by an OpenFOAM-side
-    // counter ticked at writeTime (see dmrCheck.H).  Disable DMR's own
-    // inhibitor so each gated dmr_check() actually evaluates the policy
-    // instead of being silently skipped by DMR's internal counter.
-    if (dmrDynamicMesh)
-    {
-        dmr_set_reconf_step_inhibitor(0);
-    }
 }

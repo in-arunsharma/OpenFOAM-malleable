@@ -276,14 +276,68 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
         dmrLifecycleLog(casePath, "Reconstructing processor directories...");
 
         // reconstructPar flags:
-        //   -newTimes   only merge time dirs not already present in serial
-        //   -rm         remove processor*/<time> after successful merge
-        //   -allRegions multi-region for foamMultiRun
+        //   -newTimes   merge every time dir present in processors but not
+        //               yet in serial.  These are the user's writeInterval
+        //               checkpoints (scientific output) and DMR-forced
+        //               checkpoints; both must be reconstructed to serial
+        //               so the user keeps them and the new process group
+        //               can restart from latestTime.
+        //   -allRegions multi-region for foamMultiRun.
+        //
+        // -rm is deliberately omitted.  On dynamic mesh, removing
+        // processor*/<earlier>/ after each successful merge regresses the
+        // procMesh's facesInstance back to constant/ while
+        // completeMesh.facesInstance() stays at the just-merged time —
+        // the next iteration of the walk then trips
+        // compareInstances == -1 in
+        // domainDecomposition::readUpdateReconstruct
+        // (domainDecomposition.C:899) and aborts with
+        // "complete mesh topology has evolved further than the processor
+        // mesh topology."  We sweep processor*/<time>/ ourselves below,
+        // after reconstructPar has exited and is no longer walking.
         std::string cmd =
-            "reconstructPar -newTimes -rm -case '" + casePath + "'";
+            "reconstructPar -newTimes -case '" + casePath + "'";
         if (allRegions) cmd += " -allRegions";
 
         dmrRunOrAbort(casePath, "dmr_reconstruct.log", cmd);
+
+        // Post-walk cleanup: every <time>/ now in serial form has its
+        // processor*/<time>/ counterpart removed.  reconstructPar has
+        // exited so there is no walking instance resolver left to trip.
+        // We only remove a processor*/<time>/ if the matching serial
+        // <time>/ exists — guards against accidentally deleting a
+        // processor copy whose serial reconstruct silently no-op'd.
+        {
+            glob_t pg;
+            const std::string ppattern = casePath + "/processor*";
+            if (glob(ppattern.c_str(), GLOB_ONLYDIR, nullptr, &pg) == 0)
+            {
+                for (size_t i = 0; i < pg.gl_pathc; ++i)
+                {
+                    const std::string procDir(pg.gl_pathv[i]);
+                    glob_t tg;
+                    const std::string tpattern = procDir + "/[0-9]*";
+                    if (glob(tpattern.c_str(), GLOB_ONLYDIR, nullptr, &tg) == 0)
+                    {
+                        for (size_t j = 0; j < tg.gl_pathc; ++j)
+                        {
+                            const std::string procTimeDir(tg.gl_pathv[j]);
+                            const auto slash = procTimeDir.find_last_of('/');
+                            const std::string tName =
+                                procTimeDir.substr(slash + 1);
+                            const std::string serialTimeDir =
+                                casePath + "/" + tName;
+                            if (Foam::isDir(serialTimeDir))
+                            {
+                                Foam::rmDir(procTimeDir);
+                            }
+                        }
+                        globfree(&tg);
+                    }
+                }
+                globfree(&pg);
+            }
+        }
 
         // Cheap insurance against filesystem coherence quirks before the
         // new process group's decomposePar reads what we just wrote.  On

@@ -27,8 +27,8 @@ const bool dmrEnabled = [](){
 const bool dmrAllRegions = DMR_ALL_REGIONS;
 
 // Parse -case from argv up-front (OpenFOAM's argList is not yet built)
-// so both the dynamic-mesh probe below and the DMR_AUTO restart callback
-// can reference it.  Defaults to "." when omitted.
+// so the DMR_AUTO restart callback can reference it.  Defaults to "."
+// when omitted.
 const std::string dmrCasePath = [&](){
     for (int i = 1; i < argc - 1; ++i)
     {
@@ -36,16 +36,6 @@ const std::string dmrCasePath = [&](){
     }
     return std::string(".");
 }();
-
-// Pin DMR reconfiguration to writeTime boundaries when the case has
-// any dynamic mesh.  Cases with cyclicAMI / nonConformalProcessorCyclic
-// patches can hit zero-overlap geometry where decomposePar's from-scratch
-// stitcher computes 0/0 weights and crashes.  Aligning with writeTime
-// gives us a state the case author already vetted as fully consistent.
-// Static-mesh cases are unaffected and reconfigure on any step.  See
-// dmrCheck.H for the gating logic; cadence (DMR_DEFAULT_INHIBITOR) is
-// owned entirely by DMR's inhibitor in both cases.
-const bool dmrDynamicMesh = Foam::dmrHasDynamicMesh(dmrCasePath);
 
 // Reconfiguration policy.  ROUND_POLICY deterministically cycles through
 // N_min..N_max by doubling, then resets — used for debugging and validation
@@ -60,13 +50,6 @@ if (dmrEnabled)
     {
         int provided;
         MPI_Init_thread(&argc, &argv, MPI_THREAD_SINGLE, &provided);
-    }
-
-    if (dmrDynamicMesh)
-    {
-        Info<< "DMR: dynamic mesh detected. dmr_check() is called only at"
-            << " runTime.outputTime() boundaries; cadence within that"
-            << " stream is governed by DMR_DEFAULT_INHIBITOR." << nl;
     }
 
     // DMR_AUTO phases: init / running / restart / cleanup.

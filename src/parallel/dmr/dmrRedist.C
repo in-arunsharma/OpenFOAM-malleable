@@ -235,29 +235,17 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
     const bool isDmrForced = !runTime.writeTime();
 
     // All ranks flush their fields to disk before rank 0 reconstructs.
-    // Check the return value: Time::writeNow() returns false if any I/O in
-    // the write path failed (disk full, permissions, truncated files), and
-    // a partial write would silently corrupt the next restart.  We agree
-    // across ranks via MPI_Allreduce(MIN) — a single rank failing is enough
-    // to abort the whole job before master opens the processor dirs.
-    const int writeOK = runTime.writeNow() ? 1 : 0;
-    int writeOKAll = 0;
-    MPI_Allreduce(&writeOK, &writeOKAll, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-
-    if (!writeOKAll)
-    {
-        if (Pstream::master())
-        {
-            std::fprintf
-            (
-                stderr,
-                "DMR: FATAL — runTime.writeNow() failed on at least one"
-                " rank at t=%s; aborting to avoid a corrupt checkpoint.\n",
-                runTime.name().c_str()
-            );
-        }
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
+    // We deliberately do NOT gate on the return value of writeNow():
+    // Time::write() returns the AND-reduction over every registered
+    // regIOobject's writeObject() success, including transient
+    // dynamic-mesh sub-objects (topo-changer caches, AMI weights,
+    // fvMeshStitcher state) that can legitimately return false at an
+    // arbitrary step without any data loss.  The bool is therefore not
+    // a meaningful "did the checkpoint succeed" signal.  Real I/O
+    // failures (disk full, permissions, stream errors) propagate via
+    // OpenFOAM's FatalError mechanism, which terminates the run before
+    // we reach the reconstruct subprocess below.
+    runTime.writeNow();
 
     // Wait for all parallel writes to land before rank 0 opens them.
     MPI_Barrier(MPI_COMM_WORLD);

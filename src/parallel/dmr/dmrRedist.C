@@ -492,7 +492,17 @@ void dmrRestart(const std::string& casePath, bool allRegions)
         // No-op for static cases.
         dmrEnsureFullPolyMesh(casePath, restartTime, allRegions);
 
+        // FOAM_DMR_AMI_DEGENERATE_GUARD=active is a command-line prefix:
+        // bash sets the variable in the new subprocess at exec time and it
+        // dies with that subprocess on exit.  It is never set in libfoamDmr
+        // itself, in foamRun, or in any other OpenFOAM tool.  The guard it
+        // activates lives in surfaceInterpolation::makeWeights and skips
+        // the dNei/dOwnNei division for zero-area faces produced by from-
+        // scratch AMI stitching at certain mesh positions (see comment
+        // there).  Outside of this subprocess, OpenFOAM's behaviour is
+        // bit-identical to upstream.
         std::string cmd =
+            "FOAM_DMR_AMI_DEGENERATE_GUARD=active "
             "decomposePar -force -time " + restartTime + " -cellProc"
           + " -case '" + casePath + "'";
         if (allRegions) cmd += " -allRegions";
@@ -525,7 +535,12 @@ void dmrRestart(const std::string& casePath, bool allRegions)
                 // `decomposePar -force -allRegions` above has already
                 // cleared the processor* dirs, so each sub-mesh decompose
                 // can append its output without forcing.
+                //
+                // FOAM_DMR_AMI_DEGENERATE_GUARD=active is set as a
+                // command-line prefix; see the explanatory comment on
+                // the main decomposePar invocation above.
                 const std::string mcmd =
+                    "FOAM_DMR_AMI_DEGENERATE_GUARD=active "
                     "decomposePar -mesh " + meshName
                   + " -region fluid -case '" + casePath + "'";
                 dmrRunOrAbort(casePath, "dmr_decompose.log", mcmd);

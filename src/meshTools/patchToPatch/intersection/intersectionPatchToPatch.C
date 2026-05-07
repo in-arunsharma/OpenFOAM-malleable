@@ -29,6 +29,9 @@ License
 #include "vtkWritePolyData.H"
 #include "addToRunTimeSelectionTable.H"
 
+#include <cstdlib>
+#include <string>
+
 // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
 
 namespace Foam
@@ -44,6 +47,43 @@ namespace patchToPatches
         debug::debugSwitch((intersection::typeName + "TgtFace").c_str(), -1);
 }
 }
+
+
+// * * * * * * * * * * * * Local helpers (DMR guard) * * * * * * * * * * * * //
+
+namespace
+{
+
+// Defensive guard against degenerate AMI patch faces produced by from-
+// scratch stitching during DMR-driven reconfiguration (libfoamDmr).
+//
+// Activation: dormant unless the environment variable
+//   FOAM_DMR_AMI_DEGENERATE_GUARD=active
+// is set.  libfoamDmr (src/parallel/dmr) sets this variable in foamRun /
+// foamMultiRun via dmrInit.H so it is visible throughout the DMR run and
+// inherited by spawned subprocesses.  In every non-DMR context the guard
+// is dormant and OpenFOAM's behaviour is bit-identical to upstream.
+//
+// What it guards: when two non-conformal AMI patches have collapsed to
+// near-zero geometric overlap, the patch-to-patch intersection algorithm
+// in this file produces faces with zero area (magA ~ 0) and couple-area
+// sums of zero (aSum ~ 0).  Several derived quantities (coverage,
+// openness, error, depth, weights) then divide by these zeros and raise
+// SIGFPE.  A face with zero area contributes nothing to any flux because
+// its area appears multiplicatively in every surface integral, so the
+// derived values are mathematically irrelevant; setting them to zero is
+// the unique value consistent with "no contribution from this face".
+bool dmrAmiDegenerateGuardActive()
+{
+    static const bool active = []()
+    {
+        const char* env = std::getenv("FOAM_DMR_AMI_DEGENERATE_GUARD");
+        return env != nullptr && std::string(env) == "active";
+    }();
+    return active;
+}
+
+} // End anonymous namespace
 
 
 // * * * * * * * * * * * Private Static Member Functions * * * * * * * * * * //
@@ -697,6 +737,10 @@ Foam::label Foam::patchToPatches::intersection::finalise
         coupleArea = 0;
         coverage.resize(patch.size());
 
+        // DMR degenerate-face guard (see anonymous-namespace helper above).
+        const bool dmrGuard = dmrAmiDegenerateGuardActive();
+        static bool dmrGuardWarnedCov = false;
+
         forAll(patch, facei)
         {
             const scalar magA = mag(patch.faceAreas()[facei]);
@@ -710,7 +754,24 @@ Foam::label Foam::patchToPatches::intersection::finalise
 
             area += magA;
             coupleArea += magACouple;
-            coverage[facei] = magACouple/magA;
+            if (dmrGuard && magA < SMALL)
+            {
+                coverage[facei] = 0;
+                if (!dmrGuardWarnedCov)
+                {
+                    WarningInFunction
+                        << "FOAM_DMR_AMI_DEGENERATE_GUARD active in"
+                        << " intersection coverage: zero-area face index "
+                        << facei
+                        << "; coverage set to 0 (face contributes nothing)."
+                        << " Once per process." << endl;
+                    dmrGuardWarnedCov = true;
+                }
+            }
+            else
+            {
+                coverage[facei] = magACouple/magA;
+            }
         }
 
         reduce(area, sumOp<scalar>());
@@ -790,9 +851,34 @@ Foam::label Foam::patchToPatches::intersection::finalise
             const vector aOppHat = normalised(a - Cpl.area + Cpl.nbr.area);
             srcAngleDeg[srcFacei] =
                 radToDeg(acos(min(max(aHat & aOppHat, -1), +1)));
-            srcOpenness[srcFacei] = mag(projectionA - Cpl.area)/magA;
-            srcError[srcFacei] = mag(srcErrorParts_[srcFacei].area)/magA;
-            srcDepth[srcFacei] = mag(projectionV)/pow3(sqrt(magA));
+
+            // DMR degenerate-face guard (see anonymous-namespace
+            // helper above).  When the patch face has zero area the
+            // three quality metrics below would divide by zero; the
+            // face contributes nothing, so the metrics are set to 0.
+            static const bool dmrGuardOED = dmrAmiDegenerateGuardActive();
+            static bool dmrGuardWarnedOED = false;
+            if (dmrGuardOED && magA < SMALL)
+            {
+                srcOpenness[srcFacei] = 0;
+                srcError[srcFacei] = 0;
+                srcDepth[srcFacei] = 0;
+                if (!dmrGuardWarnedOED)
+                {
+                    WarningInFunction
+                        << "FOAM_DMR_AMI_DEGENERATE_GUARD active in"
+                        << " intersection openness/error/depth:"
+                        << " zero-area src face index " << srcFacei
+                        << "; metrics set to 0. Once per process." << endl;
+                    dmrGuardWarnedOED = true;
+                }
+            }
+            else
+            {
+                srcOpenness[srcFacei] = mag(projectionA - Cpl.area)/magA;
+                srcError[srcFacei] = mag(srcErrorParts_[srcFacei].area)/magA;
+                srcDepth[srcFacei] = mag(projectionV)/pow3(sqrt(magA));
+            }
         }
 
         reduce(tgtArea, sumOp<scalar>());
@@ -893,6 +979,10 @@ Foam::patchToPatches::intersection::srcWeights() const
     );
     List<DynamicList<scalar>>& result = *resultPtr;
 
+    // DMR degenerate-face guard (see anonymous-namespace helper above).
+    const bool dmrGuard = dmrAmiDegenerateGuardActive();
+    static bool dmrGuardWarnedSrcW = false;
+
     forAll(srcCouples_, srcFacei)
     {
         result[srcFacei].resize(srcCouples_[srcFacei].size());
@@ -905,10 +995,32 @@ Foam::patchToPatches::intersection::srcWeights() const
             aSum += a;
         }
 
-        forAll(srcCouples_[srcFacei], i)
+        if (dmrGuard && aSum < SMALL)
         {
-            result[srcFacei][i] *=
-                min(max(srcCoverage_[srcFacei], small), scalar(1))/aSum;
+            // All couples on this face have zero area: degenerate
+            // overlap.  Zero out every weight so the face contributes
+            // nothing rather than dividing by zero.
+            forAll(srcCouples_[srcFacei], i)
+            {
+                result[srcFacei][i] = 0;
+            }
+            if (!dmrGuardWarnedSrcW)
+            {
+                WarningInFunction
+                    << "FOAM_DMR_AMI_DEGENERATE_GUARD active in"
+                    << " intersection srcWeights: zero couple-area sum"
+                    << " on src face index " << srcFacei
+                    << "; weights set to 0. Once per process." << endl;
+                dmrGuardWarnedSrcW = true;
+            }
+        }
+        else
+        {
+            forAll(srcCouples_[srcFacei], i)
+            {
+                result[srcFacei][i] *=
+                    min(max(srcCoverage_[srcFacei], small), scalar(1))/aSum;
+            }
         }
     }
 
@@ -925,6 +1037,10 @@ Foam::patchToPatches::intersection::tgtWeights() const
     );
     List<DynamicList<scalar>>& result = *resultPtr;
 
+    // DMR degenerate-face guard (see anonymous-namespace helper above).
+    const bool dmrGuard = dmrAmiDegenerateGuardActive();
+    static bool dmrGuardWarnedTgtW = false;
+
     forAll(tgtCouples_, tgtFacei)
     {
         result[tgtFacei].resize(tgtCouples_[tgtFacei].size());
@@ -937,10 +1053,29 @@ Foam::patchToPatches::intersection::tgtWeights() const
             aSum += a;
         }
 
-        forAll(tgtCouples_[tgtFacei], i)
+        if (dmrGuard && aSum < SMALL)
         {
-            result[tgtFacei][i] *=
-                min(max(tgtCoverage_[tgtFacei], small), scalar(1))/aSum;
+            forAll(tgtCouples_[tgtFacei], i)
+            {
+                result[tgtFacei][i] = 0;
+            }
+            if (!dmrGuardWarnedTgtW)
+            {
+                WarningInFunction
+                    << "FOAM_DMR_AMI_DEGENERATE_GUARD active in"
+                    << " intersection tgtWeights: zero couple-area sum"
+                    << " on tgt face index " << tgtFacei
+                    << "; weights set to 0. Once per process." << endl;
+                dmrGuardWarnedTgtW = true;
+            }
+        }
+        else
+        {
+            forAll(tgtCouples_[tgtFacei], i)
+            {
+                result[tgtFacei][i] *=
+                    min(max(tgtCoverage_[tgtFacei], small), scalar(1))/aSum;
+            }
         }
     }
 

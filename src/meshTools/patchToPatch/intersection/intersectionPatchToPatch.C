@@ -634,7 +634,18 @@ Foam::label Foam::patchToPatches::intersection::finalise
     }
     forAll(srcEdgeParts_, srcEdgei)
     {
-        srcEdgeParts_[srcEdgei].area /= srcEdgeNParts[srcEdgei];
+        // Guard against orphan edges (no face neighbours).  A
+        // well-formed mesh patch has 1 or 2 faces per edge, but the
+        // AMI intersection algorithm at degenerate patch positions
+        // (zero-overlap regions) can produce edges with zero face
+        // neighbours; srcEdgeNParts[srcEdgei] then stays at its
+        // initialised value of 0 and the division below SIGFPEs.
+        // Leaving the area at its default-constructed Zero is
+        // mathematically correct: there is nothing to average over.
+        if (srcEdgeNParts[srcEdgei] > 0)
+        {
+            srcEdgeParts_[srcEdgei].area /= srcEdgeNParts[srcEdgei];
+        }
     }
 
     // Add the difference between the face-edge-part and the edge-part into the
@@ -710,7 +721,18 @@ Foam::label Foam::patchToPatches::intersection::finalise
 
             area += magA;
             coupleArea += magACouple;
-            coverage[facei] = magACouple/magA;
+            // Guard against zero-area patch faces produced by from-
+            // scratch AMI stitching at degenerate positions.  A face
+            // with magA = 0 has no surface to cover, so coverage is
+            // 0 by definition (rather than 0/0 = NaN).
+            if (magA < VSMALL)
+            {
+                coverage[facei] = 0;
+            }
+            else
+            {
+                coverage[facei] = magACouple/magA;
+            }
         }
 
         reduce(area, sumOp<scalar>());
@@ -790,9 +812,23 @@ Foam::label Foam::patchToPatches::intersection::finalise
             const vector aOppHat = normalised(a - Cpl.area + Cpl.nbr.area);
             srcAngleDeg[srcFacei] =
                 radToDeg(acos(min(max(aHat & aOppHat, -1), +1)));
-            srcOpenness[srcFacei] = mag(projectionA - Cpl.area)/magA;
-            srcError[srcFacei] = mag(srcErrorParts_[srcFacei].area)/magA;
-            srcDepth[srcFacei] = mag(projectionV)/pow3(sqrt(magA));
+
+            // Same magA-based guard as in the coverage lambda above.
+            // A zero-area patch face has no surface to compute
+            // openness/error/depth against; the metrics are 0 by
+            // definition rather than 0/0 = NaN.
+            if (magA < VSMALL)
+            {
+                srcOpenness[srcFacei] = 0;
+                srcError[srcFacei] = 0;
+                srcDepth[srcFacei] = 0;
+            }
+            else
+            {
+                srcOpenness[srcFacei] = mag(projectionA - Cpl.area)/magA;
+                srcError[srcFacei] = mag(srcErrorParts_[srcFacei].area)/magA;
+                srcDepth[srcFacei] = mag(projectionV)/pow3(sqrt(magA));
+            }
         }
 
         reduce(tgtArea, sumOp<scalar>());

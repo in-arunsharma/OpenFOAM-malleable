@@ -32,9 +32,6 @@ Description
 #include "demandDrivenData.H"
 #include "coupledFvPatch.H"
 
-#include <cstdlib>
-#include <string>
-
 // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
 
 namespace Foam
@@ -43,45 +40,24 @@ namespace Foam
 }
 
 
-// * * * * * * * * * * * * Local helpers (DMR guard) * * * * * * * * * * * * //
-
-namespace
-{
-
-// Defensive guard against degenerate faces produced by from-scratch AMI
-// stitching during DMR-driven reconfiguration (libfoamDmr).
+// * * * * * * * * * * * * Defensive degenerate-face guards * * * * * * * * //
 //
-// Activation: dormant unless the environment variable
-//   FOAM_DMR_AMI_DEGENERATE_GUARD=active
-// is set in the calling process.  libfoamDmr sets this variable as a
-// command-line prefix on the decomposePar subprocess it spawns during a
-// reconfiguration; the variable lives only inside that one subprocess and
-// is never visible to foamRun, foamMultiRun, or any other OpenFOAM tool.
-// In every non-DMR context the guard is dormant and OpenFOAM's behaviour
-// is bit-identical to upstream.
-//
-// What it guards: fvMeshStitcher::connectThis can construct synthetic
-// faces with zero area whose owner cell centre, neighbour cell centre,
-// and face centre all coincide, when the geometric overlap between two
-// non-conformal AMI patches has collapsed to zero (e.g. fully-closed
-// engine valves).  Several geometric coefficient computations in
-// surfaceInterpolation then divide by zero (1.0/distance, 1.0/area,
-// Sf/|Sf|), raising SIGFPE inside decomposePar.  Such a face contributes
-// nothing to any flux or gradient because its area appears multiplicatively
-// in every surface integral, so the coefficient values are mathematically
-// irrelevant; setting them to zero is the unique value consistent with
-// "no contribution from this face".
-bool dmrAmiDegenerateGuardActive()
-{
-    static const bool active = []()
-    {
-        const char* env = std::getenv("FOAM_DMR_AMI_DEGENERATE_GUARD");
-        return env != nullptr && std::string(env) == "active";
-    }();
-    return active;
-}
-
-} // End anonymous namespace
+// Each of the make...() functions below contains an unconditional VSMALL-
+// threshold guard against zero-area / zero-distance faces that upstream
+// OpenFOAM otherwise divides by, raising SIGFPE.  The guards are dormant
+// for every real mesh face (where the geometric quantities are many
+// orders of magnitude above VSMALL) and fire only on synthetic
+// degenerate faces produced by fvMeshStitcher::connectThis at AMI patch
+// pairs whose geometric overlap has collapsed to zero.  Such a face has
+// zero physical contribution to any flux or gradient (its area appears
+// multiplicatively in every surface integral), so the fallback values
+// chosen are the unique values that produce zero contribution downstream:
+//   - weight       -> 0    (interpolation weight on a zero-area face)
+//   - deltaCoeff   -> GREAT (mimics 1/tiny_distance = huge in upstream;
+//                            BCs that divide BY deltaCoeff get ~0)
+//   - corrVec      -> Zero (zero correction vector)
+// For valid meshes the upstream computation runs unchanged, so simulation
+// results are bit-identical to unpatched OpenFOAM.
 
 
 // * * * * * * * * * * * * * Protected Member Functions  * * * * * * * * * * //
@@ -211,24 +187,25 @@ void Foam::surfaceInterpolation::makeWeights() const
     // ... and reference to the internal field of the weighting factors
     scalarField& w = weights.primitiveFieldRef();
 
-    // DMR degenerate-face guard (see anonymous-namespace helper above).
-    const bool dmrGuard = dmrAmiDegenerateGuardActive();
-    static bool dmrGuardWarnedW = false;
+    static bool degenerateWarnedW = false;
 
     forAll(owner, facei)
     {
-        if (dmrGuard && mag(Sf[facei]) < VSMALL)
+        // Defensive guard (see file-scope comment above): zero-area
+        // face -> w = 0; original upstream code below would divide
+        // by a zero distance sum.
+        if (mag(Sf[facei]) < VSMALL)
         {
             w[facei] = 0;
 
-            if (!dmrGuardWarnedW)
+            if (!degenerateWarnedW)
             {
                 WarningInFunction
-                    << "FOAM_DMR_AMI_DEGENERATE_GUARD active in"
-                    << " makeWeights: zero-area face index " << facei
+                    << "Degenerate face guard in makeWeights: zero-area"
+                    << " face index " << facei
                     << "; weight set to 0 (face contributes nothing to"
                     << " surface integrals). Once per process." << endl;
-                dmrGuardWarnedW = true;
+                degenerateWarnedW = true;
             }
 
             continue;
@@ -311,44 +288,33 @@ void Foam::surfaceInterpolation::makeDeltaCoeffs() const
     const surfaceVectorField& Sf = mesh_.Sf();
     const surfaceScalarField& magSf = mesh_.magSf();
 
-    // DMR degenerate-face guard (see anonymous-namespace helper above).
-    const bool dmrGuard = dmrAmiDegenerateGuardActive();
-    static bool dmrGuardWarnedDC = false;
+    static bool degenerateWarnedDC = false;
 
     forAll(owner, facei)
     {
-        // Two-condition guard: face is geometrically degenerate
-        // (mag(Sf) ~ 0) OR the divisor about to be used is degenerate
-        // (cell-to-cell distance ~ 0).  The second condition is the
-        // direct mechanical guard against the 0/0 SIGFPE; the first
-        // is the semantic "is this a real face?" check.  Either
-        // alone is insufficient — a stitcher artefact can have area
-        // ~0 with non-zero cell distance, or non-zero area with
-        // coincident cell centres.  Both must be covered.
-        if (dmrGuard
-         && (mag(Sf[facei]) < VSMALL
-          || mag(C[neighbour[facei]] - C[owner[facei]]) < VSMALL))
+        // Two-condition guard: face area ~ 0 OR cell-to-cell distance
+        // ~ 0.  The second is the direct mechanical guard against the
+        // 0/0 SIGFPE; the first is the semantic "is this a real face?"
+        // check.  Either alone is insufficient — a stitcher artefact
+        // can have area ~ 0 with non-zero cell distance, or vice versa.
+        // Fallback is GREAT (= 1/SMALL) not 0: some BCs divide BY
+        // deltaCoeff and need a finite divisor; GREAT mimics upstream
+        // "1.0/tiny_distance = huge".  For flux integrals deltaCoeff
+        // is multiplied by Sf which is zero on degenerate faces, so
+        // physical contribution is zero regardless.
+        if (mag(Sf[facei]) < VSMALL
+         || mag(C[neighbour[facei]] - C[owner[facei]]) < VSMALL)
         {
-            // Set deltaCoeff to GREAT (= 1/SMALL ~ 4.5e15) rather than
-            // 0.  GREAT mimics the original "1.0/tiny_distance = huge"
-            // behaviour upstream OpenFOAM produces on near-degenerate
-            // geometry: downstream code that does 1/deltaCoeff or
-            // gradient/deltaCoeff (e.g. directionMixedFvPatchField)
-            // gets a numerically tiny but finite result, no SIGFPE.
-            // For internal flux integrals the deltaCoeff is multiplied
-            // by Sf (zero on degenerate faces), so the contribution is
-            // still zero regardless.
             deltaCoeffs[facei] = GREAT;
 
-            if (!dmrGuardWarnedDC)
+            if (!degenerateWarnedDC)
             {
                 WarningInFunction
-                    << "FOAM_DMR_AMI_DEGENERATE_GUARD active in"
-                    << " makeDeltaCoeffs (internal): degenerate face"
-                    << " index " << facei
+                    << "Degenerate face guard in makeDeltaCoeffs"
+                    << " (internal): face index " << facei
                     << "; deltaCoeff set to GREAT. Once per process."
                     << endl;
-                dmrGuardWarnedDC = true;
+                degenerateWarnedDC = true;
             }
 
             continue;
@@ -361,52 +327,44 @@ void Foam::surfaceInterpolation::makeDeltaCoeffs() const
 
     forAll(deltaCoeffsBf, patchi)
     {
-        if (dmrGuard)
-        {
-            // Per-face guarded path: the upstream vectorised expression
-            // 1.0/mag(boundary().delta()) raises SIGFPE if any face has
-            // zero owner-to-face distance.  Expand into a per-face loop
-            // so we can skip degenerate faces.
-            const vectorField patchDelta(mesh_.boundary()[patchi].delta());
-            const scalarField& patchMagSf = magSf.boundaryField()[patchi];
-            fvsPatchScalarField& bf = deltaCoeffsBf[patchi];
+        // Per-face guarded path: the upstream vectorised expression
+        //     deltaCoeffsBf[patchi] = 1.0/mag(mesh_.boundary()[patchi].delta());
+        // raises SIGFPE if any face has zero owner-to-face distance,
+        // which from-scratch AMI stitching can produce on degenerate
+        // patch slices.  Expand into a per-face loop so degenerate
+        // faces can take the GREAT fallback (see file-scope comment).
+        // For valid meshes every face has finite distance and the
+        // result is bit-identical to the vectorised upstream form.
+        const vectorField patchDelta(mesh_.boundary()[patchi].delta());
+        const scalarField& patchMagSf = magSf.boundaryField()[patchi];
+        fvsPatchScalarField& bf = deltaCoeffsBf[patchi];
 
-            forAll(bf, facei)
+        forAll(bf, facei)
+        {
+            if (patchMagSf[facei] < VSMALL
+             || mag(patchDelta[facei]) < VSMALL)
             {
-                // Two-condition guard (see makeDeltaCoeffs internal
-                // loop above for the same rationale): face area ~ 0
-                // OR cell-to-face distance ~ 0.  Either alone is
-                // insufficient.
-                if (patchMagSf[facei] < VSMALL
-                 || mag(patchDelta[facei]) < VSMALL)
+                bf[facei] = GREAT;
+                if (!degenerateWarnedDC)
                 {
-                    // Set to GREAT (~1/SMALL) rather than 0; some BCs
-                    // (e.g. directionMixedFvPatchField) divide BY
-                    // deltaCoeff and would SIGFPE on 0.  GREAT mimics
-                    // the upstream "1/tiny_distance = huge" behaviour.
-                    bf[facei] = GREAT;
-                    if (!dmrGuardWarnedDC)
-                    {
-                        WarningInFunction
-                            << "FOAM_DMR_AMI_DEGENERATE_GUARD active in"
-                            << " makeDeltaCoeffs (boundary patch "
-                            << patchi << ", face " << facei
-                            << "): degenerate face; deltaCoeff set to"
-                            << " GREAT. Once per process." << endl;
-                        dmrGuardWarnedDC = true;
-                    }
-                }
-                else
-                {
-                    bf[facei] = 1.0/mag(patchDelta[facei]);
+                    WarningInFunction
+                        << "Degenerate face guard in makeDeltaCoeffs"
+                        << " (boundary patch " << patchi
+                        << ", face " << facei
+                        << "): deltaCoeff set to GREAT."
+                        << " Once per process." << endl;
+                    degenerateWarnedDC = true;
                 }
             }
+            else
+            {
+                bf[facei] = 1.0/mag(patchDelta[facei]);
+            }
         }
-        else
-        {
-            // Upstream path, unchanged.
-            deltaCoeffsBf[patchi] = 1.0/mag(mesh_.boundary()[patchi].delta());
-        }
+
+        // Original upstream expression — replaced by the per-face
+        // guarded loop above:
+        //     deltaCoeffsBf[patchi] = 1.0/mag(mesh_.boundary()[patchi].delta());
     }
 }
 
@@ -448,34 +406,28 @@ void Foam::surfaceInterpolation::makeNonOrthDeltaCoeffs() const
     const surfaceVectorField& Sf = mesh_.Sf();
     const surfaceScalarField& magSf = mesh_.magSf();
 
-    // DMR degenerate-face guard (see anonymous-namespace helper above).
-    const bool dmrGuard = dmrAmiDegenerateGuardActive();
-    static bool dmrGuardWarnedND = false;
+    static bool degenerateWarnedND = false;
 
     forAll(owner, facei)
     {
         // Two-condition guard (see makeDeltaCoeffs for rationale):
         // magSf ~ 0 (Sf/magSf below would be 0/0) OR cell-to-cell
         // distance ~ 0 (the 0.05*mag(delta) term in the max() below
-        // would not save us if both arguments are 0).
-        if (dmrGuard
-         && (magSf[facei] < VSMALL
-          || mag(C[neighbour[facei]] - C[owner[facei]]) < VSMALL))
+        // would not save us if both arguments are 0).  Fallback is
+        // GREAT, not 0, since downstream BCs may divide by this.
+        if (magSf[facei] < VSMALL
+         || mag(C[neighbour[facei]] - C[owner[facei]]) < VSMALL)
         {
-            // Set to GREAT not 0; downstream BCs and corrections may
-            // divide by nonOrthDeltaCoeff.  See the same rationale in
-            // makeDeltaCoeffs above.
             nonOrthDeltaCoeffs[facei] = GREAT;
 
-            if (!dmrGuardWarnedND)
+            if (!degenerateWarnedND)
             {
                 WarningInFunction
-                    << "FOAM_DMR_AMI_DEGENERATE_GUARD active in"
-                    << " makeNonOrthDeltaCoeffs (internal): degenerate"
-                    << " face index " << facei
+                    << "Degenerate face guard in makeNonOrthDeltaCoeffs"
+                    << " (internal): face index " << facei
                     << "; nonOrthDeltaCoeff set to GREAT."
                     << " Once per process." << endl;
-                dmrGuardWarnedND = true;
+                degenerateWarnedND = true;
             }
 
             continue;
@@ -502,54 +454,47 @@ void Foam::surfaceInterpolation::makeNonOrthDeltaCoeffs() const
 
     forAll(nonOrthDeltaCoeffsBf, patchi)
     {
-        if (dmrGuard)
-        {
-            // Per-face guarded path: skip boundary faces with zero area
-            // before the 1.0/max(...) division can blow up.
-            const vectorField delta(mesh_.boundary()[patchi].delta());
-            const vectorField nf(mesh_.boundary()[patchi].nf());
-            const scalarField& patchMagSf = magSf.boundaryField()[patchi];
-            fvsPatchScalarField& bf = nonOrthDeltaCoeffsBf[patchi];
+        // Per-face guarded path: the upstream vectorised expression
+        //     vectorField delta(mesh_.boundary()[patchi].delta());
+        //     nonOrthDeltaCoeffsBf[patchi] =
+        //         1.0/max(mesh_.boundary()[patchi].nf() & delta, 0.05*mag(delta));
+        // raises SIGFPE when both arguments to max() are 0 on a
+        // degenerate face.  Expand into a per-face loop so degenerate
+        // faces take the GREAT fallback.
+        const vectorField delta(mesh_.boundary()[patchi].delta());
+        const vectorField nf(mesh_.boundary()[patchi].nf());
+        const scalarField& patchMagSf = magSf.boundaryField()[patchi];
+        fvsPatchScalarField& bf = nonOrthDeltaCoeffsBf[patchi];
 
-            forAll(bf, facei)
+        forAll(bf, facei)
+        {
+            if (patchMagSf[facei] < VSMALL
+             || mag(delta[facei]) < VSMALL)
             {
-                // Two-condition guard: magSf ~ 0 OR mag(delta) ~ 0.
-                // The 1.0/max(... , 0.05*mag(delta)) form is safe
-                // only while mag(delta) is well above zero; when both
-                // arguments to max() are 0 the division crashes.
-                if (patchMagSf[facei] < VSMALL
-                 || mag(delta[facei]) < VSMALL)
+                bf[facei] = GREAT;
+                if (!degenerateWarnedND)
                 {
-                    // GREAT, not 0: downstream BC code divides by
-                    // nonOrthDeltaCoeff.  Same rationale as
-                    // makeDeltaCoeffs (boundary).
-                    bf[facei] = GREAT;
-                    if (!dmrGuardWarnedND)
-                    {
-                        WarningInFunction
-                            << "FOAM_DMR_AMI_DEGENERATE_GUARD active in"
-                            << " makeNonOrthDeltaCoeffs (boundary patch "
-                            << patchi << ", face " << facei
-                            << "): degenerate face; nonOrthDeltaCoeff"
-                            << " set to GREAT. Once per process." << endl;
-                        dmrGuardWarnedND = true;
-                    }
-                }
-                else
-                {
-                    bf[facei] =
-                        1.0/max(nf[facei] & delta[facei], 0.05*mag(delta[facei]));
+                    WarningInFunction
+                        << "Degenerate face guard in"
+                        << " makeNonOrthDeltaCoeffs (boundary patch "
+                        << patchi << ", face " << facei
+                        << "): nonOrthDeltaCoeff set to GREAT."
+                        << " Once per process." << endl;
+                    degenerateWarnedND = true;
                 }
             }
+            else
+            {
+                bf[facei] =
+                    1.0/max(nf[facei] & delta[facei], 0.05*mag(delta[facei]));
+            }
         }
-        else
-        {
-            // Upstream path, unchanged.
-            vectorField delta(mesh_.boundary()[patchi].delta());
 
-            nonOrthDeltaCoeffsBf[patchi] =
-                1.0/max(mesh_.boundary()[patchi].nf() & delta, 0.05*mag(delta));
-        }
+        // Original upstream expression — replaced by the per-face
+        // guarded loop above:
+        //     vectorField delta(mesh_.boundary()[patchi].delta());
+        //     nonOrthDeltaCoeffsBf[patchi] =
+        //         1.0/max(mesh_.boundary()[patchi].nf() & delta, 0.05*mag(delta));
     }
 }
 
@@ -587,25 +532,25 @@ void Foam::surfaceInterpolation::makeNonOrthCorrectionVectors() const
     const surfaceScalarField& magSf = mesh_.magSf();
     const surfaceScalarField& NonOrthDeltaCoeffs = nonOrthDeltaCoeffs();
 
-    // DMR degenerate-face guard (see anonymous-namespace helper above).
-    const bool dmrGuard = dmrAmiDegenerateGuardActive();
-    static bool dmrGuardWarnedNC = false;
+    static bool degenerateWarnedNC = false;
 
     forAll(owner, facei)
     {
-        if (dmrGuard && magSf[facei] < VSMALL)
+        // Defensive guard against zero-area face: Sf/magSf below
+        // would be 0/0.  Correction vector is Zero (no contribution).
+        if (magSf[facei] < VSMALL)
         {
             corrVecs[facei] = Zero;
 
-            if (!dmrGuardWarnedNC)
+            if (!degenerateWarnedNC)
             {
                 WarningInFunction
-                    << "FOAM_DMR_AMI_DEGENERATE_GUARD active in"
+                    << "Degenerate face guard in"
                     << " makeNonOrthCorrectionVectors (internal):"
                     << " zero-area face index " << facei
                     << "; correction vector set to Zero."
                     << " Once per process." << endl;
-                dmrGuardWarnedNC = true;
+                degenerateWarnedNC = true;
             }
 
             continue;
@@ -643,20 +588,19 @@ void Foam::surfaceInterpolation::makeNonOrthCorrectionVectors() const
 
             forAll(p, patchFacei)
             {
-                if (dmrGuard
-                 && magSf.boundaryField()[patchi][patchFacei] < VSMALL)
+                if (magSf.boundaryField()[patchi][patchFacei] < VSMALL)
                 {
                     patchCorrVecs[patchFacei] = Zero;
-                    if (!dmrGuardWarnedNC)
+                    if (!degenerateWarnedNC)
                     {
                         WarningInFunction
-                            << "FOAM_DMR_AMI_DEGENERATE_GUARD active in"
+                            << "Degenerate face guard in"
                             << " makeNonOrthCorrectionVectors (coupled"
                             << " boundary patch " << patchi << ", face "
                             << patchFacei
                             << "): zero-area face; correction vector"
                             << " set to Zero. Once per process." << endl;
-                        dmrGuardWarnedNC = true;
+                        degenerateWarnedNC = true;
                     }
                     continue;
                 }

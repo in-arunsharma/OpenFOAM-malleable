@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2022-2024 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2022-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -52,7 +52,7 @@ Foam::mappedExtrudedPatchBase::patchFaceAreas() const
     {
         if (!bottomFaceAreasPtr_.valid())
         {
-            const polyMesh& mesh = patch_.boundaryMesh().mesh();
+            const polyMesh& mesh = patch_.mesh();
             const polyPatch& pp = patch_;
 
             // If this is the extruded region we need to work out what the
@@ -197,7 +197,7 @@ Foam::mappedExtrudedPatchBase::patchLocalPoints() const
     {
         if (!bottomLocalPointsPtr_.valid())
         {
-            const polyMesh& mesh = patch_.boundaryMesh().mesh();
+            const polyMesh& mesh = patch_.mesh();
             const polyPatch& pp = patch_;
 
             // If this is the extruded region we need to work out what the
@@ -226,26 +226,26 @@ Foam::mappedExtrudedPatchBase::patchLocalPoints() const
             const label nIterations1 =
                 wave1.iterate(mesh.globalData().nTotalPoints() + 1);
 
-            if (debug)
-            {
-                pointScalarField pointLayer
-                (
-                    pointScalarField::New
-                    (
-                        typedName("pointLayer"),
-                        pointMesh::New(mesh),
-                        dimensionedScalar(dimless, 0)
-                    )
-                );
-                forAll(pointInfo1, pointi)
-                {
-                    pointLayer[pointi] =
-                        pointInfo1[pointi].valid(wave1.data())
-                      ? pointInfo1[pointi].pointLayer()
-                      : -1;
-                }
-                pointLayer.write();
-            }
+            // if (debug)
+            // {
+            //     pointScalarField pointLayer
+            //     (
+            //         pointScalarField::New
+            //         (
+            //             typedName("pointLayer"),
+            //             pointMesh::New(mesh),
+            //             dimensionedScalar(dimless, 0)
+            //         )
+            //     );
+            //     forAll(pointInfo1, pointi)
+            //     {
+            //         pointLayer[pointi] =
+            //             pointInfo1[pointi].valid(wave1.data())
+            //           ? pointInfo1[pointi].pointLayer()
+            //           : -1;
+            //     }
+            //     pointLayer.write();
+            // }
 
             // Count how many opposite points the wave ended on
             label nInitialPoints2 = 0;
@@ -314,25 +314,25 @@ Foam::mappedExtrudedPatchBase::patchLocalPoints() const
                 bottomLocalPointsPtr_()[ppPointi] = info.data();
             }
 
-            if (debug)
-            {
-                pointVectorField pointOffset
-                (
-                    pointVectorField::New
-                    (
-                        typedName("pointOffset"),
-                        pointMesh::New(mesh),
-                        dimensionedVector(dimLength, Zero)
-                    )
-                );
-                forAll(pp.meshPoints(), ppPointi)
-                {
-                    pointOffset[pp.meshPoints()[ppPointi]] =
-                        bottomLocalPointsPtr_()[ppPointi]
-                      - pp.localPoints()[ppPointi];
-                }
-                pointOffset.write();
-            }
+            // if (debug)
+            // {
+            //     pointVectorField pointOffset
+            //     (
+            //         pointVectorField::New
+            //         (
+            //             typedName("pointOffset"),
+            //             pointMesh::New(mesh),
+            //             dimensionedVector(dimLength, Zero)
+            //         )
+            //     );
+            //     forAll(pp.meshPoints(), ppPointi)
+            //     {
+            //         pointOffset[pp.meshPoints()[ppPointi]] =
+            //             bottomLocalPointsPtr_()[ppPointi]
+            //           - pp.localPoints()[ppPointi];
+            //     }
+            //     pointOffset.write();
+            // }
         }
 
         return bottomLocalPointsPtr_();

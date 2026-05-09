@@ -44,17 +44,17 @@ Foam::clouds::coupledToFluid::getRhocVf(const word& phaseName) const
 {
     const word rhocName = IOobject::groupName("rho", phaseName);
 
-    if (mesh_.mesh().foundObject<volScalarField>(rhocName))
+    if (mesh_.poly().foundObject<volScalarField>(rhocName))
     {
-        return mesh_.mesh().lookupObject<volScalarField>(rhocName);
+        return mesh_.poly().lookupObject<volScalarField>(rhocName);
     }
 
     const word thermocName =
         IOobject::groupName(physicalProperties::typeName, phaseName);
 
-    if (mesh_.mesh().foundObject<basicThermo>(thermocName))
+    if (mesh_.poly().foundObject<basicThermo>(thermocName))
     {
-        return mesh_.mesh().lookupObject<basicThermo>(thermocName).rho();
+        return mesh_.poly().lookupObject<basicThermo>(thermocName).rho();
     }
 
     FatalErrorInFunction
@@ -70,17 +70,17 @@ Foam::clouds::coupledToFluid::getMucVf(const word& phaseName) const
 {
     const word mucName = IOobject::groupName("mu", phaseName);
 
-    if (mesh_.mesh().foundObject<volScalarField>(mucName))
+    if (mesh_.poly().foundObject<volScalarField>(mucName))
     {
-        return mesh_.mesh().lookupObject<volScalarField>(mucName);
+        return mesh_.poly().lookupObject<volScalarField>(mucName);
     }
 
     const word thermocName =
         IOobject::groupName(physicalProperties::typeName, phaseName);
 
-    if (mesh_.mesh().foundObject<fluidThermo>(thermocName))
+    if (mesh_.poly().foundObject<fluidThermo>(thermocName))
     {
-        return mesh_.mesh().lookupObject<fluidThermo>(thermocName).mu();
+        return mesh_.poly().lookupObject<fluidThermo>(thermocName).mu();
     }
 
     return NullObjectRef<volScalarField>();
@@ -106,12 +106,12 @@ void Foam::clouds::coupledToFluid::updateCarrier()
 
     if (trhocVf_.isTmp())
     {
-        trhocVf_.ref() = getRhocVf(carrierPhaseName());
+        trhocVf_.ref() = getRhocVf(carriedCloud_.carrierPhaseName());
     }
 
     if (trhocPhaseVf_.isTmp())
     {
-        trhocPhaseVf_.ref() = getRhocVf(phaseName());
+        trhocPhaseVf_.ref() = getRhocVf(carriedCloud_.phaseName());
     }
 }
 
@@ -121,27 +121,28 @@ void Foam::clouds::coupledToFluid::updateCarrier()
 Foam::clouds::coupledToFluid::coupledToFluid
 (
     const cloud& c,
-    const dictionary& dict
+    const carried& carriedCloud
 )
 :
-    coupled(c, dict),
+    coupled(c, carriedCloud),
     mesh_(c.mesh()),
-    trhocVf_(getRhocVf(carrierPhaseName())),
+    carriedCloud_(carriedCloud),
+    trhocVf_(getRhocVf(carriedCloud.carrierPhaseName())),
     trhocPhaseVf_
     (
-        hasPhase()
-      ? getRhocVf(phaseName())
+        carriedCloud.hasPhase()
+      ? getRhocVf(carriedCloud.phaseName())
       : tmp<volScalarField>(NullObjectRef<volScalarField>())
     ),
-    mucVf_(getMucVf(carrierPhaseName())),
-    rhoc(carrierField<scalar>(trhocVf_())),
+    mucVf_(getMucVf(carriedCloud.carrierPhaseName())),
+    rhoc(carriedCloud.carrierField<scalar>(trhocVf_())),
     rhocPhase
     (
-        hasPhase()
-      ? carrierField<scalar>(trhocPhaseVf_())
-      : carrierField<scalar>
+        carriedCloud.hasPhase()
+      ? carriedCloud.carrierField<scalar>(trhocPhaseVf_())
+      : carriedCloud.carrierField<scalar>
         (
-            IOobject::groupName("rhoc", phaseName()),
+            IOobject::groupName("rhoc", carriedCloud.phaseName()),
             [&]()
             {
                 FatalErrorInFunction
@@ -165,7 +166,7 @@ Foam::clouds::coupledToFluid::coupledToFluid
                 return rhoc(model, subMesh)*nuc(model, subMesh);
             }
         )
-      : carrierField<scalar>(mucVf_)
+      : carriedCloud.carrierField<scalar>(mucVf_)
     )
 {}
 

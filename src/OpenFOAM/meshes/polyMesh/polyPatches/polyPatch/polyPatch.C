@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -31,7 +31,6 @@ License
 #include "SubField.H"
 #include "entry.H"
 #include "dictionary.H"
-#include "pointPatchField.H"
 
 // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
 
@@ -99,8 +98,7 @@ Foam::polyPatch::polyPatch
     const label size,
     const label start,
     const label index,
-    const polyBoundaryMesh& bm,
-    const word& patchType
+    const polyBoundaryMesh& bm
 )
 :
     patchIdentifier(name, index),
@@ -113,18 +111,7 @@ Foam::polyPatch::polyPatch
     boundaryMesh_(bm),
     faceCellsPtr_(nullptr),
     mePtr_(nullptr)
-{
-    if
-    (
-        patchType != word::null
-     && constraintType(patchType)
-     && findIndex(inGroups(), patchType) == -1
-     && name != patchType
-    )
-    {
-        inGroups().append(patchType);
-    }
-}
+{}
 
 
 Foam::polyPatch::polyPatch
@@ -132,8 +119,7 @@ Foam::polyPatch::polyPatch
     const word& name,
     const dictionary& dict,
     const label index,
-    const polyBoundaryMesh& bm,
-    const word& patchType
+    const polyBoundaryMesh& bm
 )
 :
     patchIdentifier(name, dict, index),
@@ -151,18 +137,7 @@ Foam::polyPatch::polyPatch
     boundaryMesh_(bm),
     faceCellsPtr_(nullptr),
     mePtr_(nullptr)
-{
-    if
-    (
-        patchType != word::null
-     && constraintType(patchType)
-     && findIndex(inGroups(), patchType) == -1
-     && name != patchType
-    )
-    {
-        inGroups().append(patchType);
-    }
-}
+{}
 
 
 Foam::polyPatch::polyPatch
@@ -237,59 +212,33 @@ Foam::polyPatch::~polyPatch()
 
 // * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
 
-bool Foam::polyPatch::constraintType(const word& pt)
-{
-    return pointPatchField<scalar>::pointPatchConstructorTablePtr_->found(pt);
-}
-
-
-Foam::wordList Foam::polyPatch::constraintTypes()
-{
-    wordList cTypes(dictionaryConstructorTablePtr_->size());
-
-    label i = 0;
-
-    for
-    (
-        dictionaryConstructorTable::iterator cstrIter =
-            dictionaryConstructorTablePtr_->begin();
-        cstrIter != dictionaryConstructorTablePtr_->end();
-        ++cstrIter
-    )
-    {
-        if (constraintType(cstrIter.key()))
-        {
-            cTypes[i++] = cstrIter.key();
-        }
-    }
-
-    cTypes.setSize(i);
-
-    return cTypes;
-}
-
-
 const Foam::polyBoundaryMesh& Foam::polyPatch::boundaryMesh() const
 {
     return boundaryMesh_;
 }
 
 
+const Foam::polyMesh& Foam::polyPatch::mesh() const
+{
+    return boundaryMesh_.mesh();
+}
+
+
 const Foam::vectorField::subField Foam::polyPatch::faceCentres() const
 {
-    return patchSlice(boundaryMesh().mesh().faceCentres());
+    return patchSlice(mesh().faceCentres());
 }
 
 
 const Foam::vectorField::subField Foam::polyPatch::faceAreas() const
 {
-    return patchSlice(boundaryMesh().mesh().faceAreas());
+    return patchSlice(mesh().faceAreas());
 }
 
 
 const Foam::scalarField::subField Foam::polyPatch::magFaceAreas() const
 {
-    return patchSlice(boundaryMesh().mesh().magFaceAreas());
+    return patchSlice(mesh().magFaceAreas());
 }
 
 
@@ -299,7 +248,7 @@ Foam::tmp<Foam::vectorField> Foam::polyPatch::faceCellCentres() const
     vectorField& cc = tcc.ref();
 
     // get reference to global cell centres
-    const vectorField& gcc = boundaryMesh_.mesh().cellCentres();
+    const vectorField& gcc = mesh().cellCentres();
 
     const labelUList& faceCells = this->faceCells();
 
@@ -318,7 +267,7 @@ const Foam::labelUList& Foam::polyPatch::faceCells() const
     {
         faceCellsPtr_ = new labelList::subList
         (
-            patchSlice(boundaryMesh().mesh().faceOwner())
+            patchSlice(mesh().faceOwner())
         );
     }
 
@@ -335,8 +284,8 @@ const Foam::labelList& Foam::polyPatch::meshEdges() const
             (
                 primitivePatch::meshEdges
                 (
-                    boundaryMesh().mesh().edges(),
-                    boundaryMesh().mesh().pointEdges()
+                    mesh().edges(),
+                    mesh().pointEdges()
                 )
             );
     }
@@ -377,6 +326,20 @@ bool Foam::polyPatch::order
 {
     // Nothing changed.
     return false;
+}
+
+
+void Foam::polyPatch::reset(const label size, const label start)
+{
+    clearAddressing();
+    start_ = start;
+
+    const primitivePatch pp
+    (
+        faceSubList(mesh().faces(), size, start),
+        mesh().points()
+    );
+    primitivePatch::operator=(pp);
 }
 
 

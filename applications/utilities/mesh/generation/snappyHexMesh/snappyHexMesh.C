@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -132,7 +132,7 @@ autoPtr<refinementSurfaces> createRefinementSurfaces
             const word scsFuncName =
                 shapeDict.lookup("surfaceCellSizeFunction");
             const dictionary& scsDict =
-                shapeDict.optionalSubDict(scsFuncName + "Coeffs");
+                shapeDict.optionalTypeDict(scsFuncName);
 
             const scalar surfaceCellSize =
                 scsDict.lookup<scalar>("surfaceCellSizeCoeff");
@@ -216,10 +216,7 @@ autoPtr<refinementSurfaces> createRefinementSurfaces
                                 "surfaceCellSizeFunction"
                             );
                         const dictionary& scsDict =
-                            shapeControlRegionDict.subDict
-                            (
-                                scsFuncName + "Coeffs"
-                            );
+                            shapeControlRegionDict.typeDict(scsFuncName);
 
                         const scalar surfaceCellSize =
                                 scsDict.lookup<scalar>("surfaceCellSizeCoeff");
@@ -374,7 +371,7 @@ void extractSurface
     const fileName& outFileName
 )
 {
-    const polyBoundaryMesh& bMesh = mesh.boundaryMesh();
+    const polyBoundaryMesh& bMesh = mesh.boundary();
 
     // Collect sizes. Hash on names to handle local-only patches (e.g.
     //  processor patches)
@@ -561,7 +558,7 @@ void removeZeroSizedPatches(fvMesh& mesh)
 {
     // Remove non-constraint zero-sized patches
 
-    const polyBoundaryMesh& pbm = mesh.boundaryMesh();
+    const polyBoundaryMesh& pbm = mesh.poly().boundary();
 
     labelList oldToNew(pbm.size(), -1);
     label newPatchi = 0;
@@ -571,7 +568,7 @@ void removeZeroSizedPatches(fvMesh& mesh)
 
         if
         (
-            polyPatch::constraintType(pp.type())
+            pp.constraint()
          || returnReduce(pp.size(), sumOp<label>())
         )
         {
@@ -632,7 +629,6 @@ void writeMesh
 
 int main(int argc, char *argv[])
 {
-    Foam::argList::removeOption("noFunctionObjects");
     #include "addNoOverwriteOption.H"
     Foam::argList::addBoolOption
     (
@@ -661,7 +657,7 @@ int main(int argc, char *argv[])
     #include "addMeshOption.H"
     #include "addRegionOption.H"
 
-    #include "setRootCase.H"
+    #include "setRootCaseNoFunctionObjects.H"
     #include "createTimeNoFunctionObjects.H"
     #include "createSpecifiedMeshNoChangers.H"
 
@@ -680,12 +676,13 @@ int main(int argc, char *argv[])
             << "Mesh provided is not fully 3D"
                " as required for mesh relaxation after snapping" << nl
             << "Convert all empty patches to appropriate types for a 3D mesh,"
-               " current patch types are" << nl << mesh.boundaryMesh().types()
+               " current patch types are" << nl
+            << mesh.poly().boundary().types()
             << exit(FatalError);
     }
 
     // Check patches and faceZones are synchronised
-    mesh.boundaryMesh().checkParallelSync(true);
+    mesh.poly().boundary().checkParallelSync(true);
     meshRefinement::checkCoupledFaceZones(mesh);
 
 
@@ -1021,7 +1018,7 @@ int main(int argc, char *argv[])
 
                     Info<< setf(ios_base::left)
                         << setw(6) << patchi
-                        << setw(20) << mesh.boundaryMesh()[patchi].type()
+                        << setw(20) << mesh.poly().boundary()[patchi].type()
                         << setw(30) << regNames[i] << nl;
 
                     globalToMasterPatch[globalRegionI] = patchi;
@@ -1061,7 +1058,7 @@ int main(int argc, char *argv[])
 
                         Info<< setf(ios_base::left)
                             << setw(6) << patchi
-                            << setw(20) << mesh.boundaryMesh()[patchi].type()
+                            << setw(20) << mesh.poly().boundary()[patchi].type()
                             << setw(30) << regNames[i] << nl;
 
                         globalToMasterPatch[globalRegionI] = patchi;
@@ -1093,7 +1090,7 @@ int main(int argc, char *argv[])
 
                         Info<< setf(ios_base::left)
                             << setw(6) << patchi
-                            << setw(20) << mesh.boundaryMesh()[patchi].type()
+                            << setw(20) << mesh.poly().boundary()[patchi].type()
                             << setw(30) << slaveName << nl;
 
                         globalToSlavePatch[globalRegionI] = patchi;
@@ -1236,7 +1233,7 @@ int main(int argc, char *argv[])
         const dictionary& layersDict = meshDict.subDict("addLayersControls");
 
         // Layer addition parameters
-        const layerParameters layerParams(layersDict, mesh.boundaryMesh());
+        const layerParameters layerParams(layersDict, mesh.poly().boundary());
 
         snappyLayerDriver layerDriver
         (
@@ -1313,7 +1310,7 @@ int main(int argc, char *argv[])
 
     if (surfaceSimplify)
     {
-        const polyBoundaryMesh& bMesh = mesh.boundaryMesh();
+        const polyBoundaryMesh& bMesh = mesh.poly().boundary();
 
         labelHashSet includePatches(bMesh.size());
 

@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2012-2024 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2012-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -69,7 +69,7 @@ Foam::structuredRenumber::structuredRenumber
     structuredRenumber
     (
         renumberDict,
-        renumberDict.optionalSubDict(typeName + "Coeffs")
+        renumberDict.optionalTypeDict(typeName)
     )
 {}
 
@@ -159,7 +159,7 @@ Foam::labelList Foam::structuredRenumber::renumber
             << exit(FatalError);
     }
 
-    const polyBoundaryMesh& pbm = mesh.boundaryMesh();
+    const polyBoundaryMesh& pbm = mesh.boundary();
     const labelHashSet patchIDs(pbm.patchSet(patches_));
 
     label nFaces = 0;

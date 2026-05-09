@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2024 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -195,7 +195,7 @@ void Foam::FacePostProcessing<CloudType>::write()
 
                 autoPtr<surfaceWriter> writer
                 (
-                    surfaceWriter::New(surfaceFormat_, this->coeffDict())
+                    surfaceWriter::New(surfaceFormat_, this->typeDict())
                 );
 
                 writer->write
@@ -246,17 +246,17 @@ Foam::FacePostProcessing<CloudType>::FacePostProcessing
 :
     CloudFunctionObject<CloudType>(dict, owner, modelName, typeName),
     faceZoneIndices_(),
-    surfaceFormat_(this->coeffDict().lookup("surfaceFormat")),
-    resetOnWrite_(this->coeffDict().lookup("resetOnWrite")),
+    surfaceFormat_(this->typeDict().lookup("surfaceFormat")),
+    resetOnWrite_(this->typeDict().lookup("resetOnWrite")),
     totalTime_(0.0),
     mass_(),
     massTotal_(),
     massFlowRate_(),
-    log_(this->coeffDict().lookup("log")),
+    log_(this->typeDict().lookup("log")),
     outputFilePtr_(),
     timeOld_(owner.mesh().time().value())
 {
-    wordList faceZoneNames(this->coeffDict().lookup("faceZones"));
+    wordList faceZoneNames(this->typeDict().lookup("faceZones"));
     mass_.setSize(faceZoneNames.size());
     massTotal_.setSize(faceZoneNames.size());
     massFlowRate_.setSize(faceZoneNames.size());
@@ -266,7 +266,7 @@ Foam::FacePostProcessing<CloudType>::FacePostProcessing
     DynamicList<label> zoneIDs;
     const faceZoneList& mfz = owner.mesh().faceZones();
     const surfaceScalarField& magSf = owner.mesh().magSf();
-    const polyBoundaryMesh& pbm = owner.mesh().boundaryMesh();
+    const polyBoundaryMesh& pbm = owner.mesh().poly().boundary();
     forAll(faceZoneNames, i)
     {
         const word& zoneName = faceZoneNames[i];

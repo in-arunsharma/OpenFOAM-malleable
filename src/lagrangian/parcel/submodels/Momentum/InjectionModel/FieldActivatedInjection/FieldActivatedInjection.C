@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -40,28 +40,28 @@ Foam::FieldActivatedInjection<CloudType>::FieldActivatedInjection
 )
 :
     InjectionModel<CloudType>(dict, owner, modelName, typeName),
-    factor_(this->coeffDict().template lookup<scalar>("factor")),
+    factor_(this->typeDict().template lookup<scalar>("factor")),
     referenceField_
     (
-        owner.db().objectRegistry::template lookupObject<volScalarField>
+        owner.parent().objectRegistry::template lookupObject<volScalarField>
         (
-            this->coeffDict().lookup("referenceField")
+            this->typeDict().lookup("referenceField")
         )
     ),
     thresholdField_
     (
-        owner.db().objectRegistry::template lookupObject<volScalarField>
+        owner.parent().objectRegistry::template lookupObject<volScalarField>
         (
-            this->coeffDict().lookup("thresholdField")
+            this->typeDict().lookup("thresholdField")
         )
     ),
-    positionsFile_(this->coeffDict().lookup("positionsFile")),
+    positionsFile_(this->typeDict().lookup("positionsFile")),
     positions_
     (
         IOobject
         (
             positionsFile_,
-            owner.db().time().constant(),
+            owner.time().constant(),
             owner.mesh(),
             IOobject::MUST_READ,
             IOobject::NO_WRITE
@@ -74,17 +74,17 @@ Foam::FieldActivatedInjection<CloudType>::FieldActivatedInjection
     massTotal_(this->readMassTotal(dict, owner)),
     nParcelsPerInjector_
     (
-        this->coeffDict().template lookup<label>("parcelsPerInjector")
+        this->typeDict().template lookup<label>("parcelsPerInjector")
     ),
     nParcelsInjected_(positions_.size(), 0),
-    U0_(this->coeffDict().lookup("U0")),
+    U0_(this->typeDict().lookup("U0")),
     diameters_(positions_.size()),
     sizeDistribution_
     (
         distribution::New
         (
             dimLength,
-            this->coeffDict().subDict("sizeDistribution"),
+            this->typeDict().subDict("sizeDistribution"),
             this->sizeSampleQ(),
             owner.rndGen().generator()
         )

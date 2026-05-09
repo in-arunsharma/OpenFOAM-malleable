@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2016-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2016-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -114,7 +114,7 @@ Foam::rigidBodyMeshMotion::bodyMesh::bodyMesh
     name_(name),
     bodyIndex_(bodyID),
     patches_(wordReList(dict.lookup("patches"))),
-    patchSet_(mesh.boundaryMesh().patchSet(patches_)),
+    patchSet_(mesh.boundary().patchSet(patches_)),
     pointZones_(dict.lookupOrDefault("pointZones", wordReList::null())),
     pointZoneSet_(mesh.pointZones().zoneSet(pointZones_)),
     di_(dict.lookup<scalar>("innerDistance")),
@@ -142,7 +142,7 @@ Foam::rigidBodyMeshMotion::rigidBodyMeshMotion
     const dictionary& dict
 )
 :
-    displacementMotionSolver(name, mesh, dict, typeName),
+    points0MotionSolver(name, mesh, dict, typeName),
     RBD::rigidBodyMotion
     (
         dict,
@@ -282,13 +282,7 @@ Type Foam::rigidBodyMeshMotion::bodyMesh::weight
 
 
 Foam::tmp<Foam::pointField>
-Foam::rigidBodyMeshMotion::curPoints() const
-{
-    return points0() + pointDisplacement_.primitiveField();
-}
-
-
-void Foam::rigidBodyMeshMotion::solve()
+Foam::rigidBodyMeshMotion::newPoints()
 {
     const Time& t = mesh().time();
 
@@ -374,8 +368,8 @@ void Foam::rigidBodyMeshMotion::solve()
         }
     }
 
-    vectorField& pointDisplacement = pointDisplacement_.primitiveFieldRef();
     const pointField& points0 = this->points0();
+    vectorField pointDisplacement(points0.size());
 
     // Update the displacements
     if (bodyMeshes_.size() == 1)
@@ -388,7 +382,9 @@ void Foam::rigidBodyMeshMotion::solve()
         {
             // Don't move where weight ~= 0
             if (weight[pointi] <= small)
-            {}
+            {
+                pointDisplacement[pointi] = Zero;
+            }
             // Use solid-body motion where weight ~= 1
             else if (weight[pointi] > 1 - small)
             {
@@ -421,10 +417,12 @@ void Foam::rigidBodyMeshMotion::solve()
     }
 
     // Displacement has changed. Update boundary conditions
-    pointConstraints::New
-    (
-        pointDisplacement_.mesh()
-    ).constrainDisplacement(pointDisplacement_);
+    // pointConstraints::New
+    // (
+    //     pointDisplacement.mesh()
+    // ).constrainDisplacement(pointDisplacement);
+
+    return points0 + pointDisplacement;
 }
 
 
@@ -574,7 +572,7 @@ bool Foam::rigidBodyMeshMotion::write() const
     state().write(dict);
 
     return
-        displacementMotionSolver::write()
+        points0MotionSolver::write()
      && dict.regIOobject::writeObject
         (
             IOstream::ASCII,

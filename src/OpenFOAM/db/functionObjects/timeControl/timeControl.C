@@ -157,13 +157,13 @@ void Foam::timeControl::read(const dictionary& dict)
                 dict.lookupOrDefault
                 (
                     "timeDelta",
-                    unitNone,
-                    1e-3*time_.userDeltaTValue()
+                    units::none,
+                    scalar(1e-3*time_.userDeltaTValue())
                 );
 
             if (dict.found(timesName))
             {
-                times_ = dict.lookup<scalarList>(timesName, unitNone);
+                times_ = dict.lookup<scalarList>(timesName, units::none);
             }
             else if (dict.found(frequenciesName))
             {
@@ -254,7 +254,8 @@ void Foam::timeControl::read(const dictionary& dict)
 bool Foam::timeControl::active() const
 {
     return
-        time_.value() >= startTime_ - 0.5*time_.deltaTValue()
+        timeControl_ != timeControls::none
+     && time_.value() >= startTime_ - 0.5*time_.deltaTValue()
      && time_.value() <= endTime_;
 }
 

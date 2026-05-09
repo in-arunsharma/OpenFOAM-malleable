@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2013-2024 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2013-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -24,7 +24,7 @@ License
 \*---------------------------------------------------------------------------*/
 
 #include "polyMeshFilterSettings.H"
-#include "unitConversion.H"
+#include "units.H"
 
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
@@ -35,9 +35,9 @@ Foam::polyMeshFilterSettings::polyMeshFilterSettings(const dictionary& dict)
     (
         dict_.lookupOrDefault<Switch>("controlMeshQuality", false)
     ),
-    collapseEdgesCoeffDict_(dict_.subDict("collapseEdgesCoeffs")),
-    collapseFacesCoeffDict_(dict_.subOrEmptyDict("collapseFacesCoeffs")),
-    meshQualityCoeffDict_(dict_.subOrEmptyDict("controlMeshQualityCoeffs")),
+    collapseEdgesCoeffDict_(dict_.typeDict("collapseEdges")),
+    collapseFacesCoeffDict_(dict_.typeOrEmptyDict("collapseFaces")),
+    meshQualityCoeffDict_(dict_.typeOrEmptyDict("controlMeshQuality")),
     minLen_(collapseEdgesCoeffDict_.lookup<scalar>("minimumEdgeLength")),
     maxCos_
     (
@@ -46,7 +46,7 @@ Foam::polyMeshFilterSettings::polyMeshFilterSettings(const dictionary& dict)
             collapseEdgesCoeffDict_.lookup<scalar>
             (
                 "maximumMergeAngle",
-                unitDegrees
+                units::degrees
             )
         )
     ),

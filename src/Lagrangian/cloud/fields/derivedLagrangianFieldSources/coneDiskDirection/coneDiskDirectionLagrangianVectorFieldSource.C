@@ -43,8 +43,8 @@ coneDiskDirectionLagrangianVectorFieldSource
         Function1<scalar>::New
         (
             "thetaInner",
-            field.db().time().userUnits(),
-            unitDegrees,
+            field.time().userUnits(),
+            units::degrees,
             dict
         )
     ),
@@ -53,8 +53,8 @@ coneDiskDirectionLagrangianVectorFieldSource
         Function1<scalar>::New
         (
             "thetaOuter",
-            field.db().time().userUnits(),
-            unitDegrees,
+            field.time().userUnits(),
+            units::degrees,
             dict
         )
     )
@@ -114,8 +114,21 @@ void Foam::coneDiskDirectionLagrangianVectorFieldSource::write
     Ostream& os
 ) const
 {
-    writeEntry(os, field_.db().time().userUnits(), unitDegrees, thetaInner_());
-    writeEntry(os, field_.db().time().userUnits(), unitDegrees, thetaOuter_());
+    writeEntry
+    (
+        os,
+        field_.time().userUnits(),
+        units::degrees,
+        thetaInner_()
+    );
+
+    writeEntry
+    (
+        os,
+        field_.time().userUnits(),
+        units::degrees,
+        thetaOuter_()
+    );
 }
 
 

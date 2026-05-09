@@ -195,6 +195,9 @@ private:
         //- Set the write option of the topology
         void setTopologyWrite(const IOobject::writeOption wo);
 
+        //- Clear addressing
+        void clearAddressing();
+
 
         // Helper functions for constructor from cell shapes
 
@@ -386,7 +389,7 @@ public:
 
 
             //- Return boundary mesh
-            const polyBoundaryMesh& boundaryMesh() const
+            const polyBoundaryMesh& boundary() const
             {
                 return boundary_;
             }
@@ -446,7 +449,7 @@ public:
             label& comm();
 
             //- Return the object registry
-            const objectRegistry& thisDb() const
+            const objectRegistry& db() const
             {
                 return *this;
             }
@@ -583,14 +586,8 @@ public:
             //- Clear geometry
             void clearGeom();
 
-            //- Clear addressing
-            void clearAddressing(const bool isMeshUpdate = false);
-
             //- Clear all geometry and addressing unnecessary for CFD
             void clearOut();
-
-            //- Clear primitive data (points, faces and cells)
-            void clearPrimitives();
 
             //- Clear tet base points
             void clearTetBasePtIs();

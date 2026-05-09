@@ -100,7 +100,7 @@ Foam::labelList Foam::functionObjects::fieldValues::surfaceFieldValue::patchis
     forAll(patchNames, i)
     {
         const labelList patchiis =
-            mesh_.boundaryMesh().findIndices(patchNames[i]);
+            mesh_.poly().boundary().findIndices(patchNames[i]);
 
         if (patchiis.empty())
         {
@@ -110,7 +110,7 @@ Foam::labelList Foam::functionObjects::fieldValues::surfaceFieldValue::patchis
                 << "(" << patchNames[i] << "):" << nl
                 << "    Unknown patch name: " << patchNames[i]
                 << ". Valid patch names are: "
-                << mesh_.boundaryMesh().names() << nl
+                << mesh_.poly().boundary().names() << nl
                 << exit(FatalError);
         }
 
@@ -244,7 +244,7 @@ void Foam::functionObjects::fieldValues::surfaceFieldValue::combineMeshGeometry
         if (facePatchId_[i] != -1)
         {
             label patchi = facePatchId_[i];
-            globalFacesIs[i] += mesh_.boundaryMesh()[patchi].start();
+            globalFacesIs[i] += mesh_.poly().boundary()[patchi].start();
         }
     }
 
@@ -502,7 +502,7 @@ void Foam::functionObjects::fieldValues::surfaceFieldValue::moveMesh()
         case selectionTypes::patches:
             break;
         case selectionTypes::sampledSurface:
-            surfacePtr_->expire();
+            surfacePtr_->movePoints();
             setSampledSurfaceFaces();
             break;
     }
@@ -686,24 +686,22 @@ bool Foam::functionObjects::fieldValues::surfaceFieldValue::read
     changeMesh();
 
     // Report configuration
-    Info<< type() << ' ' << name() << " read:" << nl;
-    Info<< "    number of faces = " << nFaces_ << nl;
+    Info<< indent << "number of faces = " << nFaces_ << nl;
     if (nFaces_)
     {
-        Info<< "    area = " << area_ << nl;
+        Info<< indent << "area = " << area_ << nl;
     }
-    Info<< "    operation = " << operationTypeNames_[operation_] << nl;
+    Info<< indent << "operation = " << operationTypeNames_[operation_] << nl;
     if (weightFieldNames_.size() == 1)
     {
-        Info<< "    weight field = " << weightFieldNames_[0] << nl;
+        Info<< indent << "weight field = " << weightFieldNames_[0] << nl;
     }
     if (weightFieldNames_.size() > 1)
     {
-        Info<< "    weight fields =";
+        Info<< indent << "weight fields =";
         forAll(weightFieldNames_, i) Info<< ' ' << weightFieldNames_[i];
         Info<< nl;
     }
-    Info<< endl;
 
     return true;
 }
@@ -872,7 +870,7 @@ bool Foam::functionObjects::fieldValues::surfaceFieldValue::write()
               + "("
               + (
                     selectionType_ == selectionTypes::patches
-                  ? selectionName_.replace(" ", ",").c_str()
+                  ? selectionName_.replaceAll(" ", ",").c_str()
                   : selectionName_.c_str()
                 )
               + ")",

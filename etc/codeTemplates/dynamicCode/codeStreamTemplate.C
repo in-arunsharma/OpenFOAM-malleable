@@ -31,7 +31,7 @@ Description
 #include "Ostream.H"
 #include "Pstream.H"
 #include "read.H"
-#include "unitConversion.H"
+#include "units.H"
 
 //{{{ begin codeInclude
 ${codeInclude}

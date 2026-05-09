@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2023 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -39,6 +39,7 @@ SourceFiles
 #include "floatScalar.H"
 #include "doubleScalar.H"
 #include "longDoubleScalar.H"
+#include "scaleable.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -147,6 +148,52 @@ namespace Foam
 
     //- Compute the power of the number x to the reciprocal integer 1/e
     inline scalar integerRoot(const scalar x, const label e);
+}
+
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+// Rank type
+
+namespace Foam
+{
+    template<direction Ncmpts>
+    struct typeOfNcmpts;
+
+    //- Rank type
+    template<>
+    struct typeOfNcmpts<1>
+    {
+        using type = scalar;
+    };
+}
+
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+// Define a scalar to be scaleable
+
+namespace Foam
+{
+    template<>
+    struct scaleable<scalar> : public std::true_type {};
+}
+
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+// Enable conditional instantiation for types with a scalar component type
+
+namespace Foam
+{
+    template<class Type, class Void = void>
+    using enableIfScalarCmptType =
+        std::enable_if_t
+        <
+            std::is_same
+            <
+                scalar,
+                typename pTraits<Type>::cmptType
+            >::value,
+            Void
+        >;
 }
 
 

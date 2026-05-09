@@ -38,7 +38,7 @@ template<class Coordinate, class Value>
 Foam::TableReaders::Embedded<Coordinate, Value>::Embedded
 (
     const word& name,
-    const Function1s::unitConversions& units,
+    const Function1s::unitSets& units,
     const dictionary& dict
 )
 :
@@ -59,15 +59,22 @@ template<class Coordinate, class Value>
 Foam::List<Foam::Tuple2<Coordinate, Value>>
 Foam::TableReaders::Embedded<Coordinate, Value>::read
 (
-    const Function1s::unitConversions& defaultUnits,
+    const Function1s::unitSets& defaultUnits,
     const dictionary& dict,
     const word& valuesKeyword
 ) const
 {
-    Function1s::unitConversions units(defaultUnits);
-    units.readIfPresent("units", dict);
     Istream& is = dict.lookup(valuesKeyword);
-    return TableReader<Coordinate, Value>::convertRead(units, is);
+    if (dict.found("units"))
+    {
+        Function1s::unitSets units(defaultUnits);
+        units.read(dict.lookup("units"));
+        return TableReader<Coordinate, Value>::convertRead(units, is);
+    }
+    else
+    {
+        return TableReader<Coordinate, Value>::convertRead(defaultUnits, is);
+    }
 }
 
 
@@ -75,7 +82,7 @@ template<class Coordinate, class Value>
 Foam::List<Foam::Tuple2<Coordinate, Value>>
 Foam::TableReaders::Embedded<Coordinate, Value>::read
 (
-    const Function1s::unitConversions& units,
+    const Function1s::unitSets& units,
     Istream& is
 )
 {
@@ -87,7 +94,7 @@ template<class Coordinate, class Value>
 void Foam::TableReaders::Embedded<Coordinate, Value>::write
 (
     Ostream& os,
-    const Function1s::unitConversions& units,
+    const Function1s::unitSets& units,
     const List<Tuple2<Coordinate, Value>>& table,
     const word& valuesKeyword
 ) const

@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -40,13 +40,13 @@ Foam::ManualInjection<CloudType>::ManualInjection
 )
 :
     InjectionModel<CloudType>(dict, owner, modelName, typeName),
-    positionsFile_(this->coeffDict().lookup("positionsFile")),
+    positionsFile_(this->typeDict().lookup("positionsFile")),
     positions_
     (
         IOobject
         (
             positionsFile_,
-            owner.db().time().constant(),
+            owner.time().constant(),
             owner.mesh(),
             IOobject::MUST_READ,
             IOobject::NO_WRITE
@@ -58,20 +58,20 @@ Foam::ManualInjection<CloudType>::ManualInjection
     injectorTetFaces_(positions_.size(), -1),
     injectorTetPts_(positions_.size(), -1),
     massTotal_(this->readMassTotal(dict, owner)),
-    U0_(this->coeffDict().lookup("U0")),
+    U0_(this->typeDict().lookup("U0")),
     sizeDistribution_
     (
         distribution::New
         (
             dimLength,
-            this->coeffDict().subDict("sizeDistribution"),
+            this->typeDict().subDict("sizeDistribution"),
             this->sizeSampleQ(),
             owner.rndGen().generator()
         )
     ),
     ignoreOutOfBounds_
     (
-        this->coeffDict().lookupOrDefault("ignoreOutOfBounds", false)
+        this->typeDict().lookupOrDefault("ignoreOutOfBounds", false)
     )
 {
     topoChange();

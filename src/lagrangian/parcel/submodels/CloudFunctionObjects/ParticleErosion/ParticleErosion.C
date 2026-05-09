@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2023 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -76,12 +76,12 @@ Foam::ParticleErosion<CloudType>::ParticleErosion
     CloudFunctionObject<CloudType>(dict, owner, modelName, typeName),
     QPtr_(nullptr),
     patchIndices_(),
-    p_(this->coeffDict().template lookup<scalar>("p")),
-    psi_(this->coeffDict().template lookupOrDefault<scalar>("psi", 2.0)),
-    K_(this->coeffDict().template lookupOrDefault<scalar>("K", 2.0))
+    p_(this->typeDict().template lookup<scalar>("p")),
+    psi_(this->typeDict().template lookupOrDefault<scalar>("psi", 2.0)),
+    K_(this->typeDict().template lookupOrDefault<scalar>("K", 2.0))
 {
-    const wordList allPatchNames = owner.mesh().boundaryMesh().names();
-    wordList patchName(this->coeffDict().lookup("patches"));
+    const wordList allPatchNames = owner.mesh().poly().boundary().names();
+    wordList patchName(this->typeDict().lookup("patches"));
 
     labelHashSet uniquePatchIDs;
     forAllReverse(patchName, i)
@@ -166,7 +166,7 @@ void Foam::ParticleErosion<CloudType>::preFace(const parcelType& p)
     const fvMesh& mesh = this->owner().mesh();
     if (!p.onBoundaryFace(mesh)) return;
 
-    const polyPatch& pp = mesh.boundaryMesh()[p.patch(mesh)];
+    const polyPatch& pp = mesh.poly().boundary()[p.patch(mesh)];
     const label patchi = pp.index();
     const label localPatchi = applyToPatch(patchi);
 

@@ -34,9 +34,14 @@ namespace Function1s
 {
     defineTypeNameAndDebug(${typeName}Function1${TemplateType}, 0);
 }
-    Function1<${TemplateType}>::adddictionaryConstructorToTable<Function1s::
-        ${typeName}Function1${TemplateType}>
-        ${typeName}Function1${TemplateType}ConstructorToTable_;
+
+Function1<${TemplateType}>::
+addRemovabledictionaryConstructorToTable
+<
+    Function1s::${typeName}Function1${TemplateType}
+>
+${typeName}Function1${TemplateType}ConstructorToTable_;
+
 }
 
 
@@ -66,7 +71,7 @@ Foam::Function1s::${typeName}Function1${TemplateType}::
 ${typeName}Function1${TemplateType}
 (
     const word& entryName,
-    const unitConversions& units,
+    const unitSets& units,
     const dictionary& dict
 )
 :
@@ -129,7 +134,7 @@ Foam::Function1s::${typeName}Function1${TemplateType}::integral
 void Foam::Function1s::${typeName}Function1${TemplateType}::write
 (
     Ostream& os,
-    const unitConversions&
+    const unitSets&
 ) const
 {
     NotImplemented;

@@ -43,8 +43,8 @@ coneDirectionLagrangianVectorFieldSource
         Function1<scalar>::New
         (
             "thetaInner",
-            field.db().time().userUnits(),
-            unitDegrees,
+            field.time().userUnits(),
+            units::degrees,
             dict
         )
     ),
@@ -53,8 +53,8 @@ coneDirectionLagrangianVectorFieldSource
         Function1<scalar>::New
         (
             "thetaOuter",
-            field.db().time().userUnits(),
-            unitDegrees,
+            field.time().userUnits(),
+            units::degrees,
             dict
         )
     ),
@@ -102,8 +102,8 @@ Foam::coneDirectionLagrangianVectorFieldSource::direction
     const LagrangianSubMesh& subMesh = axis.mesh();
 
     // Restart the generator if necessary and set the time index up to date
-    rndGen_.start(timeIndex_ == field_.db().time().timeIndex());
-    timeIndex_ = field_.db().time().timeIndex();
+    rndGen_.start(timeIndex_ == field_.time().timeIndex());
+    timeIndex_ = field_.time().timeIndex();
 
     // Construct a random direction perpendicular to the cone axis
     const tmp<LagrangianSubVectorField> tt1Dir(normalised(perpendicular(axis)));
@@ -152,8 +152,21 @@ Foam::coneDirectionLagrangianVectorFieldSource::direction
 
 void Foam::coneDirectionLagrangianVectorFieldSource::write(Ostream& os) const
 {
-    writeEntry(os, field_.db().time().userUnits(), unitDegrees, thetaInner_());
-    writeEntry(os, field_.db().time().userUnits(), unitDegrees, thetaOuter_());
+    writeEntry
+    (
+        os,
+        field_.time().userUnits(),
+        units::degrees,
+        thetaInner_()
+    );
+
+    writeEntry
+    (
+        os,
+        field_.time().userUnits(),
+        units::degrees,
+        thetaOuter_()
+    );
 
     writeEntry(os, "coneDirectionRndGen", rndGen_);
 }

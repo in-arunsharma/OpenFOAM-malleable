@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2023 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -181,7 +181,7 @@ void Foam::PairCollision<CloudType>::wallInteraction()
 
     const labelListList& directWallFaces = il_.dwfil();
 
-    const labelList& patchID = mesh.boundaryMesh().patchIndices();
+    const labelList& patchID = mesh.boundary().patchIndices();
 
     const volVectorField& U = mesh.lookupObject<volVectorField>(il_.UName());
 
@@ -252,7 +252,7 @@ void Foam::PairCollision<CloudType>::wallInteraction()
                     label patchi = patchID[realFacei - mesh.nInternalFaces()];
 
                     label patchFacei =
-                        realFacei - mesh.boundaryMesh()[patchi].start();
+                        realFacei - mesh.boundary()[patchi].start();
 
                     WallSiteData<vector> wSD
                     (
@@ -534,7 +534,7 @@ Foam::PairCollision<CloudType>::PairCollision
     (
         PairModel<CloudType>::New
         (
-            this->coeffDict(),
+            this->typeDict(),
             this->owner()
         )
     ),
@@ -542,23 +542,23 @@ Foam::PairCollision<CloudType>::PairCollision
     (
         WallModel<CloudType>::New
         (
-            this->coeffDict(),
+            this->typeDict(),
             this->owner()
         )
     ),
     il_
     (
         owner.mesh(),
-        this->coeffDict().template lookup<scalar>("maxInteractionDistance"),
+        this->typeDict().template lookup<scalar>("maxInteractionDistance"),
         Switch
         (
-            this->coeffDict().lookupOrDefault
+            this->typeDict().lookupOrDefault
             (
                 "writeReferredParticleCloud",
                 false
             )
         ),
-        this->coeffDict().lookupOrDefault("U", word("U"))
+        this->typeDict().lookupOrDefault("U", word("U"))
     )
 {}
 

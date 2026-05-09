@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -54,7 +54,7 @@ void printMesh(const Time& runTime, const polyMesh& mesh)
         << "  cells:" << mesh.globalData().nTotalCells()
         << "  faces:" << mesh.globalData().nTotalFaces()
         << "  points:" << mesh.globalData().nTotalPoints()
-        << "  patches:" << mesh.boundaryMesh().size()
+        << "  patches:" << mesh.boundary().size()
         << "  bb:" << mesh.bounds() << nl;
 }
 
@@ -113,7 +113,7 @@ void removeSet
     if (objects.found(setName))
     {
         // Remove file
-        const fileName object = objects[setName]->objectPath(false);
+        const fileName object = objects[setName].objectPath(false);
         Info<< "Removing file " << object << endl;
         rm(object);
     }

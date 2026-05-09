@@ -37,7 +37,7 @@ void Foam::patchProbes::sampleAndWrite(const VolField<Type>& vField)
     if (Pstream::master())
     {
         unsigned int w = IOstream::defaultPrecision() + 7;
-        OFstream& probeStream = *probeFilePtrs_[vField.name()];
+        OFstream& probeStream = probeFilePtrs_[vField.name()];
 
         probeStream
             << setw(w)
@@ -60,7 +60,7 @@ void Foam::patchProbes::sampleAndWrite(const SurfaceField<Type>& sField)
     if (Pstream::master())
     {
         unsigned int w = IOstream::defaultPrecision() + 7;
-        OFstream& probeStream = *probeFilePtrs_[sField.name()];
+        OFstream& probeStream = probeFilePtrs_[sField.name()];
 
         probeStream
             << setw(w)
@@ -141,7 +141,7 @@ Foam::patchProbes::sample(const VolField<Type>& vField) const
 
     Field<Type>& values = tValues.ref();
 
-    const polyBoundaryMesh& patches = mesh_.boundaryMesh();
+    const polyBoundaryMesh& patches = mesh_.poly().boundary();
 
     forAll(locations_, probei)
     {
@@ -175,7 +175,7 @@ Foam::patchProbes::sample(const SurfaceField<Type>& sField) const
 
     Field<Type>& values = tValues.ref();
 
-    const polyBoundaryMesh& patches = mesh_.boundaryMesh();
+    const polyBoundaryMesh& patches = mesh_.poly().boundary();
 
     forAll(locations_, probei)
     {

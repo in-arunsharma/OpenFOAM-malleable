@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2013-2022 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2013-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -40,7 +40,7 @@ Foam::PackingModels::Explicit<CloudType>::Explicit
     (
         CorrectionLimitingMethod::New
         (
-            this->coeffDict().subDict(CorrectionLimitingMethod::typeName)
+            this->typeDict().subDict(CorrectionLimitingMethod::typeName)
         )
     )
 {}
@@ -108,7 +108,7 @@ void Foam::PackingModels::Explicit<CloudType>::cacheFields(const bool store)
                 IOobject
                 (
                     cloudName + ":stressAverage",
-                    this->owner().db().time().name(),
+                    this->owner().time().name(),
                     mesh
                 ),
                 this->owner().solution().dict(),

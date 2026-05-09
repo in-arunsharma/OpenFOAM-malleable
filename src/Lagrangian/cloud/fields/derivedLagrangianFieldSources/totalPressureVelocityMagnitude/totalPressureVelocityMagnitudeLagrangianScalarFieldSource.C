@@ -99,7 +99,7 @@ Foam::totalPressureVelocityMagnitudeLagrangianScalarFieldSource::Umag
 {
     // Get the carrier pressure
     const volScalarField& pcVf =
-        subMesh.mesh().mesh().lookupObject<volScalarField>(pcName_);
+        subMesh.mesh().poly().lookupObject<volScalarField>(pcName_);
     const CarrierField<scalar>& pc =
         cloudField_.cloud<clouds::carried>(injection).carrierField(pcVf);
 
@@ -109,7 +109,7 @@ Foam::totalPressureVelocityMagnitudeLagrangianScalarFieldSource::Umag
         p0_ =
             Function1<scalar>::New
             (
-                field_.db().time().userUnits(),
+                field_.time().userUnits(),
                 pcVf.dimensions(),
                 p0Entry_()
             ).ptr();
@@ -162,7 +162,7 @@ Foam::totalPressureVelocityMagnitudeLagrangianScalarFieldSource::Umag
 
             // Get the carrier density
             const volScalarField& rhocVf =
-                subMesh.mesh().mesh().lookupObject<volScalarField>(rhocName_);
+                subMesh.mesh().poly().lookupObject<volScalarField>(rhocName_);
             const CarrierField<scalar>& rhoc =
                 cloudField_
                .cloud<clouds::carried>(injection)
@@ -201,7 +201,7 @@ void Foam::totalPressureVelocityMagnitudeLagrangianScalarFieldSource::write
     }
     else
     {
-        writeEntry(os, field_.db().time().userUnits(), unitAny, p0_());
+        writeEntry(os, field_.time().userUnits(), units::any, p0_());
     }
 
     writeEntryIfDifferent<word>

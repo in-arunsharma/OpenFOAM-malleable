@@ -42,7 +42,7 @@ activeBaffleVelocityFvPatchVectorField
     fixedValueFvPatchVectorField(p, iF, dict, false),
     pName_(dict.lookupOrDefault<word>("p", "p")),
     cyclicPatchName_(dict.lookup("cyclicPatch")),
-    cyclicPatchLabel_(p.patch().boundaryMesh().findIndex(cyclicPatchName_)),
+    cyclicPatchLabel_(p.poly().boundaryMesh().findIndex(cyclicPatchName_)),
     orientation_(dict.lookup<label>("orientation")),
     initWallSf_(p.Sf()),
     initCyclicSf_(p.boundaryMesh()[cyclicPatchLabel_].Sf()),
@@ -53,11 +53,11 @@ activeBaffleVelocityFvPatchVectorField
             p.boundaryMesh()[cyclicPatchLabel_]
         ).neighbFvPatch().Sf()
     ),
-    openFraction_(dict.lookup<scalar>("openFraction", unitFraction)),
+    openFraction_(dict.lookup<scalar>("openFraction", units::fraction)),
     openingTime_(dict.lookup<scalar>("openingTime", dimTime)),
     maxOpenFractionDelta_
     (
-        dict.lookup<scalar>("maxOpenFractionDelta", unitFraction)
+        dict.lookup<scalar>("maxOpenFractionDelta", units::fraction)
     ),
     curTimeIndex_(-1)
 {
@@ -128,7 +128,7 @@ void Foam::activeBaffleVelocityFvPatchVectorField::map
     //  fvMesh::S() which will give problems when mapped (since already
     //  on new mesh)
 
-    const vectorField& areas = patch().boundaryMesh().mesh().faceAreas();
+    const vectorField& areas = patch().mesh().faceAreas();
     initWallSf_ = patch().patchSlice(areas);
     initCyclicSf_ = patch().boundaryMesh()
     [
@@ -140,7 +140,7 @@ void Foam::activeBaffleVelocityFvPatchVectorField::map
         [
             cyclicPatchLabel_
         ]
-    ).neighbFvPatch().patch().patchSlice(areas);
+    ).neighbFvPatch().poly().patchSlice(areas);
 }
 
 
@@ -152,7 +152,7 @@ void Foam::activeBaffleVelocityFvPatchVectorField::reset
     fixedValueFvPatchVectorField::reset(ptf);
 
     // See rmap.
-    const vectorField& areas = patch().boundaryMesh().mesh().faceAreas();
+    const vectorField& areas = patch().mesh().faceAreas();
     initWallSf_ = patch().patchSlice(areas);
     initCyclicSf_ = patch().boundaryMesh()
     [
@@ -164,7 +164,7 @@ void Foam::activeBaffleVelocityFvPatchVectorField::reset
         [
             cyclicPatchLabel_
         ]
-    ).neighbFvPatch().patch().patchSlice(areas);
+    ).neighbFvPatch().poly().patchSlice(areas);
 }
 
 
@@ -176,7 +176,7 @@ void Foam::activeBaffleVelocityFvPatchVectorField::updateCoeffs()
     }
 
     // Execute the change to the openFraction only once per time-step
-    if (curTimeIndex_ != this->db().time().timeIndex())
+    if (curTimeIndex_ != this->time().timeIndex())
     {
         const volScalarField& p = db().lookupObject<volScalarField>
         (
@@ -184,12 +184,12 @@ void Foam::activeBaffleVelocityFvPatchVectorField::updateCoeffs()
         );
 
         const fvPatch& cyclicPatch = patch().boundaryMesh()[cyclicPatchLabel_];
-        const labelList& cyclicFaceCells = cyclicPatch.patch().faceCells();
+        const labelList& cyclicFaceCells = cyclicPatch.poly().faceCells();
         const fvPatch& nbrPatch = refCast<const cyclicFvPatch>
         (
             cyclicPatch
         ).neighbFvPatch();
-        const labelList& nbrFaceCells = nbrPatch.patch().faceCells();
+        const labelList& nbrFaceCells = nbrPatch.poly().faceCells();
 
         scalar forceDiff = 0;
 
@@ -213,7 +213,7 @@ void Foam::activeBaffleVelocityFvPatchVectorField::updateCoeffs()
                     openFraction_
                   + min
                     (
-                        this->db().time().deltaTValue()/openingTime_,
+                        this->time().deltaTValue()/openingTime_,
                         maxOpenFractionDelta_
                     )
                    *(orientation_*sign(forceDiff)),
@@ -224,7 +224,7 @@ void Foam::activeBaffleVelocityFvPatchVectorField::updateCoeffs()
 
         Info<< "openFraction = " << openFraction_ << endl;
 
-        vectorField::subField Sfw = this->patch().patch().faceAreas();
+        vectorField::subField Sfw = this->patch().poly().faceAreas();
         const vectorField newSfw((1 - openFraction_)*initWallSf_);
         forAll(Sfw, facei)
         {
@@ -243,7 +243,7 @@ void Foam::activeBaffleVelocityFvPatchVectorField::updateCoeffs()
         const_cast<scalarField&>(nbrPatch.magSf()) =
             mag(nbrPatch.Sf());
 
-        curTimeIndex_ = this->db().time().timeIndex();
+        curTimeIndex_ = this->time().timeIndex();
     }
 
     fixedValueFvPatchVectorField::updateCoeffs();

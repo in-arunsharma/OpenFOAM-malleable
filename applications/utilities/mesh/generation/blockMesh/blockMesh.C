@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -65,7 +65,6 @@ using namespace Foam;
 int main(int argc, char *argv[])
 {
     argList::noParallel();
-    Foam::argList::removeOption("noFunctionObjects");
     #include "addDictOption.H"
     argList::addBoolOption
     (
@@ -104,7 +103,7 @@ int main(int argc, char *argv[])
 
     #include "addMeshOption.H"
     #include "addRegionOption.H"
-    #include "setRootCase.H"
+    #include "setRootCaseNoFunctionObjects.H"
     #include "setMeshPath.H"
     #include "createTimeNoFunctionObjects.H"
 
@@ -216,6 +215,8 @@ int main(int argc, char *argv[])
 
     Info<< nl << "Creating polyMesh from blockMesh" << endl;
 
+    units::setLength(blocks.scaleFactor());
+
     word defaultFacesName = "defaultFaces";
     word defaultFacesType = emptyPolyPatch::typeName;
     polyMesh mesh
@@ -240,15 +241,18 @@ int main(int argc, char *argv[])
     // Read in a list of dictionaries for the merge patch pairs
     if (meshDict.found("mergePatchPairs"))
     {
-        List<Pair<word>> patchPairNames
+        const List<Pair<word>> patchPairNames
         (
             meshDict.lookup("mergePatchPairs")
         );
 
+        const scalar mergeTolerance =
+            meshDict.lookupOrDefault<scalar>("mergeTolerance", 1e-4);
+
         if (patchPairNames.size())
         {
             const word oldInstance = mesh.pointsInstance();
-            mergePatchPairs(mesh, patchPairNames, 1e-4);
+            mergePatchPairs(mesh, patchPairNames, mergeTolerance);
             mesh.setInstance(oldInstance);
         }
     }
@@ -335,7 +339,7 @@ int main(int argc, char *argv[])
 
     // Detect any cyclic patches and force re-ordering of the faces
     {
-        const polyPatchList& patches = mesh.boundaryMesh();
+        const polyPatchList& patches = mesh.boundary();
         bool hasCyclic = false;
         forAll(patches, patchi)
         {
@@ -373,7 +377,7 @@ int main(int argc, char *argv[])
 
     // Write summary
     {
-        const polyPatchList& patches = mesh.boundaryMesh();
+        const polyPatchList& patches = mesh.boundary();
 
         Info<< "----------------" << nl
             << "Mesh Information" << nl

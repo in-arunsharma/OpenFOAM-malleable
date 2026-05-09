@@ -57,10 +57,10 @@ Foam::plenumPressureFvPatchScalarField::plenumPressureFvPatchScalarField
     ),
     rho_(1.0),
     hasRho_(false),
-    inletAreaRatio_(dict.lookup<scalar>("inletAreaRatio", unitFraction)),
+    inletAreaRatio_(dict.lookup<scalar>("inletAreaRatio", units::fraction)),
     inletDischargeCoefficient_
     (
-        dict.lookup<scalar>("inletDischargeCoefficient", unitFraction)
+        dict.lookup<scalar>("inletDischargeCoefficient", units::fraction)
     ),
     timeScale_(dict.lookupOrDefault<scalar>("timeScale", dimTime, 0.0)),
     phiName_(dict.lookupOrDefault<word>("phi", "phi")),
@@ -146,13 +146,13 @@ void Foam::plenumPressureFvPatchScalarField::updateCoeffs()
         patch().lookupPatchField<surfaceScalarField, scalar>(phiName_);
 
     // Get the timestep
-    const scalar dt = db().time().deltaTValue();
+    const scalar dt = time().deltaTValue();
 
     // Check if operating at a new time index and update the old-time properties
     // if so
-    if (timeIndex_ != db().time().timeIndex())
+    if (timeIndex_ != time().timeIndex())
     {
-        timeIndex_ = db().time().timeIndex();
+        timeIndex_ = time().timeIndex();
         plenumDensityOld_ = plenumDensity_;
         plenumTemperatureOld_ = plenumTemperature_;
     }

@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2023 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -92,8 +92,7 @@ protected:
             const label index,
             const polyBoundaryMesh& bm,
             const int myProcNo,
-            const int neighbProcNo,
-            const word& patchType = typeName
+            const int neighbProcNo
         );
 
 
@@ -134,8 +133,7 @@ public:
             const label index,
             const polyBoundaryMesh& bm,
             const int myProcNo,
-            const int neighbProcNo,
-            const word& patchType = typeName
+            const int neighbProcNo
         );
 
         //- Construct from dictionary
@@ -144,8 +142,7 @@ public:
             const word& name,
             const dictionary& dict,
             const label index,
-            const polyBoundaryMesh&,
-            const word& patchType
+            const polyBoundaryMesh&
         );
 
         //- Construct as copy, resetting the boundary mesh
@@ -197,6 +194,12 @@ public:
 
 
     // Member Functions
+
+        //- Return true as this patch is a constraint type
+        virtual bool constraint() const
+        {
+            return true;
+        }
 
         //- Return true only if this is a parallel run
         virtual bool coupled() const
@@ -276,7 +279,7 @@ public:
         //- Return communicator used for communication
         virtual label comm() const
         {
-            return boundaryMesh().mesh().comm();
+            return mesh().comm();
         }
 
         //- Return null transform between processor patches

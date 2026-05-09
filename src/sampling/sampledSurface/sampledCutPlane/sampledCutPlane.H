@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2022 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -31,7 +31,6 @@ Description
     \verbatim
     {
         type        cutPlane;
-        planeType   pointAndNormal;
         point       (0 0 0);
         normal      (0 0 1);
         interpolate yes;
@@ -40,13 +39,20 @@ Description
 
 Usage
     \table
-        Property     | Description             | Required    | Default value
-        planeType    | the method of specification of the plane | yes |
-        interpolate  | interpolate values to the surface points | no | no
+        Property    | Description             | Required    | Default value
+        planeType   | Method of specification. E.g., pointAndNormal. | no
+        point       | A point in the plane (for pointAndNormal) | yes
+        normal      | A vector normal to the plane (for pointAndNormal) | yes
+        interpolate | Interpolate values to the surface points? | no | no
+        cellZone    | Zone containing cells to include | no | all
     \endtable
+
+    Note: there are also other options for planeType, including
+    'planeEquation' and 'embeddedPoints'.
 
 See also
     Foam::plane
+    Foam::generatedCellZone
 
 SourceFiles
     sampledCutPlane.C

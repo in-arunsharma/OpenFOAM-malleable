@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2022 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -54,11 +54,10 @@ Foam::processorPolyPatch::processorPolyPatch
     const label index,
     const polyBoundaryMesh& bm,
     const int myProcNo,
-    const int neighbProcNo,
-    const word& patchType
+    const int neighbProcNo
 )
 :
-    coupledPolyPatch(name, size, start, index, bm, patchType),
+    coupledPolyPatch(name, size, start, index, bm),
     myProcNo_(myProcNo),
     neighbProcNo_(neighbProcNo),
     neighbFaceCentres_(),
@@ -74,8 +73,7 @@ Foam::processorPolyPatch::processorPolyPatch
     const label index,
     const polyBoundaryMesh& bm,
     const int myProcNo,
-    const int neighbProcNo,
-    const word& patchType
+    const int neighbProcNo
 )
 :
     coupledPolyPatch
@@ -84,8 +82,7 @@ Foam::processorPolyPatch::processorPolyPatch
         size,
         start,
         index,
-        bm,
-        patchType
+        bm
     ),
     myProcNo_(myProcNo),
     neighbProcNo_(neighbProcNo),
@@ -100,11 +97,10 @@ Foam::processorPolyPatch::processorPolyPatch
     const word& name,
     const dictionary& dict,
     const label index,
-    const polyBoundaryMesh& bm,
-    const word& patchType
+    const polyBoundaryMesh& bm
 )
 :
-    coupledPolyPatch(name, dict, index, bm, patchType),
+    coupledPolyPatch(name, dict, index, bm),
     myProcNo_(dict.lookup<label>("myProcNo")),
     neighbProcNo_(dict.lookup<label>("neighbProcNo")),
     neighbFaceCentres_(),
@@ -228,7 +224,7 @@ void Foam::processorPolyPatch::calcGeometry(PstreamBuffers& pBufs)
             {
                 const fileName patchOBJName
                 (
-                    boundaryMesh().mesh().time().path()/name() + "_faces.obj"
+                    mesh().time().path()/name() + "_faces.obj"
                 );
 
                 Pout<< "processorPolyPatch::calcGeometry : Writing my "
@@ -238,7 +234,7 @@ void Foam::processorPolyPatch::calcGeometry(PstreamBuffers& pBufs)
 
                 const fileName centresOBJName
                 (
-                    boundaryMesh().mesh().time().path()/name()
+                    mesh().time().path()/name()
                   + "_faceCentresConnections.obj"
                 );
 

@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2024 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -38,7 +38,7 @@ Foam::MixedDiffuseSpecular<CloudType>::MixedDiffuseSpecular
     WallInteractionModel<CloudType>(dict, cloud, typeName),
     diffuseFraction_
     (
-        this->coeffDict().template lookup<scalar>("diffuseFraction")
+        this->typeDict().template lookup<scalar>("diffuseFraction")
     )
 {}
 
@@ -68,7 +68,7 @@ void Foam::MixedDiffuseSpecular<CloudType>::correct
 
     const label wppIndex = p.patch(mesh);
 
-    const polyPatch& wpp = mesh.boundaryMesh()[wppIndex];
+    const polyPatch& wpp = mesh.boundary()[wppIndex];
 
     label wppLocalFace = wpp.whichFace(p.face());
 

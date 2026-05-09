@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -27,7 +27,7 @@ License
 #include "randomGenerator.H"
 #include "addToRunTimeSelectionTable.H"
 #include "EdgeMap.H"
-#include "triSurfaceFields.H"
+#include "labelIOField.H"
 #include "Time.H"
 #include "PatchTools.H"
 
@@ -266,7 +266,7 @@ Foam::searchableSurfaces::triSurface::triSurface
 {
     const pointField& pts = Foam::triSurface::points();
 
-    bounds() = boundBox(pts);
+    bounds() = boundBox(pts, false);
 }
 
 
@@ -298,7 +298,7 @@ Foam::searchableSurfaces::triSurface::triSurface(const IOobject& io)
 {
     const pointField& pts = Foam::triSurface::points();
 
-    bounds() = boundBox(pts);
+    bounds() = boundBox(pts, false);
 }
 
 
@@ -353,7 +353,7 @@ Foam::searchableSurfaces::triSurface::triSurface
 
     const pointField& pts = Foam::triSurface::points();
 
-    bounds() = boundBox(pts);
+    bounds() = boundBox(pts, false);
 
     // Have optional minimum quality for normal calculation
     if (dict.readIfPresent("minQuality", minQuality_) && minQuality_ > 0)
@@ -397,7 +397,7 @@ Foam::searchableSurfaces::triSurface::triSurface
 {
     const pointField& pts = Foam::triSurface::points();
 
-    bounds() = boundBox(pts);
+    bounds() = boundBox(pts, false);
 }
 
 
@@ -455,7 +455,7 @@ Foam::searchableSurfaces::triSurface::triSurface
 
     const pointField& pts = Foam::triSurface::points();
 
-    bounds() = boundBox(pts);
+    bounds() = boundBox(pts, false);
 
     // Have optional minimum quality for normal calculation
     if (dict.readIfPresent("minQuality", minQuality_) && minQuality_ > 0)
@@ -570,10 +570,9 @@ Foam::searchableSurfaces::triSurface::edgeTree() const
         (
             identityMap
             (
-                nEdges()
-               -nInternalEdges()
+                nInternalEdges(),
+                nEdges() - nInternalEdges()
             )
-          + nInternalEdges()
         );
 
         treeBoundBox bb(Zero, Zero);
@@ -844,9 +843,9 @@ void Foam::searchableSurfaces::triSurface::getVolumeType
 
 void Foam::searchableSurfaces::triSurface::setField(const labelList& values)
 {
-    autoPtr<triSurfaceLabelField> fldPtr
+    autoPtr<labelIOField> fldPtr
     (
-        new triSurfaceLabelField
+        new labelIOField
         (
             IOobject
             (
@@ -857,8 +856,6 @@ void Foam::searchableSurfaces::triSurface::setField(const labelList& values)
                 IOobject::NO_READ,
                 IOobject::AUTO_WRITE
             ),
-            *this,
-            dimless,
             labelField(values)
         )
     );
@@ -874,11 +871,11 @@ void Foam::searchableSurfaces::triSurface::getField
     labelList& values
 ) const
 {
-    if (foundObject<triSurfaceLabelField>("values"))
+    if (foundObject<labelIOField>("values"))
     {
         values.setSize(info.size());
 
-        const triSurfaceLabelField& fld = lookupObject<triSurfaceLabelField>
+        const labelIOField& fld = lookupObject<labelIOField>
         (
             "values"
         );

@@ -139,7 +139,10 @@ public:
             inline const LagrangianMesh& mesh() const;
 
             //- Return the object registry
-            const objectRegistry& thisDb() const;
+            const objectRegistry& db() const;
+
+            //- Return time
+            const Time& time() const;
 
             //- Return the group
             inline LagrangianGroup group() const;

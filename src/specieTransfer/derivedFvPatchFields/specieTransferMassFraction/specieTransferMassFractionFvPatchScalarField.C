@@ -76,7 +76,7 @@ specieTransferMassFractionFvPatchScalarField
     UName_(dict.lookupOrDefault<word>("U", "U")),
     phiYp_(p.size(), 0),
     timeIndex_(-1),
-    c_(dict.lookupOrDefault<scalar>("c", unitAny, scalar(0))),
+    c_(dict.lookupOrDefault<scalar>("c", units::any, scalar(0))),
     property_
     (
         c_ == scalar(0)
@@ -165,9 +165,9 @@ void Foam::specieTransferMassFractionFvPatchScalarField::reset
 const Foam::scalarField&
 Foam::specieTransferMassFractionFvPatchScalarField::phiYp() const
 {
-    if (timeIndex_ != this->db().time().timeIndex())
+    if (timeIndex_ != this->time().timeIndex())
     {
-        timeIndex_ = this->db().time().timeIndex();
+        timeIndex_ = this->time().timeIndex();
 
         phiYp_ = calcPhiYp();
     }

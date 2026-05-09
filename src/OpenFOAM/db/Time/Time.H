@@ -266,6 +266,12 @@ public:
             //  the corresponding method in objectRegistry
             using TimePaths::path;
 
+            //- Return true if this is a complete serial or parallel case
+            bool completeCase() const
+            {
+                return Pstream::parRun() || !processorCase();
+            }
+
             //- Return the control dict
             const IOdictionary& controlDict() const
             {
@@ -417,10 +423,10 @@ public:
             word userTimeName() const;
 
             //- Return the user-time unit conversion
-            const unitConversion& userUnits() const;
+            const unitSet& userUnits() const;
 
             //- Return the write interval units
-            const unitConversion& writeIntervalUnits() const;
+            const unitSet& writeIntervalUnits() const;
 
             //- Return the list of function objects
             const functionObjectList& functionObjects() const

@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2020 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -41,8 +41,7 @@ Foam::CloudSubModelBase<CloudType>::CloudSubModelBase
     CloudType& owner,
     const dictionary& dict,
     const word& baseName,
-    const word& modelType,
-    const word& dictExt
+    const word& modelType
 )
 :
     subModelBase
@@ -50,8 +49,7 @@ Foam::CloudSubModelBase<CloudType>::CloudSubModelBase
         owner.outputProperties(),
         dict,
         baseName,
-        modelType,
-        dictExt
+        modelType
     ),
     owner_(owner)
 {}
@@ -118,7 +116,7 @@ bool Foam::CloudSubModelBase<CloudType>::writeTime() const
 {
     return
         owner_.solution().transient()
-     && owner_.db().time().writeTime();
+     && owner_.time().writeTime();
 }
 
 

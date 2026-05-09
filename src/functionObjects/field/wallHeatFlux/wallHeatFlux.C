@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2016-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2016-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -139,11 +139,9 @@ bool Foam::functionObjects::wallHeatFlux::read(const dictionary& dict)
 
     phaseName_ = dict.lookupOrDefault<word>("phase", word::null);
 
-    const polyBoundaryMesh& pbm = mesh_.boundaryMesh();
+    const polyBoundaryMesh& pbm = mesh_.poly().boundary();
 
-    patchSet_ = mesh_.boundaryMesh().patchSet(dict, true);
-
-    Info<< type() << " " << name() << ":" << nl;
+    patchSet_ = mesh_.poly().boundary().patchSet(dict, true);
 
     if (patchSet_.empty())
     {
@@ -155,11 +153,13 @@ bool Foam::functionObjects::wallHeatFlux::read(const dictionary& dict)
             }
         }
 
-        Info<< "    processing all wall patches" << nl << endl;
+        Info<< indent << "processing all wall patches" << endl;
     }
     else
     {
-        Info<< "    processing wall patches: " << nl;
+        Info<< indent << "processing wall patches:" << nl;
+
+        Info<< incrIndent;
         labelHashSet filteredPatchSet;
         forAllConstIter(labelHashSet, patchSet_, iter)
         {
@@ -167,7 +167,7 @@ bool Foam::functionObjects::wallHeatFlux::read(const dictionary& dict)
             if (isA<wallPolyPatch>(pbm[patchi]))
             {
                 filteredPatchSet.insert(patchi);
-                Info<< "        " << pbm[patchi].name() << endl;
+                Info<< indent << pbm[patchi].name() << endl;
             }
             else
             {
@@ -176,8 +176,7 @@ bool Foam::functionObjects::wallHeatFlux::read(const dictionary& dict)
                     << "type patch: " << pbm[patchi].name() << endl;
             }
         }
-
-        Info<< endl;
+        Info<< decrIndent;
 
         patchSet_ = filteredPatchSet;
     }

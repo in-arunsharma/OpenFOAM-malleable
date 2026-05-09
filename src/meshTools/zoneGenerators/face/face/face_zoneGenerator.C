@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2025-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -131,7 +131,7 @@ Foam::zoneSet Foam::zoneGenerators::face::generate() const
                     const label nInt = mesh_.nInternalFaces();
                     const labelList& own = mesh_.faceOwner();
                     const labelList& nei = mesh_.faceNeighbour();
-                    const polyBoundaryMesh& patches = mesh_.boundaryMesh();
+                    const polyBoundaryMesh& patches = mesh_.boundary();
 
                     // Check all internal faces
                     for (label facei = 0; facei < nInt; facei++)
@@ -200,7 +200,7 @@ Foam::zoneSet Foam::zoneGenerators::face::generate() const
                     const label nInt = mesh_.nInternalFaces();
                     const labelList& own = mesh_.faceOwner();
                     const labelList& nei = mesh_.faceNeighbour();
-                    const polyBoundaryMesh& patches = mesh_.boundaryMesh();
+                    const polyBoundaryMesh& patches = mesh_.boundary();
 
                     // Check all internal faces
                     for (label facei = 0; facei < nInt; facei++)
@@ -293,15 +293,24 @@ Foam::zoneSet Foam::zoneGenerators::face::generate() const
 
         if (zs.fValid() && zs.fZone().name() != zoneName_)
         {
-            const labelList& zoneFaces = zs.fZone();
+            const faceZone& fZone = zs.fZone();
+            const labelList& zoneFaces = fZone;
 
-            forAll(zoneFaces, zfi)
+            if (fZone.oriented())
             {
-                const Foam::face& f = mesh_.faces()[zoneFaces[zfi]];
+                const boolList& zoneFlipMap = fZone.flipMap();
 
-                forAll(f, fp)
+                forAll(zoneFaces, zfi)
                 {
-                    selectedFaces[f[fp]] = true;
+                    selectedFaces[zoneFaces[zfi]] = true;
+                    flipMap[zoneFaces[zfi]] = zoneFlipMap[zfi];
+                }
+            }
+            else
+            {
+                forAll(zoneFaces, zfi)
+                {
+                    selectedFaces[zoneFaces[zfi]] = true;
                 }
             }
         }

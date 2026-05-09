@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -35,7 +35,7 @@ template<class CloudType>
 void Foam::ConeInjection<CloudType>::setInjectionMethod()
 {
     const word injectionMethod =
-        this->coeffDict().template lookupOrDefault<word>
+        this->typeDict().template lookupOrDefault<word>
         (
             "injectionMethod",
             word::null
@@ -52,9 +52,9 @@ void Foam::ConeInjection<CloudType>::setInjectionMethod()
         injectionMethod_ = imDisc;
 
         dInner_ =
-            this->coeffDict().template lookup<scalar>("dInner", dimLength);
+            this->typeDict().template lookup<scalar>("dInner", dimLength);
         dOuter_ =
-            this->coeffDict().template lookup<scalar>("dOuter", dimLength);
+            this->typeDict().template lookup<scalar>("dOuter", dimLength);
     }
     else
     {
@@ -69,7 +69,7 @@ template<class CloudType>
 void Foam::ConeInjection<CloudType>::setFlowType()
 {
     const word flowType =
-        this->coeffDict().template lookupOrDefault<word>
+        this->typeDict().template lookupOrDefault<word>
         (
             "flowType",
             word::null
@@ -84,9 +84,9 @@ void Foam::ConeInjection<CloudType>::setFlowType()
             Function1<scalar>::New
             (
                 "Umag",
-                this->owner().db().time().userUnits(),
+                this->owner().time().userUnits(),
                 dimVelocity,
-                this->coeffDict()
+                this->typeDict()
             ).ptr()
         );
     }
@@ -99,9 +99,9 @@ void Foam::ConeInjection<CloudType>::setFlowType()
             Function1<scalar>::New
             (
                 "Pinj",
-                this->owner().db().time().userUnits(),
+                this->owner().time().userUnits(),
                 dimPressure,
-                this->coeffDict()
+                this->typeDict()
             ).ptr()
         );
     }
@@ -110,18 +110,18 @@ void Foam::ConeInjection<CloudType>::setFlowType()
         flowType_ = ftFlowRateAndDischarge;
 
         dInner_ =
-            this->coeffDict().template lookup<scalar>("dInner", dimLength);
+            this->typeDict().template lookup<scalar>("dInner", dimLength);
         dOuter_ =
-            this->coeffDict().template lookup<scalar>("dOuter", dimLength);
+            this->typeDict().template lookup<scalar>("dOuter", dimLength);
 
         Cd_.reset
         (
             Function1<scalar>::New
             (
                 "Cd",
-                this->owner().db().time().userUnits(),
+                this->owner().time().userUnits(),
                 dimless,
-                this->coeffDict()
+                this->typeDict()
             ).ptr()
         );
     }
@@ -153,9 +153,9 @@ Foam::ConeInjection<CloudType>::ConeInjection
         Function1<vector>::New
         (
             "position",
-            this->owner().db().time().userUnits(),
+            this->owner().time().userUnits(),
             dimLength,
-            this->coeffDict()
+            this->typeDict()
         )
     ),
     direction_
@@ -163,9 +163,9 @@ Foam::ConeInjection<CloudType>::ConeInjection
         Function1<vector>::New
         (
             "direction",
-            this->owner().db().time().userUnits(),
+            this->owner().time().userUnits(),
             dimless,
-            this->coeffDict()
+            this->typeDict()
         )
     ),
     injectorCoordinates_(barycentric::uniform(NaN)),
@@ -180,9 +180,9 @@ Foam::ConeInjection<CloudType>::ConeInjection
         Function1<scalar>::New
         (
             "thetaInner",
-            this->owner().db().time().userUnits(),
-            unitDegrees,
-            this->coeffDict()
+            this->owner().time().userUnits(),
+            units::degrees,
+            this->typeDict()
         )
     ),
     thetaOuter_
@@ -190,9 +190,9 @@ Foam::ConeInjection<CloudType>::ConeInjection
         Function1<scalar>::New
         (
             "thetaOuter",
-            this->owner().db().time().userUnits(),
-            unitDegrees,
-            this->coeffDict()
+            this->owner().time().userUnits(),
+            units::degrees,
+            this->typeDict()
         )
     ),
     sizeDistribution_
@@ -200,7 +200,7 @@ Foam::ConeInjection<CloudType>::ConeInjection
         distribution::New
         (
             dimLength,
-            this->coeffDict().subDict("sizeDistribution"),
+            this->typeDict().subDict("sizeDistribution"),
             this->sizeSampleQ(),
             owner.rndGen().generator()
         )

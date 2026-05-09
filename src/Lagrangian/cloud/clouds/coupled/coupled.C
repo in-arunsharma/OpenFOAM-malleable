@@ -42,19 +42,24 @@ namespace clouds
 
 Foam::tmp<Foam::volScalarField> Foam::clouds::coupled::getNucVf() const
 {
-    const word nucName = IOobject::groupName("nu", carrierPhaseName());
+    const word nucName =
+        IOobject::groupName("nu", carriedCloud_.carrierPhaseName());
 
-    if (cloud_.mesh().mesh().foundObject<volScalarField>(nucName))
+    if (cloud_.mesh().poly().foundObject<volScalarField>(nucName))
     {
-        return cloud_.mesh().mesh().lookupObject<volScalarField>(nucName);
+        return cloud_.mesh().poly().lookupObject<volScalarField>(nucName);
     }
 
     const word viscosityName =
-        IOobject::groupName(physicalProperties::typeName, carrierPhaseName());
+        IOobject::groupName
+        (
+            physicalProperties::typeName,
+            carriedCloud_.carrierPhaseName()
+        );
 
-    if (cloud_.mesh().mesh().foundObject<viscosity>(viscosityName))
+    if (cloud_.mesh().poly().foundObject<viscosity>(viscosityName))
     {
-        return cloud_.mesh().mesh().lookupObject<viscosity>(viscosityName).nu();
+        return cloud_.mesh().poly().lookupObject<viscosity>(viscosityName).nu();
     }
 
     return tmp<volScalarField>(nullptr);
@@ -138,15 +143,15 @@ Foam::tmp<Foam::LagrangianEqn<Foam::scalar>> Foam::clouds::coupled::psicEqn
 
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
-Foam::clouds::coupled::coupled(const cloud& c, const dictionary& dict)
+Foam::clouds::coupled::coupled(const cloud& c, const carried& carriedCloud)
 :
-    carried(c, dict),
     cloud_(c),
+    carriedCloud_(carriedCloud),
     tnucVf_(getNucVf()),
     nuc
     (
         tnucVf_.valid()
-      ? carrierField<scalar>(tnucVf_())
+      ? carriedCloud_.carrierField<scalar>(tnucVf_())
       : c.derivedField<scalar>(*this, &coupled::calcNuc)
     )
 {}

@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2024 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -147,7 +147,7 @@ Foam::decompositionMethod::NewDecomposer
         )
     );
 
-    Info<< "Selecting decomposer " << methodType << endl;
+    Info<< indentOrNl << "Selecting decomposer " << methodType << endl;
 
     libs.open
     (
@@ -176,7 +176,7 @@ Foam::decompositionMethod::NewDecomposer
         cstrIter()
         (
             decompositionDict,
-            decompositionDict.subOrEmptyDict(methodType + "Coeffs")
+            decompositionDict.typeOrEmptyDict(methodType)
         )
     );
 
@@ -200,7 +200,7 @@ Foam::decompositionMethod::NewDistributor
         )
     );
 
-    Info<< "Selecting distributor " << methodType << endl;
+    Info<< indentOrNl << "Selecting distributor " << methodType << endl;
 
     libs.open
     (
@@ -229,7 +229,7 @@ Foam::decompositionMethod::NewDistributor
         cstrIter()
         (
             distributionDict,
-            distributionDict.subOrEmptyDict(methodType + "Coeffs")
+            distributionDict.typeOrEmptyDict(methodType)
         )
     );
 
@@ -465,7 +465,7 @@ void Foam::decompositionMethod::calcCellCells
 {
     const labelList& faceOwner = mesh.faceOwner();
     const labelList& faceNeighbour = mesh.faceNeighbour();
-    const polyBoundaryMesh& patches = mesh.boundaryMesh();
+    const polyBoundaryMesh& patches = mesh.boundary();
 
 
     // Create global cell numbers
@@ -656,7 +656,7 @@ void Foam::decompositionMethod::calcCellCells
 {
     const labelList& faceOwner = mesh.faceOwner();
     const labelList& faceNeighbour = mesh.faceNeighbour();
-    const polyBoundaryMesh& patches = mesh.boundaryMesh();
+    const polyBoundaryMesh& patches = mesh.boundary();
 
 
     // Create global cell numbers
@@ -1142,7 +1142,7 @@ Foam::labelList Foam::decompositionMethod::decompose
             labelList nbrDecomp;
             syncTools::swapBoundaryCellList(mesh, finalDecomp, nbrDecomp);
 
-            const polyBoundaryMesh& patches = mesh.boundaryMesh();
+            const polyBoundaryMesh& patches = mesh.boundary();
             forAll(patches, patchi)
             {
                 const polyPatch& pp = patches[patchi];

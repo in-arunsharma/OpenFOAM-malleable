@@ -102,14 +102,14 @@ void Foam::timeVaryingMappedFvPatchField<Type>::checkTable()
             new pointToPointPlanarInterpolation
             (
                 samplePoints,
-                patch_.patch().faceCentres(),
+                patch_.poly().faceCentres(),
                 perturb_,
                 nearestOnly
             )
         );
 
         // Read the times for which data is available
-        sampleTimes_ = patch_.db().time().findTimes(dataDir_);
+        sampleTimes_ = patch_.time().findTimes(dataDir_);
 
         if (debug)
         {

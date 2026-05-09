@@ -64,7 +64,7 @@ template<class Type>
 Foam::Function2s::Coded<Type>::Coded
 (
     const word& name,
-    const unitConversions& units,
+    const unitSets& units,
     const dictionary& dict
 )
 :
@@ -139,8 +139,8 @@ Foam::tmp<Foam::Field<Type>> Foam::Function2s::Coded<Type>::value
         (
             redirectFunction2Ptr_->value
             (
-                units_.x.toUser(x),
-                units_.y.toUser(y)
+                units_.x.toUser(tmp<scalarField>(x)),
+                units_.y.toUser(tmp<scalarField>(y))
             )
         );
 }
@@ -150,7 +150,7 @@ template<class Type>
 void Foam::Function2s::Coded<Type>::write
 (
     Ostream& os,
-    const unitConversions& units
+    const unitSets& units
 ) const
 {
     codedBase::write(os);

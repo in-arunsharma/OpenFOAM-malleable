@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2025-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -57,15 +57,15 @@ Foam::LagrangianMesh& Foam::cloud::mesh
 {
     if (!pMesh.foundObject<LagrangianMesh>(name))
     {
-        wordList wantedPatchTypes(pMesh.boundaryMesh().size());
+        wordList wantedPatchTypes(pMesh.boundary().size());
 
-        forAll(pMesh.boundaryMesh(), patchi)
+        forAll(pMesh.boundary(), patchi)
         {
-            const polyPatch& patch = pMesh.boundaryMesh()[patchi];
+            const polyPatch& pPatch = pMesh.boundary()[patchi];
 
             wantedPatchTypes[patchi] =
-                polyPatch::constraintType(patch.type())
-              ? patch.type()
+                pPatch.constraint()
+              ? pPatch.type()
               : cloudVelocityLagrangianPatch::typeName;
         }
 
@@ -471,15 +471,9 @@ Foam::cloud::cloud(LagrangianMesh& mesh, const contextType context)
     mesh_(mesh),
     LagrangianModelsPtr_(nullptr),
     statePtr_(readStates()),
-    cellLengthScaleVf_(mag(cbrt(mesh_.mesh().cellVolumes()))),
+    cellLengthScaleVf_(mag(cbrt(mesh_.poly().cellVolumes()))),
     context(context),
-    tracking
-    (
-        cloudTrackingNames
-        [
-            mesh.schemes().schemesDict().lookup<word>("tracking")
-        ]
-    ),
+    tracking(cloudTrackingNames[mesh.schemes().lookup<word>("tracking")]),
     U
     (
         IOobject
@@ -506,14 +500,9 @@ Foam::cloud::cloud
     mesh_(mesh),
     LagrangianModelsPtr_(nullptr),
     statePtr_(readStates()),
-    cellLengthScaleVf_(mag(cbrt(mesh_.mesh().cellVolumes()))),
+    cellLengthScaleVf_(mag(cbrt(mesh_.poly().cellVolumes()))),
     context(context),
-    tracking
-    (
-        cloudTrackingNames
-        [
-            mesh.schemes().schemesDict().lookup<word>("tracking")
-        ]
+    tracking(cloudTrackingNames[mesh.schemes().lookup<word>("tracking")]
     ),
     U
     (
@@ -543,7 +532,7 @@ Foam::autoPtr<Foam::cloud> Foam::cloud::New
     const IOobject::writeOption writeOption
 )
 {
-    Info<< "Selecting " << typeName
+    Info<< indentOrNl << "Selecting " << typeName
         << " with name " << name
         << " of type " << type << endl;
 
@@ -727,7 +716,7 @@ void Foam::cloud::solve(const bool initial, const bool final)
                 if                                                             \
                 (                                                              \
                     patch.mesh().size()                                        \
-                 && !polyPatch::constraintType(patch.type())                   \
+                && !patch.poly().constraint()                                  \
                 )                                                              \
                 {                                                              \
                     iter()->boundaryFieldRef()[patchi].evaluate                \
@@ -884,7 +873,7 @@ void Foam::cloud::storePosition()
 
 void Foam::cloud::movePoints(const polyMesh&)
 {
-    cellLengthScaleVf_ = mag(cbrt(mesh_.mesh().cellVolumes()));
+    cellLengthScaleVf_ = mag(cbrt(mesh_.poly().cellVolumes()));
 }
 
 
@@ -892,7 +881,7 @@ void Foam::cloud::topoChange(const polyTopoChangeMap& map)
 {
     mesh_.topoChange(map);
 
-    cellLengthScaleVf_ = mag(cbrt(mesh_.mesh().cellVolumes()));
+    cellLengthScaleVf_ = mag(cbrt(mesh_.poly().cellVolumes()));
 }
 
 
@@ -900,7 +889,7 @@ void Foam::cloud::mapMesh(const polyMeshMap& map)
 {
     mesh_.mapMesh(map);
 
-    cellLengthScaleVf_ = mag(cbrt(mesh_.mesh().cellVolumes()));
+    cellLengthScaleVf_ = mag(cbrt(mesh_.poly().cellVolumes()));
 }
 
 
@@ -908,7 +897,7 @@ void Foam::cloud::distribute(const polyDistributionMap& map)
 {
     mesh_.distribute(map);
 
-    cellLengthScaleVf_ = mag(cbrt(mesh_.mesh().cellVolumes()));
+    cellLengthScaleVf_ = mag(cbrt(mesh_.poly().cellVolumes()));
 }
 
 

@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2024 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -382,6 +382,7 @@ public:
         );
 };
 
+
 template<class T>
 void sort(UList<T>&);
 
@@ -410,6 +411,21 @@ void writeListEntries(Ostream& os, const ListType& l);
 
 template<class ListType>
 void writeListEntries(Ostream& os, const word& keyword, const ListType& l);
+
+
+//- A UList is scaleable if its type is
+template<class Type>
+struct scaleable<UList<Type>> : public scaleable<Type> {};
+
+//- Apply a conversion to a UList by applying to each element individually
+template<class Type, class ... Args>
+void convert(UList<Type>& l, const Args& ... args)
+{
+    for (label i = 0; i < l.size(); ++ i)
+    {
+        convert(l[i], args ...);
+    }
+}
 
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
@@ -477,8 +493,8 @@ void writeListEntries(Ostream& os, const word& keyword, const ListType& l);
 #define forAllConstIter(Container,container,iter)                              \
     for                                                                        \
     (                                                                          \
-        Container::const_iterator iter = (container).begin();                  \
-        iter != (container).end();                                             \
+        Container::const_iterator iter = (container).cbegin();                 \
+        iter != (container).cend();                                            \
         ++iter                                                                 \
     )
 

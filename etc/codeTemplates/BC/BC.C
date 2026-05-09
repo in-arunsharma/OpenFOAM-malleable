@@ -34,7 +34,7 @@ License
 template<class Type>
 Foam::scalar Foam::CLASS::t() const
 {
-    return this->db().time().value();
+    return this->time().value();
 }
 
 
@@ -50,7 +50,7 @@ CONSTRUCT
 )
 :
     PARENT(p, iF),
-    scalarData_(dict.lookup<scalar>("scalarData", unitAny)),
+    scalarData_(dict.lookup<scalar>("scalarData", units::any)),
     data_(dict.lookup<TYPE>("data")),
     fieldData_("fieldData", iF.dimensions(), dict, p.size()),
     timeVsData_
@@ -58,8 +58,8 @@ CONSTRUCT
         Function1<TYPE>::New
         (
             "timeVsData",
-            this->db().time().userUnits(),
-            unitAny,
+            this->time().userUnits(),
+            units::any,
             dict
         )
     ),
@@ -195,7 +195,7 @@ void Foam::CLASS::write
     writeEntry(os, "scalarData", scalarData_);
     writeEntry(os, "data", data_);
     writeEntry(os, "fieldData", fieldData_);
-    writeEntry(os, this->db().time().userUnits(), unitAny, timeVsData_());
+    writeEntry(os, this->time().userUnits(), units::any, timeVsData_());
     writeEntry(os, "wordData", wordData_);
     writeEntry(os, "value", *this);
 }

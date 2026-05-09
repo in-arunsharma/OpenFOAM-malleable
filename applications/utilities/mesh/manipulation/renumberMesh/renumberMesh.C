@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -427,7 +427,7 @@ autoPtr<polyTopoChangeMap> reorderMesh
         }
     }
 
-    const polyBoundaryMesh& patches = mesh.boundaryMesh();
+    const polyBoundaryMesh& patches = mesh.boundary();
     labelList patchSizes(patches.size());
     labelList patchStarts(patches.size());
     labelList oldPatchNMeshPoints(patches.size());
@@ -559,7 +559,7 @@ int main(int argc, char *argv[])
         "do not update fields"
     );
 
-    #include "setRootCase.H"
+    #include "setRootCaseNoFunctionObjects.H"
     #include "createTimeNoFunctionObjects.H"
 
     // Get times list
@@ -684,7 +684,6 @@ int main(int argc, char *argv[])
     Info<< "Selecting renumberMethod " << renumberPtr().type() << nl << endl;
 
 
-
     // Read parallel reconstruct maps
     labelIOList cellProcAddressing
     (
@@ -767,7 +766,7 @@ int main(int argc, char *argv[])
         Info<< "nBlocks   = " << nBlocks << endl;
 
         // Read decompositionMethod dictionary
-        dictionary decomposeDict(renumberDictPtr().subDict("blockCoeffs"));
+        dictionary decomposeDict(renumberDictPtr().typeDict("block"));
         decomposeDict.set("numberOfSubdomains", nBlocks);
 
         bool oldParRun = UPstream::parRun();
@@ -823,7 +822,7 @@ int main(int argc, char *argv[])
         if (sortCoupledFaceCells)
         {
             // Change order so all coupled patch faceCells are at the end.
-            const polyBoundaryMesh& pbm = mesh.boundaryMesh();
+            const polyBoundaryMesh& pbm = mesh.poly().boundary();
 
             // Collect all boundary cells on coupled patches
             label nBndCells = 0;

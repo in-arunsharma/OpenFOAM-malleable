@@ -29,25 +29,26 @@ License
 // * * * * * * * * * * * * * Protected Member Functions  * * * * * * * * * * //
 
 template<class Coordinate, class Value>
-Foam::autoPtr<Foam::Function1s::unitConversions>
+Foam::autoPtr<Foam::Function1s::unitSets>
 Foam::TableFileReader<Coordinate, Value>::readUnits
 (
-    const Function1s::unitConversions& defaultUnits,
+    const Function1s::unitSets& defaultUnits,
     const dictionary& dict
 ) const
 {
     if (dict.found("units"))
     {
-        autoPtr<Function1s::unitConversions> unitsPtr
-        (
-            new Function1s::unitConversions(defaultUnits)
-        );
-        unitsPtr->readIfPresent("units", dict);
-        return unitsPtr;
+        Function1s::unitSets units(defaultUnits);
+        units.read(dict.lookup("units"));
+        return
+            autoPtr<Function1s::unitSets>
+            (
+                new Function1s::unitSets(units)
+            );
     }
     else
     {
-        return autoPtr<Function1s::unitConversions>(nullptr);
+        return autoPtr<Function1s::unitSets>(nullptr);
     }
 }
 
@@ -55,7 +56,7 @@ Foam::TableFileReader<Coordinate, Value>::readUnits
 template<class Coordinate, class Value>
 void Foam::TableFileReader<Coordinate, Value>::read
 (
-    const Function1s::unitConversions& defaultUnits,
+    const Function1s::unitSets& defaultUnits,
     const dictionary& dict,
     List<Tuple2<Coordinate, Value>>& table
 ) const
@@ -99,7 +100,7 @@ void Foam::TableFileReader<Coordinate, Value>::read
 template<class Coordinate, class Value>
 Foam::TableFileReader<Coordinate, Value>::TableFileReader
 (
-    const Function1s::unitConversions& defaultUnits,
+    const Function1s::unitSets& defaultUnits,
     const dictionary& dict
 )
 :
@@ -117,7 +118,12 @@ Foam::TableFileReader<Coordinate, Value>::TableFileReader
 :
     TableReader<Coordinate, Value>(tfr),
     fName_(tfr.fName_),
-    unitsPtr_(tfr.unitsPtr_, false)
+    unitsPtr_
+    (
+        tfr.unitsPtr_.valid()
+      ? new Function1s::unitSets(tfr.unitsPtr_())
+      : nullptr
+    )
 {}
 
 
@@ -134,7 +140,7 @@ template<class Coordinate, class Value>
 Foam::List<Foam::Tuple2<Coordinate, Value>>
 Foam::TableFileReader<Coordinate, Value>::read
 (
-    const Function1s::unitConversions& units,
+    const Function1s::unitSets& units,
     const dictionary& dict,
     const word&
 ) const
@@ -149,7 +155,7 @@ template<class Coordinate, class Value>
 void Foam::TableFileReader<Coordinate, Value>::write
 (
     Ostream& os,
-    const Function1s::unitConversions& units,
+    const Function1s::unitSets& units,
     const List<Tuple2<Coordinate, Value>>& table,
     const word&
 ) const

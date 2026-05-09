@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2019-2024 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2019-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -50,7 +50,7 @@ int main(int argc, char *argv[])
 
     #include "addMeshOption.H"
     #include "addRegionOption.H"
-    #include "setRootCase.H"
+    #include "setRootCaseNoFunctionObjects.H"
     #include "createTimeNoFunctionObjects.H"
     #include "createSpecifiedMesh.H"
 
@@ -64,7 +64,7 @@ int main(int argc, char *argv[])
     #include "readSurfaceFields.H"
     #include "readPointFields.H"
 
-    const polyBoundaryMesh& pbm = mesh.boundaryMesh();
+    const polyBoundaryMesh& pbm = mesh.poly().boundary();
 
     // Add/insert a (global) wall patch
     {
@@ -74,14 +74,13 @@ int main(int argc, char *argv[])
             0,          // dummy
             0,          // dummy
             0,          // dummy
-            pbm,
-            wallPolyPatch::typeName
+            pbm
         );
 
         label newPatchi = fvMeshTools::addPatch(mesh, pp);
 
-        Info<< "Inserted patch " << mesh.boundaryMesh()[newPatchi].name()
-            << " type " << mesh.boundaryMesh()[newPatchi].type()
+        Info<< "Inserted patch " << mesh.poly().boundary()[newPatchi].name()
+            << " type " << mesh.poly().boundary()[newPatchi].type()
             << " at index " << newPatchi << endl;
 
         runTime++;
@@ -139,14 +138,13 @@ int main(int argc, char *argv[])
                 newPatchName,
                 dict,
                 0,          // dummy index
-                pbm,
-                processorPolyPatch::typeName
+                pbm
             );
 
             label newPatchi = fvMeshTools::addPatch(mesh, pp);
 
-            Pout<< "Inserted patch " << mesh.boundaryMesh()[newPatchi].name()
-                << " type " << mesh.boundaryMesh()[newPatchi].type()
+            Pout<< "Inserted patch " << mesh.poly().boundary()[newPatchi].name()
+                << " type " << mesh.poly().boundary()[newPatchi].type()
                 << " at index " << newPatchi << endl;
         }
 

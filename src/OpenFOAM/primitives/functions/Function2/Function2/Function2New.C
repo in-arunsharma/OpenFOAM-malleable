@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2020-2024 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2020-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -31,7 +31,7 @@ template<class Type>
 Foam::autoPtr<Foam::Function2<Type>> Foam::Function2<Type>::New
 (
     const word& name,
-    const Function2s::unitConversions& units,
+    const Function2s::unitSets& units,
     const dictionary& dict
 )
 {
@@ -41,6 +41,12 @@ Foam::autoPtr<Foam::Function2<Type>> Foam::Function2<Type>::New
         const dictionary& coeffDict(dict.subDict(name));
 
         const word Function2Type(coeffDict.lookup("type"));
+
+        if (printDictionary::prints(coeffDict))
+        {
+            Info<< indent << "Selecting " << typeName << " "
+                << Function2Type << endl;
+        }
 
         typename dictionaryConstructorTable::iterator cstrIter =
             dictionaryConstructorTablePtr_->find(Function2Type);
@@ -55,6 +61,8 @@ Foam::autoPtr<Foam::Function2<Type>> Foam::Function2<Type>::New
                 << dictionaryConstructorTablePtr_->sortedToc() << nl
                 << exit(FatalIOError);
         }
+
+        printDictionary print(coeffDict);
 
         return cstrIter()(name, units, coeffDict);
     }
@@ -100,9 +108,9 @@ template<class Type>
 Foam::autoPtr<Foam::Function2<Type>> Foam::Function2<Type>::New
 (
     const word& name,
-    const unitConversion& xUnits,
-    const unitConversion& yUnits,
-    const unitConversion& valueUnits,
+    const unitSet& xUnits,
+    const unitSet& yUnits,
+    const unitSet& valueUnits,
     const dictionary& dict
 )
 {
@@ -114,7 +122,7 @@ template<class Type>
 Foam::autoPtr<Foam::Function2<Type>> Foam::Function2<Type>::New
 (
     const word& name,
-    const Function2s::unitConversions& units,
+    const Function2s::unitSets& units,
     const word& Function2Type,
     Istream& is
 )
@@ -157,9 +165,9 @@ template<class Type>
 Foam::autoPtr<Foam::Function2<Type>> Foam::Function2<Type>::New
 (
     const word& name,
-    const unitConversion& xUnits,
-    const unitConversion& yUnits,
-    const unitConversion& valueUnits,
+    const unitSet& xUnits,
+    const unitSet& yUnits,
+    const unitSet& valueUnits,
     const word& Function2Type,
     Istream& is
 )

@@ -28,9 +28,11 @@ License
 #include "fvMesh.H"
 #include "addToRunTimeSelectionTable.H"
 
+#include "TimeFunction_DimensionedFieldFunction.H"
 #include "Zonal_DimensionedFvPatchFieldFunction.H"
-#include "Function1_DimensionedFieldFunction.H"
+#include "DistanceFunction_DimensionedFieldFunction.H"
 #include "Coded_DimensionedFieldFunction.H"
+#include "Surfaces_DimensionedFieldFunction.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -46,17 +48,27 @@ License
     {                                                                          \
         addDimensionedFieldFunction                                            \
         (                                                                      \
+            TimeFunction,                                                      \
+            DimensionedField##Type##fvPatch##Field                             \
+        );                                                                     \
+        addDimensionedFieldFunction                                            \
+        (                                                                      \
             Zonal,                                                             \
             DimensionedField##Type##fvPatch##Field                             \
         );                                                                     \
         addDimensionedFieldFunction                                            \
         (                                                                      \
-            Function1,                                                         \
+            DistanceFunction,                                                  \
             DimensionedField##Type##fvPatch##Field                             \
         );                                                                     \
         addDimensionedFieldFunction                                            \
         (                                                                      \
             Coded,                                                             \
+            DimensionedField##Type##fvPatch##Field                             \
+        );                                                                     \
+        addDimensionedFieldFunction                                            \
+        (                                                                      \
+            Surfaces,                                                          \
             DimensionedField##Type##fvPatch##Field                             \
         );                                                                     \
     }

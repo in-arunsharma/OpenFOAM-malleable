@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -56,7 +56,7 @@ Foam::SurfaceFilmModel<CloudType>::SurfaceFilmModel
     g_(owner.g()),
     ejectedParcelType_
     (
-        this->coeffDict().lookupOrDefault("ejectedParcelType", -1)
+        this->typeDict().lookupOrDefault("ejectedParcelType", -1)
     ),
     massParcelPatch_(0),
     diameterParcelPatch_(0),
@@ -105,7 +105,7 @@ void Foam::SurfaceFilmModel<CloudType>::inject(TrackCloudType& cloud)
         const label filmPatchi = filmPatches[filmi];
 
         const fvMesh& mesh = this->owner().mesh();
-        const polyBoundaryMesh& pbm = mesh.boundaryMesh();
+        const polyBoundaryMesh& pbm = mesh.poly().boundary();
 
         const labelList& injectorCellsPatch = pbm[filmPatchi].faceCells();
 

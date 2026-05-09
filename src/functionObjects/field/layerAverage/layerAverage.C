@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -57,7 +57,7 @@ void Foam::functionObjects::layerAverage::calcLayers()
     DynamicList<layerInfo> startFacesInfo;
     forAll(patchIndices_, i)
     {
-        const polyPatch& pp = mesh_.boundaryMesh()[patchIndices_[i]];
+        const polyPatch& pp = mesh_.poly().boundary()[patchIndices_[i]];
         forAll(pp, j)
         {
             startFaces.append(pp.start() + j);
@@ -104,7 +104,7 @@ void Foam::functionObjects::layerAverage::calcLayers()
     // Report
     if (nLayers_ != 0)
     {
-        Info<< "    Detected " << nLayers_ << " layers" << nl << endl;
+        Info<< indent << "Detected " << nLayers_ << " layers" << endl;
     }
     else
     {
@@ -238,9 +238,7 @@ Foam::functionObjects::layerAverage::~layerAverage()
 
 bool Foam::functionObjects::layerAverage::read(const dictionary& dict)
 {
-    Info<< type() << " " << name() << ":" << nl;
-
-    patchIndices_ = mesh_.boundaryMesh().patchSet(dict, true).toc();
+    patchIndices_ = mesh_.poly().boundary().patchSet(dict, true).toc();
 
     zoneIndices_ =
         findStrings
@@ -400,7 +398,6 @@ void Foam::functionObjects::layerAverage::movePoints(const polyMesh& mesh)
 {
     if (&mesh == &mesh_)
     {
-        Info<< type() << " " << name() << ":" << nl;
         calcLayers();
     }
 }
@@ -413,7 +410,6 @@ void Foam::functionObjects::layerAverage::topoChange
 {
     if (&map.mesh() == &mesh_)
     {
-        Info<< type() << " " << name() << ":" << nl;
         calcLayers();
     }
 }
@@ -423,7 +419,6 @@ void Foam::functionObjects::layerAverage::mapMesh(const polyMeshMap& map)
 {
     if (&map.mesh() == &mesh_)
     {
-        Info<< type() << " " << name() << ":" << nl;
         calcLayers();
     }
 }
@@ -436,7 +431,6 @@ void Foam::functionObjects::layerAverage::distribute
 {
     if (&map.mesh() == &mesh_)
     {
-        Info<< type() << " " << name() << ":" << nl;
         calcLayers();
     }
 }

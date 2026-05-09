@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2016-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2016-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -80,7 +80,7 @@ void Foam::fv::fixedValueConstraint::readCoeffs(const dictionary& dict)
         (
             "fraction",
             mesh().time().userUnits(),
-            unitFraction,
+            units::fraction,
             dict
         )
       : autoPtr<Function1<scalar>>();
@@ -95,7 +95,7 @@ bool Foam::fv::fixedValueConstraint::constrainType
 ) const
 {
     // Set the value units for the function
-    fieldValues_[fieldName]->template setValueUnits<Type>
+    fieldValues_[fieldName].template setValueUnits<Type>
     (
         eqn.psi().dimensions()
     );
@@ -105,7 +105,7 @@ bool Foam::fv::fixedValueConstraint::constrainType
     const List<Type> values
     (
         zone_.nCells(),
-        fieldValues_[fieldName]->value<Type>(t)
+        fieldValues_[fieldName].value<Type>(t)
     );
 
     if (fraction_.valid())

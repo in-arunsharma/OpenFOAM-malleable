@@ -38,7 +38,7 @@ Foam::word Foam::fvMeshMovers::multiValveEngine::pistonObject::pistonBowlName
 
 void Foam::fvMeshMovers::multiValveEngine::pistonObject::calculateBore()
 {
-    const polyBoundaryMesh& pbm = meshMover_.mesh().boundaryMesh();
+    const polyBoundaryMesh& pbm = meshMover_.mesh().poly().boundary();
 
     // Find the maximum and minimum coordinates of the piston patch-set
     vector pistonMax(vector::min);
@@ -59,8 +59,8 @@ void Foam::fvMeshMovers::multiValveEngine::pistonObject::calculateBore()
 
     // Assuming the piston moves in the positive axis direction
     // remove the axis_ component to find the lateral extent of the piston
-    pistonMax = pistonMax - (axis & pistonMax)*pistonMax;
-    pistonMin = pistonMin - (axis & pistonMin)*pistonMin;
+    pistonMax -= (axis & pistonMax)*axis;
+    pistonMin -= (axis & pistonMin)*axis;
 
     bore_ = mag(pistonMax - pistonMin)/sqrt(2.0);
     centre_ = (pistonMax + pistonMin)/2;
@@ -69,7 +69,7 @@ void Foam::fvMeshMovers::multiValveEngine::pistonObject::calculateBore()
 
 void Foam::fvMeshMovers::multiValveEngine::pistonObject::correctClearance()
 {
-    const polyBoundaryMesh& pbm = meshMover_.mesh().boundaryMesh();
+    const polyBoundaryMesh& pbm = meshMover_.mesh().poly().boundary();
 
     // Find the maximum and minimum coordinate of the liner patch-sets
     scalar linerMax(-great);

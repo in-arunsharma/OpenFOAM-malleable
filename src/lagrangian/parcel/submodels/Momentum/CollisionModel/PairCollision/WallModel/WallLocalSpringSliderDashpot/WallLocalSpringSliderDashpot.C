@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2023 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -194,15 +194,15 @@ Foam::WallLocalSpringSliderDashpot<CloudType>::WallLocalSpringSliderDashpot
     maxEstarIndex_(-1),
     collisionResolutionSteps_
     (
-        this->coeffDict().template lookup<scalar>("collisionResolutionSteps")
+        this->typeDict().template lookup<scalar>("collisionResolutionSteps")
     ),
     volumeFactor_(1.0),
-    useEquivalentSize_(Switch(this->coeffDict().lookup("useEquivalentSize")))
+    useEquivalentSize_(Switch(this->typeDict().lookup("useEquivalentSize")))
 {
     if (useEquivalentSize_)
     {
         volumeFactor_ =
-            this->coeffDict().template lookup<scalar>("volumeFactor");
+            this->typeDict().template lookup<scalar>("volumeFactor");
     }
 
     scalar pNu = this->owner().constProps().poissonsRatio();
@@ -211,7 +211,7 @@ Foam::WallLocalSpringSliderDashpot<CloudType>::WallLocalSpringSliderDashpot
 
     const polyMesh& mesh = cloud.mesh();
 
-    const polyBoundaryMesh& bMesh = mesh.boundaryMesh();
+    const polyBoundaryMesh& bMesh = mesh.boundary();
 
     patchMap_.setSize(bMesh.size(), -1);
 
@@ -241,7 +241,7 @@ Foam::WallLocalSpringSliderDashpot<CloudType>::WallLocalSpringSliderDashpot
     {
         const dictionary& patchCoeffDict
         (
-            this->coeffDict().subDict(bMesh[wallPatchIndices[wPI]].name())
+            this->typeDict().subDict(bMesh[wallPatchIndices[wPI]].name())
         );
 
         patchMap_[wallPatchIndices[wPI]] = wPI;

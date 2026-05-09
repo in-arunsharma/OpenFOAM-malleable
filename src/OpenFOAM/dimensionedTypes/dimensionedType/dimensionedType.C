@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -26,6 +26,8 @@ License
 #include "dimensionedType.H"
 #include "pTraits.H"
 #include "dictionary.H"
+#include "units.H"
+#include "printDictionary.H"
 
 // * * * * * * * * * * * * * Private Member Functions  * * * * * * * * * * * //
 
@@ -33,7 +35,7 @@ template<class Type>
 void Foam::dimensioned<Type>::initialise
 (
     const word& name,
-    const unitConversion& defaultUnits,
+    const unitSet& defaultUnits,
     Istream& is
 )
 {
@@ -62,7 +64,7 @@ void Foam::dimensioned<Type>::initialise
     }
 
     // Read the units if they are before the value
-    unitConversion units(defaultUnits);
+    unitSet units(defaultUnits);
     const bool haveUnits = units.readIfPresent(is);
 
     // Read the value
@@ -149,7 +151,7 @@ Foam::dimensioned<Type>::dimensioned(Istream& is)
 :
     dimensions_(dimless)
 {
-    initialise(word::null, unitAny, is);
+    initialise(word::null, units::any, is);
 }
 
 
@@ -159,7 +161,7 @@ Foam::dimensioned<Type>::dimensioned(const word& name, Istream& is)
     name_(name),
     dimensions_(dimless)
 {
-    initialise(name, unitAny, is);
+    initialise(name, units::any, is);
 }
 
 
@@ -183,7 +185,7 @@ template<class Type>
 Foam::dimensioned<Type>::dimensioned
 (
     const word& name,
-    const unitConversion& units,
+    const unitSet& units,
     Istream& is
 )
 :
@@ -215,7 +217,7 @@ template<class Type>
 Foam::dimensioned<Type>::dimensioned
 (
     const word& name,
-    const unitConversion& units,
+    const unitSet& units,
     const dictionary& dict
 )
 :
@@ -233,8 +235,7 @@ Foam::dimensioned<Type>::dimensioned
     const word& name,
     const dimensionSet& dims,
     const dictionary& dict,
-    const Type& defaultValue,
-    const bool writeDefault
+    const Type& defaultValue
 )
 :
     name_(name),
@@ -245,22 +246,9 @@ Foam::dimensioned<Type>::dimensioned
     {
         initialise(name, dims, dict.lookup(name));
     }
-    else if (writeDefault)
+    else if (printDictionary::haveDefaults(dict))
     {
-        Info<< indent << "Default: " << name;
-
-        if (!dims.dimensionless())
-        {
-            Info<< " " << dims.info();
-        }
-
-        Info<< " " << defaultValue;
-
-        if (dict.name() != fileName::null)
-        {
-            Info<< " in " << dict.name().relativePath();
-        }
-        Info<< endl;
+        printDictionary::defaults(dict).add(name, defaultValue, true);
     }
 }
 
@@ -270,11 +258,10 @@ Foam::dimensioned<Type>::dimensioned
 (
     const word& name,
     const dictionary& dict,
-    const Type& defaultValue,
-    const bool writeDefault
+    const Type& defaultValue
 )
 :
-    dimensioned(name, dimless, dict, defaultValue, writeDefault)
+    dimensioned(name, dimless, dict, defaultValue)
 {}
 
 
@@ -282,10 +269,9 @@ template<class Type>
 Foam::dimensioned<Type>::dimensioned
 (
     const word& name,
-    const unitConversion& units,
+    const unitSet& units,
     const dictionary& dict,
-    const Type& defaultValue,
-    const bool writeDefault
+    const Type& defaultValue
 )
 :
     name_(name),
@@ -296,22 +282,9 @@ Foam::dimensioned<Type>::dimensioned
     {
         initialise(name, units, dict.lookup(name));
     }
-    else if (writeDefault)
+    else if (printDictionary::haveDefaults(dict))
     {
-        Info<< indent << "Default: " << name;
-
-        if (!units.dimensions().dimensionless())
-        {
-            Info<< " " << units.info();
-        }
-
-        Info<< " " << defaultValue;
-
-        if (dict.name() != fileName::null)
-        {
-            Info<< " in " << dict.name().relativePath();
-        }
-        Info<< endl;
+        printDictionary::defaults(dict).add(name, defaultValue, true);
     }
 }
 
@@ -389,7 +362,7 @@ template<class Type>
 void Foam::dimensioned<Type>::read
 (
     const dictionary& dict,
-    const unitConversion& defaultUnits
+    const unitSet& defaultUnits
 )
 {
     initialise
@@ -405,7 +378,7 @@ template<class Type>
 bool Foam::dimensioned<Type>::readIfPresent
 (
     const dictionary& dict,
-    const unitConversion& defaultUnits
+    const unitSet& defaultUnits
 )
 {
     const entry* entryPtr = dict.lookupEntryPtr(name_, false, true);
@@ -422,14 +395,6 @@ bool Foam::dimensioned<Type>::readIfPresent
     }
     else
     {
-        if (dictionary::writeOptionalEntries)
-        {
-            IOInfoInFunction(dict)
-                << "Optional entry '" << name_ << "' is not present,"
-                << " the default value '" << *this << "' will be used."
-                << endl;
-        }
-
         return false;
     }
 }
@@ -440,7 +405,7 @@ void Foam::dimensioned<Type>::readOrDefault
 (
     const dictionary& dict,
     const Type& defaultValue,
-    const unitConversion& defaultUnits
+    const unitSet& defaultUnits
 )
 {
     const entry* entryPtr = dict.lookupEntryPtr(name_, false, true);
@@ -636,6 +601,8 @@ Foam::dimensioned<Type> Foam::min
 template<class Type>
 void Foam::writeEntry(Ostream& os, const dimensioned<Type>& dt)
 {
+    writeKeyword(os, dt.name());
+
     // Write the dimensions
     dt.dimensions().write(os);
 
@@ -643,6 +610,8 @@ void Foam::writeEntry(Ostream& os, const dimensioned<Type>& dt)
 
     // Write the value
     os << dt.value();
+
+    os << token::END_STATEMENT << endl;
 }
 
 
@@ -651,7 +620,7 @@ void Foam::writeEntry(Ostream& os, const dimensioned<Type>& dt)
 template<class Type>
 Foam::Istream& Foam::operator>>(Istream& is, dimensioned<Type>& dt)
 {
-    dt.initialise(word::null, unitAny, is);
+    dt.initialise(word::null, units::any, is);
 
     // Check state of Istream
     is.check("Istream& operator>>(Istream&, dimensioned<Type>&)");

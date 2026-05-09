@@ -140,8 +140,8 @@ void Foam::externalCoupledMixedFvPatchField<Type>::writeGeometry
     int tag = Pstream::msgType() + 1;
 
     const label proci = Pstream::myProcNo();
-    const polyPatch& p = this->patch().patch();
-    const polyMesh& mesh = p.boundaryMesh().mesh();
+    const polyPatch& p = this->patch().poly();
+    const polyMesh& mesh = p.mesh();
 
     labelList pointToGlobal;
     labelList uniquePointIDs;
@@ -632,7 +632,7 @@ void Foam::externalCoupledMixedFvPatchField<Type>::evaluate
     const Pstream::commsTypes comms
 )
 {
-    if (!initialised_ || this->db().time().timeIndex() % calcFrequency_ == 0)
+    if (!initialised_ || this->time().timeIndex() % calcFrequency_ == 0)
     {
         const fileName transferFile(baseDir()/fName_);
 

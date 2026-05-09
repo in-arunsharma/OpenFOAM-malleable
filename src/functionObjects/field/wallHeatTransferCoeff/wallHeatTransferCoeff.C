@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2020-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2020-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -107,11 +107,9 @@ bool Foam::functionObjects::wallHeatTransferCoeff::read(const dictionary& dict)
         Cp_.read(dict);
     }
 
-    const polyBoundaryMesh& pbm = mesh_.boundaryMesh();
+    const polyBoundaryMesh& pbm = mesh_.poly().boundary();
 
-    patchSet_ = mesh_.boundaryMesh().patchSet(dict, true);
-
-    Info<< type() << ":" << nl;
+    patchSet_ = mesh_.poly().boundary().patchSet(dict, true);
 
     if (patchSet_.empty())
     {
@@ -123,11 +121,11 @@ bool Foam::functionObjects::wallHeatTransferCoeff::read(const dictionary& dict)
             }
         }
 
-        Info<< "    processing all wall patches" << nl << endl;
+        Info<< indent << "processing all wall patches" << endl;
     }
     else
     {
-        Info<< "    processing wall patches: " << nl;
+        Info<< indent << "processing wall patches: " << nl;
         labelHashSet filteredPatchSet;
         forAllConstIter(labelHashSet, patchSet_, iter)
         {
@@ -135,17 +133,15 @@ bool Foam::functionObjects::wallHeatTransferCoeff::read(const dictionary& dict)
             if (isA<wallPolyPatch>(pbm[patchi]))
             {
                 filteredPatchSet.insert(patchi);
-                Info<< "        " << pbm[patchi].name() << endl;
+                Info<< indent << "    " << pbm[patchi].name() << endl;
             }
             else
             {
                 WarningInFunction
                     << "Requested wall heat-transferCoeff on non-wall boundary"
-                    << " type patch: " << pbm[patchi].name() << nl << endl;
+                    << " type patch: " << pbm[patchi].name() << endl;
             }
         }
-
-        Info<< endl;
 
         patchSet_ = filteredPatchSet;
     }

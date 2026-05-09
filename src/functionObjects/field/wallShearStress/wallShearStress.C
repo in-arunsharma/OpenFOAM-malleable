@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2013-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2013-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -121,11 +121,9 @@ bool Foam::functionObjects::wallShearStress::read(const dictionary& dict)
 
     phaseName_ = dict.lookupOrDefault<word>("phase", word::null);
 
-    patchSet_ = mesh_.boundaryMesh().patchSet(dict, true);
+    patchSet_ = mesh_.poly().boundary().patchSet(dict, true);
 
-    Info<< type() << " " << name() << ":" << nl;
-
-    const polyBoundaryMesh& pbm = mesh_.boundaryMesh();
+    const polyBoundaryMesh& pbm = mesh_.poly().boundary();
 
     if (patchSet_.empty())
     {
@@ -137,12 +135,13 @@ bool Foam::functionObjects::wallShearStress::read(const dictionary& dict)
             }
         }
 
-        Info<< "    processing all wall patches" << nl << endl;
+        Info<< indent << "processing all wall patches" << endl;
     }
     else
     {
-        Info<< "    processing wall patches: " << nl;
+        Info<< indent << "processing wall patches:" << nl;
 
+        Info<< incrIndent;
         labelHashSet filteredPatchSet;
         forAllConstIter(labelHashSet, patchSet_, iter)
         {
@@ -151,16 +150,16 @@ bool Foam::functionObjects::wallShearStress::read(const dictionary& dict)
 
             if (isA<wallPolyPatch>(pbm[patchi]))
             {
-                Info<< "        " << pbm[patchi].name() << endl;
+                Info<< indent << pbm[patchi].name() << endl;
             }
             else
             {
-                Info<< "        " << pbm[patchi].name()
-                    << "    type " << pbm[patchi].type() << endl;
+                Info<< indent
+                    << pbm[patchi].name()
+                    << " type " << pbm[patchi].type() << endl;
             }
         }
-
-        Info<< endl;
+        Info<< decrIndent;
 
         patchSet_ = filteredPatchSet;
     }

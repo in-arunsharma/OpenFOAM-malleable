@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -122,7 +122,7 @@ int main(int argc, char *argv[])
         "do not update fields"
     );
 
-    #include "setRootCase.H"
+    #include "setRootCaseNoFunctionObjects.H"
     #include "createTimeNoFunctionObjects.H"
 
     Foam::word meshRegionName = polyMesh::defaultRegion;
@@ -168,12 +168,12 @@ int main(int argc, char *argv[])
     {
         const word patchName = args["patch"];
 
-        patchi = mesh.boundaryMesh().findIndex(patchName);
+        patchi = mesh.poly().boundary().findIndex(patchName);
 
         if (patchi == -1)
         {
             FatalErrorInFunction
-                << nl << "Valid patches are " << mesh.boundaryMesh().names()
+                << nl << "Valid patches are " << mesh.poly().boundary().names()
                 << exit(FatalError);
         }
 
@@ -205,7 +205,7 @@ int main(int argc, char *argv[])
 
     if (zoneName != word::null)
     {
-        Info<< "Selecting cellZone " << zoneName << endl << endl;
+        Info<< indent << "Selecting cellZone " << zoneName << endl << endl;
         subsetter.setLargeCellSubset
         (
             labelHashSet(mesh.cellZones()[zoneName]),
@@ -215,7 +215,7 @@ int main(int argc, char *argv[])
     }
     else if (setName != word::null)
     {
-        Info<< "Selecting cellSet " << setName << endl << endl;
+        Info<< indent << "Selecting cellSet " << setName << endl << endl;
         const cellSet currentSet(mesh, setName);
         subsetter.setLargeCellSubset(currentSet, patchi, true);
     }
@@ -229,12 +229,13 @@ int main(int argc, char *argv[])
         if (patchi == -1 && subsetDict.found("patch"))
         {
             const word patchName(subsetDict.lookup("patch"));
-            patchi = mesh.boundaryMesh().findIndex(patchName);
+            patchi = mesh.poly().boundary().findIndex(patchName);
 
             if (patchi == -1)
             {
                 FatalErrorInFunction
-                    << nl << "Valid patches are " << mesh.boundaryMesh().names()
+                    << nl << "Valid patches are "
+                    << mesh.poly().boundary().names()
                     << exit(FatalError);
             }
         }
@@ -254,7 +255,7 @@ int main(int argc, char *argv[])
                 )
             );
 
-            Info<< "Selecting cellZone " << zg->zoneName()
+            Info<< indent << "Selecting cellZone " << zg->zoneName()
                 << " of type " << zg->type() << endl;
 
             subCells = zg->generate().cZone();
@@ -263,7 +264,7 @@ int main(int argc, char *argv[])
         {
             const word cellZoneName(subsetDict.lookup("zone"));
 
-            Info<< "Selecting cellZone " << cellZoneName << endl;
+            Info<< indent << "Selecting cellZone " << cellZoneName << endl;
 
             subCells = mesh.cellZones()[cellZoneName];
         }

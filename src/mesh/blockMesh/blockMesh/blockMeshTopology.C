@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2024 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -395,11 +395,35 @@ Foam::polyMesh* Foam::blockMesh::createTopology
         defaultPatchTypeSet = true;
     }
 
-    // Optional 'convertToMeters' or 'scale' scaling factor
-    if (!meshDescription.readIfPresent("convertToMeters", scaleFactor_))
+    // Read the scaling factor (if any)
+    const bool haveConvertToMeters = meshDescription.found("convertToMeters");
+    const bool haveScale = meshDescription.found("scale");
+    const bool haveUnits = meshDescription.found("units");
+    if (haveConvertToMeters + haveScale + haveUnits > 1)
     {
-        meshDescription.readIfPresent("scale", scaleFactor_);
+        FatalIOErrorInFunction(meshDescription)
+            << "more than one of keywords 'convertToMeters', 'scale' and "
+            << "'units' defined in dictionary " << meshDescription.name()
+            << exit(FatalIOError);
     }
+    if (haveConvertToMeters)
+    {
+        scaleFactor_ = meshDescription.lookup<scalar>("convertToMeters");
+    }
+    if (haveScale)
+    {
+        scaleFactor_ = meshDescription.lookup<scalar>("scale");
+    }
+    if (haveUnits)
+    {
+        unitSet units(dimensions::length);
+        units.read(meshDescription.lookup("units"));
+        scaleFactor_ = units.toStandard(scalar(1));
+    }
+
+    // Prohibit unit conversion in the patch settings
+    units::setLength(units::none);
+
 
     // Read the block edges
     if (meshDescription.found("edges"))
@@ -459,7 +483,6 @@ Foam::polyMesh* Foam::blockMesh::createTopology
 
         transfer(blocks);
     }
-
 
 
     polyMesh* blockMeshPtr = nullptr;
@@ -569,7 +592,7 @@ Foam::polyMesh* Foam::blockMesh::createTopology
         if
         (
             !defaultPatchTypeSet
-         && blockMeshPtr->boundaryMesh().findIndex(defaultPatchName) != -1
+         && blockMeshPtr->boundary().findIndex(defaultPatchName) != -1
         )
         {
             defaultPatchError(defaultPatchName, meshDescription);
@@ -617,7 +640,7 @@ Foam::polyMesh* Foam::blockMesh::createTopology
         if
         (
             !defaultPatchTypeSet
-         && blockMeshPtr->boundaryMesh().findIndex(defaultPatchName) != -1
+         && blockMeshPtr->boundary().findIndex(defaultPatchName) != -1
         )
         {
             defaultPatchError(defaultPatchName, meshDescription);

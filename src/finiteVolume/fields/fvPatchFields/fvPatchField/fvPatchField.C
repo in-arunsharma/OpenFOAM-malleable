@@ -71,15 +71,7 @@ Foam::fvPatchField<Type>::fvPatchField
 )
 :
     Field<Type>(p.size()),
-    libs_
-    (
-        dict.lookupOrDefault
-        (
-            "libs",
-            fileNameList::null(),
-            dictionary::writeOptionalEntries > 1
-        )
-    ),
+    libs_(dict.lookupOrDefault("libs", fileNameList::null())),
     patch_(p),
     internalField_(iF),
     updated_(false),
@@ -149,7 +141,14 @@ Foam::fvPatchField<Type>::fvPatchField
 template<class Type>
 const Foam::objectRegistry& Foam::fvPatchField<Type>::db() const
 {
-    return patch_.boundaryMesh().mesh();
+    return patch_.mesh();
+}
+
+
+template<class Type>
+const Foam::Time& Foam::fvPatchField<Type>::time() const
+{
+    return patch_.time();
 }
 
 

@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -60,12 +60,15 @@ void mergeDuplicateBoundaryFaces
     labelList duplicates = localPointRegion::findDuplicateFaces
     (
         mesh,
-        identityMap(mesh.nFaces() - mesh.nInternalFaces())
-      + mesh.nInternalFaces()
+        identityMap
+        (
+            mesh.nInternalFaces(),
+            mesh.nFaces() - mesh.nInternalFaces()
+        )
     );
 
     // Check that none are on processor patches
-    const polyBoundaryMesh& patches = mesh.boundaryMesh();
+    const polyBoundaryMesh& patches = mesh.boundary();
     forAll(duplicates, bFacei)
     {
         if (duplicates[bFacei] != -1)
@@ -155,7 +158,7 @@ int main(int argc, char *argv[])
         "update fields"
     );
 
-    #include "setRootCase.H"
+    #include "setRootCaseNoFunctionObjects.H"
     #include "createTimeNoFunctionObjects.H"
     #include "createSpecifiedMeshNoChangers.H"
 

@@ -112,7 +112,7 @@ void Foam::meshRefinement::calcNeighbourData
             << abort(FatalError);
     }
 
-    const polyBoundaryMesh& patches = mesh_.boundaryMesh();
+    const polyBoundaryMesh& patches = mesh_.poly().boundary();
 
     labelHashSet addedPatchIDSet(meshedPatches());
 
@@ -551,8 +551,11 @@ void Foam::meshRefinement::checkData()
         localPointRegion::findDuplicateFaces
         (
             mesh_,
-            identityMap(mesh_.nFaces() - mesh_.nInternalFaces())
-          + mesh_.nInternalFaces()
+            identityMap
+            (
+                mesh_.nInternalFaces(),
+                mesh_.nFaces() - mesh_.nInternalFaces()
+            )
         )
     );
 
@@ -678,7 +681,7 @@ Foam::autoPtr<Foam::polyTopoChangeMap> Foam::meshRefinement::splitFaces
         label patchi = -1;
         if (facei >= mesh_.nInternalFaces())
         {
-            patchi = mesh_.boundaryMesh().whichPatch(facei);
+            patchi = mesh_.poly().boundary().whichPatch(facei);
         }
         else
         {
@@ -757,7 +760,7 @@ Foam::autoPtr<Foam::polyTopoChangeMap> Foam::meshRefinement::splitFaces
 //    Map<label>& regionToMaster
 //) const
 //{
-//    const polyBoundaryMesh& patches = mesh_.boundaryMesh();
+//    const polyBoundaryMesh& patches = mesh_.poly().boundary();
 //
 //    forAll(patches, patchi)
 //    {
@@ -1367,7 +1370,7 @@ Foam::autoPtr<Foam::polyDistributionMap> Foam::meshRefinement::balance
                 const PtrList<surfaceZonesInfo>& surfZones =
                     surfaces().surfZones();
                 const faceZoneList& fZones = mesh_.faceZones();
-                const polyBoundaryMesh& pbm = mesh_.boundaryMesh();
+                const polyBoundaryMesh& pbm = mesh_.poly().boundary();
 
                 // Get faces whose owner and neighbour should stay together,
                 // i.e. they are not 'blocked'.
@@ -1648,7 +1651,7 @@ Foam::labelList Foam::meshRefinement::intersectedPoints() const
     //
     //    if (patchi != -1)
     //    {
-    //        const polyPatch& pp = mesh_.boundaryMesh()[patchi];
+    //        const polyPatch& pp = mesh_.poly().boundary()[patchi];
     //
     //        label facei = pp.start();
     //
@@ -1689,7 +1692,7 @@ Foam::autoPtr<Foam::indirectPrimitivePatch> Foam::meshRefinement::makePatch
     const labelList& patchIDs
 )
 {
-    const polyBoundaryMesh& patches = mesh.boundaryMesh();
+    const polyBoundaryMesh& patches = mesh.boundary();
 
     // Count faces.
     label nFaces = 0;
@@ -1917,7 +1920,7 @@ Foam::label Foam::meshRefinement::addMeshedPatch
     const dictionary& patchInfo
 )
 {
-    const polyBoundaryMesh& pbm = mesh_.boundaryMesh();
+    const polyBoundaryMesh& pbm = mesh_.poly().boundary();
 
     const label meshedI = findIndex(meshedPatches_, name);
 
@@ -1977,12 +1980,12 @@ void Foam::meshRefinement::addedMeshedPatches()
 
 Foam::labelList Foam::meshRefinement::meshedPatches() const
 {
-    const polyBoundaryMesh& patches = mesh_.boundaryMesh();
+    const polyBoundaryMesh& patches = mesh_.poly().boundary();
 
     DynamicList<label> patchIDs(meshedPatches_.size());
     forAll(meshedPatches_, i)
     {
-        label patchi = patches.findIndex(meshedPatches_[i]);
+        const label patchi = patches.findIndex(meshedPatches_[i]);
 
         if (patchi == -1)
         {
@@ -1991,7 +1994,8 @@ Foam::labelList Foam::meshRefinement::meshedPatches() const
                 << endl << "Valid patches are " << patches.names()
                 << abort(FatalError);
         }
-        if (!polyPatch::constraintType(patches[patchi].type()))
+
+        if (!patches[patchi].constraint())
         {
             patchIDs.append(patchi);
         }
@@ -2003,7 +2007,7 @@ Foam::labelList Foam::meshRefinement::meshedPatches() const
 
 void Foam::meshRefinement::selectSeparatedCoupledFaces(boolList& selected) const
 {
-    const polyBoundaryMesh& patches = mesh_.boundaryMesh();
+    const polyBoundaryMesh& patches = mesh_.poly().boundary();
 
     forAll(patches, patchi)
     {

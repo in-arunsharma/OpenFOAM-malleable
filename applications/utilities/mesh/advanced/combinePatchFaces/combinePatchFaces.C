@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     | Website:  https://openfoam.org
-    \\  /    A nd           | Copyright (C) 2011-2025 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2026 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -190,7 +190,7 @@ label mergePatchFaces
                 // Restore. Get face properties.
 
                 label own = mesh.faceOwner()[newMasterI];
-                label patchID = mesh.boundaryMesh().whichPatch(newMasterI);
+                label patchID = mesh.boundary().whichPatch(newMasterI);
 
                 Pout<< "Restoring new master face " << newMasterI
                     << " to vertices " << setFaceVerts[0] << endl;
@@ -299,7 +299,7 @@ int main(int argc, char *argv[])
         "read user-defined mesh quality criterions from system/meshQualityDict"
     );
 
-    #include "setRootCase.H"
+    #include "setRootCaseNoFunctionObjects.H"
     #include "createTimeNoFunctionObjects.H"
     #include "createPolyMesh.H"
     const word oldInstance = mesh.pointsInstance();

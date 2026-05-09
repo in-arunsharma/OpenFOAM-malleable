@@ -22,8 +22,19 @@
 // When the policy fires, dmrCheckpoint() (the OLD-group branch of
 // DMR_AUTO) forces a runTime.writeNow() at the current step, so the
 // write does not depend on runTime.writeTime() being true.
-if (dmrEnabled
- && runTime.userTimeValue() < runTime.endTime().value())
+//
+// Note: we do NOT additionally guard on `runTime.userTimeValue() <
+// runTime.endTime().value()` here.  That comparison silently mixes
+// units when the case uses a non-trivial userTime (e.g. `userTime
+// engine` converting CAD ↔ seconds): userTimeValue() returns the
+// numeric value in user units (CAD), while endTime().value() returns
+// the numeric value in raw seconds.  At the moment the user-time
+// scalar overtakes the raw-time scalar (CAD=4.0 vs raw 4.0 s for a
+// typical engine RPM, for example), the comparison becomes false and
+// dmr_check stops firing for the rest of the run.  The outer
+// `while (pimple.run(runTime))` already correctly gates entry to this
+// code by end-of-run, so no additional guard is needed.
+if (dmrEnabled)
 {
     DMR_AUTO
     (

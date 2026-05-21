@@ -1,34 +1,30 @@
 // DMR initialisation — include before setRootCase.H.
 // For multi-region (foamMultiRun), define DMR_ALL_REGIONS true first.
 //
-// Runtime control (OpenFOAM-side hooks):
-//   FOAM_DMR_ENABLED=1       activates DMR at runtime (required even when
-//                            the binary was compiled with -DFOAM_USE_DMR)
-//   FOAM_DMR_LOG=1           write DMR-internal subprocess and lifecycle
-//                            output to <case>/log.dmr/ (default on; set
-//                            FOAM_DMR_LOG=0 to silence)
-//
-// DMR-library knobs (DMR_DEFAULT_INHIBITOR for reconfiguration cadence,
-// DMR_DEFAULT_POLICY_MIN/MAX, DMR_PRINT_ANALYTICS, DMR_DEBUG_LEVEL,
-// DMR_PROCS_PER_NODE, ...) are read directly by the DMR library and
-// need no OpenFOAM-side bridging.
+// DMR is opt-in: pass -dmr on the command line to activate. The
+// dmr_wrapper launcher appends this flag automatically.
 
 #ifndef DMR_ALL_REGIONS
 #define DMR_ALL_REGIONS false
 #endif
 
-// Runtime toggle: compiled with -DFOAM_USE_DMR means DMR is active by default.
-// Set FOAM_DMR_ENABLED=0 to disable at runtime (e.g. comparison runs).
-const bool dmrEnabled = [](){
-    const char* env = std::getenv("FOAM_DMR_ENABLED");
-    return !env || std::string(env) != "0";
+Foam::argList::addBoolOption
+(
+    "dmr",
+    "Enable DMR malleability (requires launch via dmr_wrapper)."
+);
+
+// argList is not built yet; scan argv directly.
+const bool dmrEnabled = [&](){
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::string(argv[i]) == "-dmr") return true;
+    }
+    return false;
 }();
 
 const bool dmrAllRegions = DMR_ALL_REGIONS;
 
-// Parse -case from argv up-front (OpenFOAM's argList is not yet built)
-// so the DMR_AUTO restart callback can reference it.  Defaults to "."
-// when omitted.
 const std::string dmrCasePath = [&](){
     for (int i = 1; i < argc - 1; ++i)
     {
@@ -37,24 +33,17 @@ const std::string dmrCasePath = [&](){
     return std::string(".");
 }();
 
-// Reconfiguration policy.  ROUND_POLICY deterministically cycles through
-// N_min..N_max by doubling, then resets — used for debugging and validation
-// because every reconfiguration path is exercised.  Switch to CE_POLICY
-// (communication-efficiency driven) for production runs; the choice is a
-// build-time decision, not a user-facing option.
+// ROUND_POLICY for debugging (deterministic doubling cycle); switch to
+// CE_POLICY for production. Build-time choice, not user-facing.
 const DMRSuggestion dmrPolicy = ROUND_POLICY;
 
 if (dmrEnabled)
 {
-    // Initialise MPI before DMR.
     {
         int provided;
         MPI_Init_thread(&argc, &argv, MPI_THREAD_SINGLE, &provided);
     }
 
-    // DMR_AUTO phases: init / running / restart / cleanup.
-    // On restart, dmrRestart() updates the case dicts and decomposes for the
-    // new process count — safe to run inside DMR_AUTO.
     DMR_AUTO(
         dmr_init(argc, argv),
         (void)NULL,

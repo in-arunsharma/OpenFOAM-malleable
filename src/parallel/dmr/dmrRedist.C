@@ -27,6 +27,11 @@ License
 #include "OSspecific.H"
 #include "Pstream.H"
 
+extern "C"
+{
+    #include "dmr.h"
+}
+
 #include <mpi.h>
 #include <glob.h>
 #include <sys/stat.h>
@@ -290,8 +295,172 @@ static std::string dmrLatestTimeName(const std::string& casePath)
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
+// Reconfiguration direction reported by DMR analytics.
+enum class DmrDir { Unknown = 0, Shrink = 1, Grow = 2 };
+
+struct DmrWorldInfo
+{
+    int nOld = 0;
+    int nNew = 0;
+    DmrDir dir = DmrDir::Unknown;
+};
+
+
+// Rank 0 queries DMR analytics + procs_next_* getters; result is broadcast
+// to every rank. Valid window: between dmr_reconfigure() returning
+// DMR_REDIST_FINALIZE and dmr_finalize() running — i.e. inside the redist
+// callback in DMR_AUTO.
+static bool dmrQueryWorldInfo(DmrWorldInfo& w)
+{
+    MPI_Comm_size(MPI_COMM_WORLD, &w.nOld);
+
+    int dir = static_cast<int>(DmrDir::Unknown);
+    int delta = 0;
+
+    int myRank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
+    if (myRank == 0)
+    {
+        DMRAnalytics a{};
+        if (dmr_get_analytics(&a) == DMR_SUCCESS)
+        {
+            switch (a.event)
+            {
+                case DMR_EVENT_START_EXPAND_SLURM:
+                case DMR_EVENT_START_EXPAND_MPI:
+                    dir = static_cast<int>(DmrDir::Grow);
+                    delta = dmr_get_procs_next_expand();
+                    break;
+                case DMR_EVENT_START_SHRINK:
+                    dir = static_cast<int>(DmrDir::Shrink);
+                    delta = dmr_get_procs_next_shrink();
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    int buf[2] = {dir, delta};
+    MPI_Bcast(buf, 2, MPI_INT, 0, MPI_COMM_WORLD);
+    dir = buf[0];
+    delta = buf[1];
+
+    w.dir = static_cast<DmrDir>(dir);
+    if (w.dir == DmrDir::Grow)
+    {
+        w.nNew = w.nOld + delta;
+    }
+    else if (w.dir == DmrDir::Shrink)
+    {
+        w.nNew = w.nOld - delta;
+    }
+    else
+    {
+        w.nNew = w.nOld;
+    }
+
+    return w.dir != DmrDir::Unknown && delta > 0 && w.nNew > 0;
+}
+
+
+static const char* dmrDirToStr(DmrDir d)
+{
+    switch (d)
+    {
+        case DmrDir::Shrink: return "SHRINK";
+        case DmrDir::Grow:   return "GROW";
+        default:             return "UNKNOWN";
+    }
+}
+
+
+// Plain-text key=value per line so the NEW group can read it without
+// depending on OF's dictionary machinery (which is not initialised yet
+// at dmrRestart time).
+static void dmrWriteWorldMeta
+(
+    const std::string& casePath,
+    const DmrWorldInfo& w
+)
+{
+    Foam::mkDir(casePath + "/log.dmr");
+    const std::string path = casePath + "/log.dmr/.world.meta";
+
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return;
+
+    std::fprintf(f, "n_old=%d\n", w.nOld);
+    std::fprintf(f, "n_new=%d\n", w.nNew);
+    std::fprintf(f, "direction=%s\n", dmrDirToStr(w.dir));
+    std::fclose(f);
+    ::sync();
+}
+
+
+// Rank 0 reads, broadcasts. Returns true only on a fully-populated meta;
+// stale or partial files are treated as missing so the caller knows it
+// can't rely on the direction.
+static bool dmrReadWorldMeta
+(
+    const std::string& casePath,
+    DmrWorldInfo& w
+)
+{
+    int myRank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
+
+    int payload[3] = {0, 0, static_cast<int>(DmrDir::Unknown)};
+    int found = 0;
+
+    if (myRank == 0)
+    {
+        const std::string path = casePath + "/log.dmr/.world.meta";
+        FILE* f = std::fopen(path.c_str(), "r");
+        if (f)
+        {
+            char line[128];
+            int n_old = 0, n_new = 0;
+            char dirStr[32] = "UNKNOWN";
+            while (std::fgets(line, sizeof(line), f))
+            {
+                if (std::sscanf(line, "n_old=%d", &n_old) == 1) continue;
+                if (std::sscanf(line, "n_new=%d", &n_new) == 1) continue;
+                std::sscanf(line, "direction=%31s", dirStr);
+            }
+            std::fclose(f);
+
+            DmrDir d = DmrDir::Unknown;
+            if      (std::string(dirStr) == "SHRINK") d = DmrDir::Shrink;
+            else if (std::string(dirStr) == "GROW")   d = DmrDir::Grow;
+
+            payload[0] = n_old;
+            payload[1] = n_new;
+            payload[2] = static_cast<int>(d);
+            found = (n_old > 0 && n_new > 0 && d != DmrDir::Unknown) ? 1 : 0;
+        }
+    }
+
+    MPI_Bcast(&found, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (!found) return false;
+
+    MPI_Bcast(payload, 3, MPI_INT, 0, MPI_COMM_WORLD);
+    w.nOld = payload[0];
+    w.nNew = payload[1];
+    w.dir = static_cast<DmrDir>(payload[2]);
+    return true;
+}
+
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
 void dmrCheckpoint(Time& runTime, bool allRegions)
 {
+    // Direction + target world size from DMR analytics. Collective on
+    // MPI_COMM_WORLD; broadcasts to every rank.
+    DmrWorldInfo world;
+    const bool worldOk = dmrQueryWorldInfo(world);
+
     // DMR-forced checkpoints (off-cadence) get a sentinel file so the
     // sweep below can discard them once a newer checkpoint exists.
     const bool isDmrForced = !runTime.writeTime();
@@ -315,6 +484,27 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
             "Checkpoint at t=" + timeName
           + (isDmrForced ? " (DMR-forced)" : " (writeInterval)")
         );
+
+        if (worldOk)
+        {
+            dmrWriteWorldMeta(casePath, world);
+            dmrLifecycleLog
+            (
+                casePath,
+                std::string("Reconfig ") + dmrDirToStr(world.dir)
+              + ": N_old=" + std::to_string(world.nOld)
+              + " -> N_new=" + std::to_string(world.nNew)
+            );
+        }
+        else
+        {
+            dmrLifecycleLog
+            (
+                casePath,
+                "Reconfig direction unknown (DMR analytics unavailable)."
+            );
+        }
+
         dmrLifecycleLog(casePath, "Reconstructing processor directories...");
 
         // -newTimes merges only times not yet in serial. -rm is omitted
@@ -442,6 +632,11 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
 
 void dmrRestart(const std::string& casePath, bool allRegions)
 {
+    // Read direction + N_old written by the OLD group at checkpoint.
+    // Collective; broadcasts to every rank.
+    DmrWorldInfo world;
+    const bool worldOk = dmrReadWorldMeta(casePath, world);
+
     // Subprocesses spawned here run in isolated MPI environments, so
     // there is no interaction with DMR_INTERCOMM.
     int newSize, myRank;
@@ -455,6 +650,37 @@ void dmrRestart(const std::string& casePath, bool allRegions)
             casePath,
             "Restarting with " + std::to_string(newSize) + " processes."
         );
+
+        if (worldOk)
+        {
+            dmrLifecycleLog
+            (
+                casePath,
+                std::string("Restart ") + dmrDirToStr(world.dir)
+              + ": N_old=" + std::to_string(world.nOld)
+              + ", N_new(meta)=" + std::to_string(world.nNew)
+              + ", MPI_Comm_size=" + std::to_string(newSize)
+            );
+            if (world.nNew != newSize)
+            {
+                dmrLifecycleLog
+                (
+                    casePath,
+                    "WARNING: .world.meta n_new ("
+                  + std::to_string(world.nNew)
+                  + ") disagrees with MPI_Comm_size ("
+                  + std::to_string(newSize) + ")."
+                );
+            }
+        }
+        else
+        {
+            dmrLifecycleLog
+            (
+                casePath,
+                "Restart: no .world.meta (first run or stale)."
+            );
+        }
 
         dmrUpdateDictEntry
         (

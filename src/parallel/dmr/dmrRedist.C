@@ -26,6 +26,13 @@ License
 #include "dmrRedist.H"
 #include "OSspecific.H"
 #include "Pstream.H"
+#include "fvMesh.H"
+#include "fvMeshDistribute.H"
+#include "decompositionMethod.H"
+#include "polyDistributionMap.H"
+#include "IOobjectList.H"
+#include "volFields.H"
+#include "surfaceFields.H"
 
 extern "C"
 {
@@ -452,23 +459,191 @@ static bool dmrReadWorldMeta
 }
 
 
+// Load all on-disk fields of a given GeoField type into a PtrList,
+// registering each with the supplied mesh. Matches the loading pattern
+// redistributePar uses on its freshly-constructed mesh.
+template<class GeoField>
+static void dmrLoadFields
+(
+    const typename GeoField::Mesh& mesh,
+    IOobjectList& allObjects,
+    PtrList<GeoField>& fields
+)
+{
+    IOobjectList objects(allObjects.lookupClass(GeoField::typeName));
+    const wordList names(objects.toc());
+
+    fields.setSize(names.size());
+    forAll(names, i)
+    {
+        IOobject& io = objects[names[i]];
+        io.writeOpt() = IOobject::AUTO_WRITE;
+        fields.set(i, new GeoField(io, mesh));
+    }
+}
+
+
+// Construct a fresh fvMesh from disk (non-registered, so it doesn't clash
+// with the live mesh still in runTime's registry), load every field type
+// into it, run fvMeshDistribute, and write the new layout. Mirrors the
+// body of redistributePar.C's main() — calling fvMeshDistribute against
+// this clean mesh avoids the receiver-side deadlock that happens when it
+// is called against a mesh carrying live solver state.
+static void dmrRunFreshRedistribute
+(
+    Time& runTime,
+    const std::string& timeName
+)
+{
+    const fileName meshSubDir(polyMesh::meshSubDir);
+    const fileName masterInstDir =
+        runTime.findInstance(meshSubDir, "points");
+
+    fvMesh mesh
+    (
+        IOobject
+        (
+            polyMesh::defaultRegion,
+            masterInstDir,
+            runTime,
+            IOobject::MUST_READ,
+            IOobject::AUTO_WRITE,
+            false
+        )
+    );
+
+    autoPtr<decompositionMethod> distributor
+    (
+        decompositionMethod::NewDistributor
+        (
+            decompositionMethod::decomposeParDict(runTime)
+        )
+    );
+    const labelList finalDecomp =
+        distributor().decompose(mesh, mesh.cellCentres());
+
+    IOobjectList allObjects(mesh, runTime.name());
+
+    PtrList<volScalarField>              volScalars;
+    PtrList<volVectorField>              volVectors;
+    PtrList<volSphericalTensorField>     volSphereTensors;
+    PtrList<volSymmTensorField>          volSymmTensors;
+    PtrList<volTensorField>              volTensors;
+    PtrList<surfaceScalarField>          surfScalars;
+    PtrList<surfaceVectorField>          surfVectors;
+    PtrList<surfaceSphericalTensorField> surfSphereTensors;
+    PtrList<surfaceSymmTensorField>      surfSymmTensors;
+    PtrList<surfaceTensorField>          surfTensors;
+
+    dmrLoadFields(mesh, allObjects, volScalars);
+    dmrLoadFields(mesh, allObjects, volVectors);
+    dmrLoadFields(mesh, allObjects, volSphereTensors);
+    dmrLoadFields(mesh, allObjects, volSymmTensors);
+    dmrLoadFields(mesh, allObjects, volTensors);
+    dmrLoadFields(mesh, allObjects, surfScalars);
+    dmrLoadFields(mesh, allObjects, surfVectors);
+    dmrLoadFields(mesh, allObjects, surfSphereTensors);
+    dmrLoadFields(mesh, allObjects, surfSymmTensors);
+    dmrLoadFields(mesh, allObjects, surfTensors);
+
+    fvMeshDistribute(mesh).distribute(finalDecomp);
+
+    mesh.setInstance(timeName);
+    mesh.write();
+}
+
+
+// SHRINK on the OLD group:
+// 1. Flush the live solver state to processor*/timeName/ (writeNow).
+// 2. Update decomposeParDict for the new world size + scotch.
+// 3. Run the redistribute on a fresh mesh loaded from that just-written
+//    state (see dmrRunFreshRedistribute for the rationale).
+// 4. Sweep processor{N_new..N_old-1}/ - those are empty after the
+//    redistribute and the NEW group will only look at 0..N_new-1.
+static void dmrShrinkInPlace
+(
+    Time& runTime,
+    const DmrWorldInfo& world,
+    bool isDmrForced,
+    bool /*allRegions*/
+)
+{
+    const std::string casePath = runTime.globalPath();
+    const std::string timeName = runTime.name();
+
+    runTime.writeNow();
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (Pstream::master())
+    {
+        dmrLifecycleLog
+        (
+            casePath,
+            "Checkpoint at t=" + timeName
+          + (isDmrForced ? " (DMR-forced)" : " (writeInterval)")
+        );
+        dmrWriteWorldMeta(casePath, world);
+        dmrLifecycleLog
+        (
+            casePath,
+            "Reconfig SHRINK: N_old=" + std::to_string(world.nOld)
+          + " -> N_new=" + std::to_string(world.nNew)
+        );
+
+        dmrUpdateDictEntry
+        (
+            casePath, "system/decomposeParDict",
+            "numberOfSubdomains", std::to_string(world.nNew)
+        );
+        dmrUpdateDictEntry
+        (
+            casePath, "system/decomposeParDict",
+            "decomposer", "scotch"
+        );
+        dmrUpdateDictEntry
+        (
+            casePath, "system/decomposeParDict",
+            "distributor", "scotch"
+        );
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    dmrRunFreshRedistribute(runTime, timeName);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (Pstream::master())
+    {
+        for (int p = world.nNew; p < world.nOld; ++p)
+        {
+            Foam::rmDir(casePath + "/processor" + std::to_string(p));
+        }
+        ::sync();
+
+        dmrLifecycleLog(casePath, "Shrink redistribute complete.");
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 void dmrCheckpoint(Time& runTime, bool allRegions)
 {
-    // Direction + target world size from DMR analytics. Collective on
-    // MPI_COMM_WORLD; broadcasts to every rank.
     DmrWorldInfo world;
     const bool worldOk = dmrQueryWorldInfo(world);
-
-    // DMR-forced checkpoints (off-cadence) get a sentinel file so the
-    // sweep below can discard them once a newer checkpoint exists.
     const bool isDmrForced = !runTime.writeTime();
 
-    // writeNow()'s bool return is the AND over every registered
-    // regIOobject including transient dynamic-mesh sub-objects, so it
-    // is not a useful success signal. Real I/O failures propagate via
-    // FatalError and abort before we reach reconstructPar below.
+    if (worldOk && world.dir == DmrDir::Shrink)
+    {
+        dmrShrinkInPlace(runTime, world, isDmrForced, allRegions);
+        return;
+    }
+
+    // GROW / Unknown: legacy reconstructPar path. Replaced by an
+    // in-process redistribute on the NEW group in Phase 3.
     runTime.writeNow();
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -707,65 +882,68 @@ void dmrRestart(const std::string& casePath, bool allRegions)
         // and controlDict overrides are not handled. The root dicts
         // suffice for the -allRegions cases tested so far.
 
-        const std::string restartTime = dmrLatestTimeName(casePath);
-        if (restartTime.empty())
+        if (worldOk && world.dir == DmrDir::Shrink)
         {
-            std::fprintf
+            // OLD group has already written processor0..N_new-1/ via
+            // fvMeshDistribute. decomposePar would overwrite that from
+            // the stale serial dirs.
+            dmrLifecycleLog
             (
-                stderr,
-                "DMR: FATAL — no time directories found in '%s'.\n",
-                casePath.c_str()
+                casePath,
+                "Shrink restart: data already in N_new processor layout."
             );
-            MPI_Abort(MPI_COMM_WORLD, 1);
         }
-
-        // For moving-mesh cases the polyMesh topology is only written at
-        // mesh-swap times; between those, time directories contain only
-        // a `points` file. decomposePar evolves topology forward via a
-        // comma-separated time chain (e.g. -time 0.1,0.8) — see bug
-        // 0004368 on bugs.openfoam.org. dmrBuildDecomposeTimeArg
-        // collects the mesh-write times from the case and builds that
-        // argument; no polyMesh files are copied.
-        const std::string timeArg =
-            dmrBuildDecomposeTimeArg(casePath, restartTime, allRegions);
-
-        std::string cmd =
-            "decomposePar -force -time " + timeArg + " -cellProc"
-          + " -case '" + casePath + "'";
-        if (allRegions) cmd += " -allRegions";
-
-        dmrRunOrAbort(casePath, "dmr_decompose.log", cmd);
-
-        // Engine-style cases keep additional sub-meshes under
-        // constant/meshes/<name> that -allRegions does not visit.
-        // Mirror the case's Allrun pattern: decompose each sub-mesh
-        // explicitly for the new process count. No-op for cases
-        // without sub-meshes.
-        const std::string subMeshGlob =
-            casePath + "/constant/meshes/*";
-        glob_t mg;
-        if (glob(subMeshGlob.c_str(), GLOB_ONLYDIR, nullptr, &mg) == 0)
+        else
         {
-            for (size_t i = 0; i < mg.gl_pathc; ++i)
+            const std::string restartTime = dmrLatestTimeName(casePath);
+            if (restartTime.empty())
             {
-                const std::string p(mg.gl_pathv[i]);
-                const auto slash = p.find_last_of('/');
-                const std::string meshName = p.substr(slash + 1);
-                // No -force here: OpenFOAM rejects `-force` combined with
-                // `-mesh` plus a single `-region` ("Cannot force the
-                // decomposition of a single region").  The main
-                // `decomposePar -force -allRegions` above has already
-                // cleared the processor* dirs, so each sub-mesh decompose
-                // can append its output without forcing.
-                const std::string mcmd =
-                    "decomposePar -mesh " + meshName
-                  + " -region fluid -case '" + casePath + "'";
-                dmrRunOrAbort(casePath, "dmr_decompose.log", mcmd);
+                std::fprintf
+                (
+                    stderr,
+                    "DMR: FATAL — no time directories found in '%s'.\n",
+                    casePath.c_str()
+                );
+                MPI_Abort(MPI_COMM_WORLD, 1);
             }
-            globfree(&mg);
-        }
 
-        dmrLifecycleLog(casePath, "Decomposition complete.");
+            // For moving-mesh cases the polyMesh topology is only written
+            // at mesh-swap times; between those, time directories contain
+            // only a `points` file. decomposePar evolves topology forward
+            // via a comma-separated time chain (e.g. -time 0.1,0.8) — see
+            // bug 0004368 on bugs.openfoam.org.
+            const std::string timeArg =
+                dmrBuildDecomposeTimeArg(casePath, restartTime, allRegions);
+
+            std::string cmd =
+                "decomposePar -force -time " + timeArg + " -cellProc"
+              + " -case '" + casePath + "'";
+            if (allRegions) cmd += " -allRegions";
+
+            dmrRunOrAbort(casePath, "dmr_decompose.log", cmd);
+
+            // Engine-style cases keep additional sub-meshes under
+            // constant/meshes/<name> that -allRegions does not visit.
+            const std::string subMeshGlob =
+                casePath + "/constant/meshes/*";
+            glob_t mg;
+            if (glob(subMeshGlob.c_str(), GLOB_ONLYDIR, nullptr, &mg) == 0)
+            {
+                for (size_t i = 0; i < mg.gl_pathc; ++i)
+                {
+                    const std::string p(mg.gl_pathv[i]);
+                    const auto slash = p.find_last_of('/');
+                    const std::string meshName = p.substr(slash + 1);
+                    const std::string mcmd =
+                        "decomposePar -mesh " + meshName
+                      + " -region fluid -case '" + casePath + "'";
+                    dmrRunOrAbort(casePath, "dmr_decompose.log", mcmd);
+                }
+                globfree(&mg);
+            }
+
+            dmrLifecycleLog(casePath, "Decomposition complete.");
+        }
     }
 
     // Synchronise before setRootCase.H re-initialises OpenFOAM in

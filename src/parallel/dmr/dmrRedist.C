@@ -33,6 +33,7 @@ License
 #include "IOobjectList.H"
 #include "volFields.H"
 #include "surfaceFields.H"
+#include "pointFields.H"
 
 extern "C"
 {
@@ -488,14 +489,26 @@ static void dmrLoadFields
 // into it, run fvMeshDistribute, and write the new layout. Mirrors the
 // body of redistributePar.C's main() — calling fvMeshDistribute against
 // this clean mesh avoids the receiver-side deadlock that happens when it
-// is called against a mesh carrying live solver state.
+// is called against a mesh carrying live solver state. The region argument
+// is the polyMesh name (polyMesh::defaultRegion for single-region cases,
+// or one of the case's named regions for foamMultiRun).
 static void dmrRunFreshRedistribute
 (
     Time& runTime,
-    const std::string& timeName
+    const std::string& timeName,
+    const word& regionName
 )
 {
-    const fileName meshSubDir(polyMesh::meshSubDir);
+    fileName meshSubDir;
+    if (regionName == polyMesh::defaultRegion)
+    {
+        meshSubDir = polyMesh::meshSubDir;
+    }
+    else
+    {
+        meshSubDir = regionName / polyMesh::meshSubDir;
+    }
+
     const fileName masterInstDir =
         runTime.findInstance(meshSubDir, "points");
 
@@ -503,7 +516,7 @@ static void dmrRunFreshRedistribute
     (
         IOobject
         (
-            polyMesh::defaultRegion,
+            regionName,
             masterInstDir,
             runTime,
             IOobject::MUST_READ,
@@ -545,6 +558,24 @@ static void dmrRunFreshRedistribute
     dmrLoadFields(mesh, allObjects, surfSphereTensors);
     dmrLoadFields(mesh, allObjects, surfSymmTensors);
     dmrLoadFields(mesh, allObjects, surfTensors);
+
+    // Point fields (e.g. pointDisplacement on moving meshes). Their mesh
+    // type is pointMesh, not fvMesh, so they load against pointMesh::New.
+    // fvMeshDistribute maps every field registered on the mesh, so these
+    // must be loaded (and thereby registered) before distribute() runs.
+    pointMesh& pMesh = const_cast<pointMesh&>(pointMesh::New(mesh));
+
+    PtrList<pointScalarField>          pointScalars;
+    PtrList<pointVectorField>          pointVectors;
+    PtrList<pointSphericalTensorField> pointSphereTensors;
+    PtrList<pointSymmTensorField>      pointSymmTensors;
+    PtrList<pointTensorField>          pointTensors;
+
+    dmrLoadFields(pMesh, allObjects, pointScalars);
+    dmrLoadFields(pMesh, allObjects, pointVectors);
+    dmrLoadFields(pMesh, allObjects, pointSphereTensors);
+    dmrLoadFields(pMesh, allObjects, pointSymmTensors);
+    dmrLoadFields(pMesh, allObjects, pointTensors);
 
     fvMeshDistribute(mesh).distribute(finalDecomp);
 
@@ -609,7 +640,25 @@ static void dmrShrinkInPlace
 
     MPI_Barrier(MPI_COMM_WORLD);
 
-    dmrRunFreshRedistribute(runTime, timeName);
+    // Snapshot the live region names BEFORE the redistribute loop. Each
+    // call to dmrRunFreshRedistribute constructs a non-registered fvMesh
+    // that does not appear in the registry, so iterating the live mesh
+    // table once up front avoids any iterator-vs-mutation hazard.
+    wordList regionNames;
+    {
+        HashTable<fvMesh*> liveRegions(runTime.lookupClass<fvMesh>());
+        regionNames.setSize(liveRegions.size());
+        label i = 0;
+        forAllIter(HashTable<fvMesh*>, liveRegions, iter)
+        {
+            regionNames[i++] = iter()->name();
+        }
+    }
+
+    forAll(regionNames, i)
+    {
+        dmrRunFreshRedistribute(runTime, timeName, regionNames[i]);
+    }
 
     MPI_Barrier(MPI_COMM_WORLD);
 
@@ -621,7 +670,12 @@ static void dmrShrinkInPlace
         }
         ::sync();
 
-        dmrLifecycleLog(casePath, "Shrink redistribute complete.");
+        dmrLifecycleLog
+        (
+            casePath,
+            "Shrink redistribute complete ("
+          + std::to_string(regionNames.size()) + " region(s))."
+        );
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -962,8 +1016,15 @@ void dmrFinalize(const std::string& casePath, bool allRegions)
     {
         dmrLifecycleLog(casePath, "Final reconstruction to serial...");
 
+        // -latestTime (not -newTimes): with in-process SHRINK each
+        // reconfiguration writes a new processor-side polyMesh at the SHRINK
+        // time, which trips reconstructPar's mesh-evolution check (bug
+        // 0004368-style) when it tries to chain through the whole time
+        // sequence. Reconstructing the final time is enough for post-run
+        // analysis; intermediate serial snapshots can be produced manually
+        // with `reconstructPar -time T` if needed.
         std::string cmd =
-            "reconstructPar -newTimes -rm -case '" + casePath + "'";
+            "reconstructPar -latestTime -rm -case '" + casePath + "'";
         if (allRegions) cmd += " -allRegions";
 
         // Soft fail: the simulation has already finished, so on

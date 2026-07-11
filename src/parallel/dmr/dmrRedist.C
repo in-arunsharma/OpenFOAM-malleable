@@ -34,6 +34,10 @@ License
 #include "volFields.H"
 #include "surfaceFields.H"
 #include "pointFields.H"
+#include "fvMeshTools.H"
+#include "internalPolyPatch.H"
+#include "processorPolyPatch.H"
+#include "PstreamReduceOps.H"
 
 extern "C"
 {
@@ -577,7 +581,95 @@ static void dmrRunFreshRedistribute
     dmrLoadFields(pMesh, allObjects, pointSymmTensors);
     dmrLoadFields(pMesh, allObjects, pointTensors);
 
+    // fvMeshDistribute requires an internal-type patch when fields are
+    // registered (findInternalPatch). The on-disk case must not carry
+    // one (it clashes with the non-conformal solver machinery), so add
+    // a transient zero-size internalPolyPatch to this private mesh copy
+    // after field loading (fvMesh::addPatch extends every registered
+    // field's boundary) and remove it again before writing. Same
+    // pattern as createNonConformalCouples' patch insertion.
+    const word dmrPatchName("dmrTransientInternal");
+    bool dmrAddedPatch = false;
+    {
+        const polyBoundaryMesh& pbm = mesh.poly().boundary();
+
+        bool hasInternal = false;
+        forAll(pbm, patchi)
+        {
+            if (isA<internalPolyPatch>(pbm[patchi]))
+            {
+                hasInternal = true;
+                break;
+            }
+        }
+
+        if (!hasInternal)
+        {
+            // Zero-size, positioned where fvMeshTools::addPatch inserts
+            // it: before the first processor patch, or at the end.
+            label start = mesh.nFaces();
+            forAll(pbm, patchi)
+            {
+                if (isA<processorPolyPatch>(pbm[patchi]))
+                {
+                    start = pbm[patchi].start();
+                    break;
+                }
+            }
+
+            fvMeshTools::addPatch
+            (
+                mesh,
+                internalPolyPatch
+                (
+                    dmrPatchName,
+                    0,
+                    start,
+                    pbm.size(),
+                    pbm
+                )
+            );
+            dmrAddedPatch = true;
+        }
+    }
+
     fvMeshDistribute(mesh).distribute(finalDecomp);
+
+    // Remove the transient patch before writing. It must be empty
+    // again (exposed faces are re-homed onto processor patches by the
+    // end of distribute); the check is reduced so all ranks take the
+    // same branch, since reorderPatches is collective.
+    if (dmrAddedPatch)
+    {
+        const polyBoundaryMesh& pbm = mesh.poly().boundary();
+        const label patchi = pbm.findIndex(dmrPatchName);
+
+        label globalSize = patchi == -1 ? 0 : pbm[patchi].size();
+        reduce(globalSize, sumOp<label>());
+
+        if (patchi != -1 && globalSize == 0)
+        {
+            labelList oldToNew(pbm.size());
+            label newi = 0;
+            forAll(oldToNew, i)
+            {
+                if (i != patchi)
+                {
+                    oldToNew[i] = newi++;
+                }
+            }
+            oldToNew[patchi] = newi;
+
+            fvMeshTools::reorderPatches(mesh, oldToNew, newi, true);
+        }
+        else if (patchi != -1)
+        {
+            WarningInFunction
+                << "Transient internal patch holds " << globalSize
+                << " faces after distribute; keeping it in the written"
+                << " mesh." << endl;
+        }
+    }
 
     mesh.setInstance(timeName);
     mesh.write();

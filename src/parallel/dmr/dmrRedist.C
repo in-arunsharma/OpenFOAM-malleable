@@ -978,6 +978,18 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
                 nonProci,
                 false
             );
+
+            // fvMeshSubset::interpolate on a point field lazily
+            // constructs the subset mesh's pointMesh, whose
+            // constructor (pointBoundaryMesh::calcGeometry) is
+            // COLLECTIVE — but interpolate is only called on the
+            // master (zero-field sends), deadlocking every other rank
+            // in the following scatter. Stock redistributePar has the
+            // same defect whenever point fields are present (gdb
+            // stacks, movingCone, 2026-07-12). Constructing the
+            // pointMesh collectively up front makes the master-only
+            // path a pure cache hit.
+            (void)pointMesh::New(subsetterPtr().subMesh());
         }
 
         IOobjectList allObjects(mesh, runTime.name());

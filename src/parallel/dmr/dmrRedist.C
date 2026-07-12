@@ -38,6 +38,9 @@ License
 #include "internalPolyPatch.H"
 #include "processorPolyPatch.H"
 #include "PstreamReduceOps.H"
+#include "fvMeshSubset.H"
+#include "loadOrCreateMesh.H"
+#include "HashSet.H"
 
 extern "C"
 {
@@ -305,6 +308,15 @@ static std::string dmrLatestTimeName(const std::string& casePath)
 }
 
 
+// Largest numeric time in processor0/. In the all-parallel pipeline
+// checkpoints exist only in the processor layout (no serial time
+// dirs), so this — not dmrLatestTimeName — names the restart time.
+static std::string dmrLatestProcTimeName(const std::string& casePath)
+{
+    return dmrLatestTimeName(casePath + "/processor0");
+}
+
+
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 // Reconfiguration direction reported by DMR analytics.
@@ -488,6 +500,192 @@ static void dmrLoadFields
 }
 
 
+// Grow-side field loader: ranks without a mesh have no field files, so
+// the master interpolates each field to zero size (via the subsetter)
+// and sends it to them, keeping the field set identical on every rank
+// before fvMeshDistribute runs. Mirrors redistributePar.C's readFields.
+template<class GeoField>
+static void dmrLoadFieldsGrow
+(
+    const boolList& haveMesh,
+    const typename GeoField::Mesh& mesh,
+    const autoPtr<fvMeshSubset>& subsetterPtr,
+    IOobjectList& allObjects,
+    PtrList<GeoField>& fields
+)
+{
+    IOobjectList objects(allObjects.lookupClass(GeoField::typeName));
+
+    wordList masterNames(objects.toc());
+    Pstream::scatter(masterNames);
+
+    if (haveMesh[Pstream::myProcNo()] && objects.toc() != masterNames)
+    {
+        FatalErrorInFunction
+            << "differing fields of type " << GeoField::typeName
+            << " on processors." << endl
+            << "Master has:" << masterNames << endl
+            << Pstream::myProcNo() << " has:" << objects.toc()
+            << abort(FatalError);
+    }
+
+    fields.setSize(masterNames.size());
+
+    if (Pstream::master())
+    {
+        forAll(masterNames, i)
+        {
+            IOobject& io = objects[masterNames[i]];
+            io.writeOpt() = IOobject::AUTO_WRITE;
+
+            fields.set(i, new GeoField(io, mesh));
+
+            // Zero-sized copy to every rank without a mesh
+            if (subsetterPtr.valid())
+            {
+                tmp<GeoField> tsubfld = subsetterPtr().interpolate(fields[i]);
+
+                for (label proci = 1; proci < Pstream::nProcs(); proci++)
+                {
+                    if (!haveMesh[proci])
+                    {
+                        OPstream toProc(Pstream::commsTypes::blocking, proci);
+                        toProc<< tsubfld();
+                    }
+                }
+            }
+        }
+    }
+    else if (!haveMesh[Pstream::myProcNo()])
+    {
+        forAll(masterNames, i)
+        {
+            IPstream fromMaster
+            (
+                Pstream::commsTypes::blocking,
+                Pstream::masterNo()
+            );
+            dictionary fieldDict(fromMaster);
+
+            fields.set
+            (
+                i,
+                new GeoField
+                (
+                    IOobject
+                    (
+                        masterNames[i],
+                        mesh.db().time().name(),
+                        mesh.db(),
+                        IOobject::NO_READ,
+                        IOobject::AUTO_WRITE
+                    ),
+                    mesh,
+                    fieldDict
+                )
+            );
+        }
+    }
+    else
+    {
+        forAll(masterNames, i)
+        {
+            IOobject& io = objects[masterNames[i]];
+            io.writeOpt() = IOobject::AUTO_WRITE;
+
+            fields.set(i, new GeoField(io, mesh));
+        }
+    }
+}
+
+
+// fvMeshDistribute requires an internal-type patch when fields are
+// registered (findInternalPatch). The on-disk case must not carry one
+// (it clashes with the non-conformal solver machinery), so a transient
+// zero-size internalPolyPatch is added to the private mesh copy after
+// field loading (fvMesh::addPatch extends every registered field's
+// boundary) and removed again before writing. Same insertion pattern
+// as createNonConformalCouples.
+static const word dmrTransientPatchName("dmrTransientInternal");
+
+static bool dmrAddTransientInternalPatch(fvMesh& mesh)
+{
+    const polyBoundaryMesh& pbm = mesh.poly().boundary();
+
+    forAll(pbm, patchi)
+    {
+        if (isA<internalPolyPatch>(pbm[patchi]))
+        {
+            return false;
+        }
+    }
+
+    // Zero-size, positioned where fvMeshTools::addPatch inserts it:
+    // before the first processor patch, or at the end.
+    label start = mesh.nFaces();
+    forAll(pbm, patchi)
+    {
+        if (isA<processorPolyPatch>(pbm[patchi]))
+        {
+            start = pbm[patchi].start();
+            break;
+        }
+    }
+
+    fvMeshTools::addPatch
+    (
+        mesh,
+        internalPolyPatch
+        (
+            dmrTransientPatchName,
+            0,
+            start,
+            pbm.size(),
+            pbm
+        )
+    );
+
+    return true;
+}
+
+
+// Remove the transient patch before writing. It must be empty again
+// (exposed faces are re-homed onto processor patches by the end of
+// distribute); the check is reduced so all ranks take the same branch,
+// since reorderPatches is collective.
+static void dmrRemoveTransientInternalPatch(fvMesh& mesh)
+{
+    const polyBoundaryMesh& pbm = mesh.poly().boundary();
+    const label patchi = pbm.findIndex(dmrTransientPatchName);
+
+    label globalSize = patchi == -1 ? 0 : pbm[patchi].size();
+    reduce(globalSize, sumOp<label>());
+
+    if (patchi != -1 && globalSize == 0)
+    {
+        labelList oldToNew(pbm.size());
+        label newi = 0;
+        forAll(oldToNew, i)
+        {
+            if (i != patchi)
+            {
+                oldToNew[i] = newi++;
+            }
+        }
+        oldToNew[patchi] = newi;
+
+        fvMeshTools::reorderPatches(mesh, oldToNew, newi, true);
+    }
+    else if (patchi != -1)
+    {
+        WarningInFunction
+            << "Transient internal patch holds " << globalSize
+            << " faces after distribute; keeping it in the written"
+            << " mesh." << endl;
+    }
+}
+
+
 // Construct a fresh fvMesh from disk (non-registered, so it doesn't clash
 // with the live mesh still in runTime's registry), load every field type
 // into it, run fvMeshDistribute, and write the new layout. Mirrors the
@@ -581,98 +779,354 @@ static void dmrRunFreshRedistribute
     dmrLoadFields(pMesh, allObjects, pointSymmTensors);
     dmrLoadFields(pMesh, allObjects, pointTensors);
 
-    // fvMeshDistribute requires an internal-type patch when fields are
-    // registered (findInternalPatch). The on-disk case must not carry
-    // one (it clashes with the non-conformal solver machinery), so add
-    // a transient zero-size internalPolyPatch to this private mesh copy
-    // after field loading (fvMesh::addPatch extends every registered
-    // field's boundary) and remove it again before writing. Same
-    // pattern as createNonConformalCouples' patch insertion.
-    const word dmrPatchName("dmrTransientInternal");
-    bool dmrAddedPatch = false;
-    {
-        const polyBoundaryMesh& pbm = mesh.poly().boundary();
-
-        bool hasInternal = false;
-        forAll(pbm, patchi)
-        {
-            if (isA<internalPolyPatch>(pbm[patchi]))
-            {
-                hasInternal = true;
-                break;
-            }
-        }
-
-        if (!hasInternal)
-        {
-            // Zero-size, positioned where fvMeshTools::addPatch inserts
-            // it: before the first processor patch, or at the end.
-            label start = mesh.nFaces();
-            forAll(pbm, patchi)
-            {
-                if (isA<processorPolyPatch>(pbm[patchi]))
-                {
-                    start = pbm[patchi].start();
-                    break;
-                }
-            }
-
-            fvMeshTools::addPatch
-            (
-                mesh,
-                internalPolyPatch
-                (
-                    dmrPatchName,
-                    0,
-                    start,
-                    pbm.size(),
-                    pbm
-                )
-            );
-            dmrAddedPatch = true;
-        }
-    }
+    const bool addedPatch = dmrAddTransientInternalPatch(mesh);
 
     fvMeshDistribute(mesh).distribute(finalDecomp);
 
-    // Remove the transient patch before writing. It must be empty
-    // again (exposed faces are re-homed onto processor patches by the
-    // end of distribute); the check is reduced so all ranks take the
-    // same branch, since reorderPatches is collective.
-    if (dmrAddedPatch)
+    if (addedPatch)
     {
-        const polyBoundaryMesh& pbm = mesh.poly().boundary();
-        const label patchi = pbm.findIndex(dmrPatchName);
-
-        label globalSize = patchi == -1 ? 0 : pbm[patchi].size();
-        reduce(globalSize, sumOp<label>());
-
-        if (patchi != -1 && globalSize == 0)
-        {
-            labelList oldToNew(pbm.size());
-            label newi = 0;
-            forAll(oldToNew, i)
-            {
-                if (i != patchi)
-                {
-                    oldToNew[i] = newi++;
-                }
-            }
-            oldToNew[patchi] = newi;
-
-            fvMeshTools::reorderPatches(mesh, oldToNew, newi, true);
-        }
-        else if (patchi != -1)
-        {
-            WarningInFunction
-                << "Transient internal patch holds " << globalSize
-                << " faces after distribute; keeping it in the written"
-                << " mesh." << endl;
-        }
+        dmrRemoveTransientInternalPatch(mesh);
     }
 
     mesh.setInstance(timeName);
     mesh.write();
+}
+
+
+// Sweep the fvMeshStitcher caches (fvMesh/polyFaces, a label surface
+// field fvMeshDistribute cannot transport) from this rank's processor
+// directory, at both the given time and the constant instance. The
+// cache is derivable: when absent (READ_IF_PRESENT), the stitcher
+// reconnects from geometry at the next startup. Must run only after
+// ALL regions have been redistributed: sibling regions re-read each
+// other's caches through mapped/NCC patches during fresh-load, so a
+// per-region sweep starves the next region's construction. No-op for
+// non-NCC cases.
+static void dmrSweepStitchCaches
+(
+    Time& runTime,
+    const std::string& timeName,
+    const wordList& regionNames
+)
+{
+    forAll(regionNames, i)
+    {
+        const fileName regionDir =
+            regionNames[i] == polyMesh::defaultRegion
+          ? fileName(".")
+          : fileName(regionNames[i]);
+
+        const fileName cacheT =
+            runTime.path()/timeName/regionDir/"fvMesh";
+        const fileName cacheC =
+            runTime.path()/runTime.constant()/regionDir/"fvMesh";
+
+        if (isDir(cacheT)) rmDir(cacheT);
+        if (isDir(cacheC)) rmDir(cacheC);
+    }
+}
+
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+void dmrGrowRedistribute(Time& runTime, bool allRegions)
+{
+    // Only a process generation that follows a DMR GROW reconfiguration
+    // has work to do here. The reconfig count guards fresh launches
+    // against stale meta files; the meta is renamed once consumed.
+    if (dmr_get_reconfig_count() <= 0)
+    {
+        return;
+    }
+
+    const std::string casePath = runTime.globalPath();
+
+    DmrWorldInfo world;
+    if (!dmrReadWorldMeta(casePath, world) || world.dir != DmrDir::Grow)
+    {
+        return;
+    }
+
+    const std::string timeName = runTime.name();
+
+    if (Pstream::master())
+    {
+        dmrLifecycleLog
+        (
+            casePath,
+            "Grow redistribute at t=" + timeName
+          + ": inflating " + std::to_string(world.nOld)
+          + "-way layout to " + std::to_string(world.nNew) + " ranks."
+        );
+    }
+
+    // Not all ranks have meshes yet; master-only reading cannot work.
+    regIOobject::fileModificationChecking = regIOobject::timeStamp;
+
+    wordList regionNames;
+    if (allRegions)
+    {
+        const std::string pattern =
+            casePath + "/processor0/constant/*/polyMesh";
+        glob_t g;
+        if (glob(pattern.c_str(), GLOB_ONLYDIR, nullptr, &g) == 0)
+        {
+            regionNames.setSize(g.gl_pathc);
+            forAll(regionNames, i)
+            {
+                const fileName p(g.gl_pathv[i]);
+                regionNames[i] = p.path().name();
+            }
+            globfree(&g);
+        }
+    }
+    else
+    {
+        regionNames = wordList(1, word(polyMesh::defaultRegion));
+    }
+
+    forAll(regionNames, regioni)
+    {
+        const word& regionName = regionNames[regioni];
+
+        fileName meshSubDir;
+        if (regionName == polyMesh::defaultRegion)
+        {
+            meshSubDir = polyMesh::meshSubDir;
+        }
+        else
+        {
+            meshSubDir = regionName / polyMesh::meshSubDir;
+        }
+
+        // Only the master is guaranteed to have the mesh on disk
+        fileName masterInstDir;
+        if (Pstream::master())
+        {
+            masterInstDir = runTime.findInstance(meshSubDir, "points");
+        }
+        Pstream::scatter(masterInstDir);
+
+        boolList haveMesh(Pstream::nProcs(), false);
+        haveMesh[Pstream::myProcNo()] =
+            isDir(runTime.path()/masterInstDir/meshSubDir);
+        Pstream::gatherList(haveMesh);
+        Pstream::scatterList(haveMesh);
+
+        autoPtr<fvMesh> meshPtr = loadOrCreateMesh
+        (
+            IOobject
+            (
+                regionName,
+                masterInstDir,
+                runTime,
+                IOobject::MUST_READ,
+                IOobject::AUTO_WRITE,
+                false
+            )
+        );
+        fvMesh& mesh = meshPtr();
+
+        // loadOrCreateMesh's dummy zones must never reach the written
+        // mesh: the unoriented dummyFaceZone FATALs in a later
+        // fvMeshDistribute zone sync (flipMap). The utility's own sync
+        // clears them, but they have been observed to survive into the
+        // write; purge by name. Dummies never coexist with real zones
+        // (the sync replaces them when real zones exist), so this is a
+        // no-op on every legitimate case.
+        if (mesh.faceZones().findIndex("dummyFaceZone") != -1)
+        {
+            Pout<< "DMR-GROW[r" << Pstream::myProcNo()
+                << "] purging dummy zones after loadOrCreateMesh" << endl;
+            mesh.pointZones().clear();
+            mesh.faceZones().clear();
+            mesh.cellZones().clear();
+        }
+
+        // Zero-cell subsetter so the master can send zero-sized fields
+        // to the ranks that have none (redistributePar.C pattern)
+        autoPtr<fvMeshSubset> subsetterPtr;
+
+        bool allHaveMesh = true;
+        forAll(haveMesh, proci)
+        {
+            if (!haveMesh[proci])
+            {
+                allHaveMesh = false;
+                break;
+            }
+        }
+
+        if (!allHaveMesh)
+        {
+            const polyBoundaryMesh& patches = mesh.poly().boundary();
+
+            label nonProci = -1;
+            forAll(patches, patchi)
+            {
+                if (isA<processorPolyPatch>(patches[patchi]))
+                {
+                    break;
+                }
+                nonProci++;
+            }
+
+            subsetterPtr.reset(new fvMeshSubset(mesh));
+            subsetterPtr().setLargeCellSubset
+            (
+                labelHashSet(0),
+                nonProci,
+                false
+            );
+        }
+
+        IOobjectList allObjects(mesh, runTime.name());
+
+        PtrList<volScalarField>              volScalars;
+        PtrList<volVectorField>              volVectors;
+        PtrList<volSphericalTensorField>     volSphereTensors;
+        PtrList<volSymmTensorField>          volSymmTensors;
+        PtrList<volTensorField>              volTensors;
+        PtrList<surfaceScalarField>          surfScalars;
+        PtrList<surfaceVectorField>          surfVectors;
+        PtrList<surfaceSphericalTensorField> surfSphereTensors;
+        PtrList<surfaceSymmTensorField>      surfSymmTensors;
+        PtrList<surfaceTensorField>          surfTensors;
+
+        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, volScalars);
+        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, volVectors);
+        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, volSphereTensors);
+        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, volSymmTensors);
+        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, volTensors);
+        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, surfScalars);
+        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, surfVectors);
+        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, surfSphereTensors);
+        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, surfSymmTensors);
+        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, surfTensors);
+
+        pointMesh& pMesh = const_cast<pointMesh&>(pointMesh::New(mesh));
+
+        PtrList<pointScalarField>          pointScalars;
+        PtrList<pointVectorField>          pointVectors;
+        PtrList<pointSphericalTensorField> pointSphereTensors;
+        PtrList<pointSymmTensorField>      pointSymmTensors;
+        PtrList<pointTensorField>          pointTensors;
+
+        dmrLoadFieldsGrow(haveMesh, pMesh, subsetterPtr, allObjects, pointScalars);
+        dmrLoadFieldsGrow(haveMesh, pMesh, subsetterPtr, allObjects, pointVectors);
+        dmrLoadFieldsGrow(haveMesh, pMesh, subsetterPtr, allObjects, pointSphereTensors);
+        dmrLoadFieldsGrow(haveMesh, pMesh, subsetterPtr, allObjects, pointSymmTensors);
+        dmrLoadFieldsGrow(haveMesh, pMesh, subsetterPtr, allObjects, pointTensors);
+
+        const bool addedPatch = dmrAddTransientInternalPatch(mesh);
+
+        autoPtr<decompositionMethod> distributor
+        (
+            decompositionMethod::NewDistributor
+            (
+                decompositionMethod::decomposeParDict(runTime)
+            )
+        );
+        const labelList finalDecomp =
+            distributor().decompose(mesh, mesh.cellCentres());
+
+        fvMeshDistribute(mesh).distribute(finalDecomp);
+
+        if (addedPatch)
+        {
+            dmrRemoveTransientInternalPatch(mesh);
+        }
+
+        // Second purge site: catches dummies resurrected inside
+        // distribute (zone merge across ranks).
+        if (mesh.faceZones().findIndex("dummyFaceZone") != -1)
+        {
+            Pout<< "DMR-GROW[r" << Pstream::myProcNo()
+                << "] purging dummy zones after distribute" << endl;
+            mesh.pointZones().clear();
+            mesh.faceZones().clear();
+            mesh.cellZones().clear();
+        }
+
+        mesh.setInstance(timeName);
+        mesh.write();
+
+        Pout<< "DMR-GROW[r" << Pstream::myProcNo()
+            << "] region '" << regionName
+            << "' masterInstDir=" << masterInstDir
+            << " wrote mesh at " << timeName.c_str() << endl;
+
+        // If the in-memory zone lists are empty, any *Zones files at
+        // the write instance are stale leftovers (the dummy mesh from
+        // loadOrCreateMesh writes its dummy zones into the same dir
+        // when the staged instance coincides with the write time, and
+        // its cleanup does not always take them out). An unoriented
+        // dummyFaceZone read back later FATALs in fvMeshDistribute.
+        if
+        (
+            mesh.pointZones().empty()
+         && mesh.faceZones().empty()
+         && mesh.cellZones().empty()
+        )
+        {
+            const fileName meshDir =
+                runTime.path()/timeName/meshSubDir;
+
+            rm(meshDir/"pointZones");
+            rm(meshDir/"faceZones");
+            rm(meshDir/"cellZones");
+        }
+
+        // loadOrCreateMesh wrote a dummy zero-cell mesh (with dummy
+        // point/face/cell zones) at the staged instance on the ranks
+        // that had no data. The real mesh now lives at timeName, but
+        // the dummy files persist and a later fresh-load's zone
+        // findInstance walks back into them (unoriented dummyFaceZone
+        // FATALs in fvMeshDistribute's zone sync). Remove them; if the
+        // staged instance IS the write time, remove only the dummy
+        // zone files beside the real mesh.
+        if (!haveMesh[Pstream::myProcNo()])
+        {
+            const fileName dummyDir =
+                runTime.path()/masterInstDir/meshSubDir;
+
+            if (fileName(masterInstDir) != fileName(timeName))
+            {
+                if (isDir(dummyDir)) rmDir(dummyDir);
+            }
+            else
+            {
+                rm(dummyDir/"pointZones");
+                rm(dummyDir/"faceZones");
+                rm(dummyDir/"cellZones");
+            }
+        }
+    }
+
+    dmrSweepStitchCaches(runTime, timeName, regionNames);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (Pstream::master())
+    {
+        // Consume the meta so a later fresh launch of this case (or the
+        // next generation) cannot mistake it for an in-flight grow
+        std::rename
+        (
+            (casePath + "/log.dmr/.world.meta").c_str(),
+            (casePath + "/log.dmr/.world.meta.done").c_str()
+        );
+        ::sync();
+
+        dmrLifecycleLog
+        (
+            casePath,
+            "Grow redistribute complete ("
+          + std::to_string(regionNames.size()) + " region(s))."
+        );
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 
@@ -752,6 +1206,8 @@ static void dmrShrinkInPlace
         dmrRunFreshRedistribute(runTime, timeName, regionNames[i]);
     }
 
+    dmrSweepStitchCaches(runTime, timeName, regionNames);
+
     MPI_Barrier(MPI_COMM_WORLD);
 
     if (Pstream::master())
@@ -788,8 +1244,41 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
         return;
     }
 
-    // GROW / Unknown: legacy reconstructPar path. Replaced by an
-    // in-process redistribute on the NEW group in Phase 3.
+    if (worldOk && world.dir == DmrDir::Grow)
+    {
+        // The NEW group has the max(N_old, N_new) ranks, so the data
+        // move happens there (dmrGrowRedistribute, hooked after
+        // createTime). The dying group only flushes its state.
+        runTime.writeNow();
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        if (Pstream::master())
+        {
+            const std::string casePath = runTime.globalPath();
+            const std::string timeName = runTime.name();
+
+            dmrLifecycleLog
+            (
+                casePath,
+                "Checkpoint at t=" + timeName
+              + (isDmrForced ? " (DMR-forced)" : " (writeInterval)")
+            );
+            dmrWriteWorldMeta(casePath, world);
+            dmrLifecycleLog
+            (
+                casePath,
+                "Reconfig GROW: N_old=" + std::to_string(world.nOld)
+              + " -> N_new=" + std::to_string(world.nNew)
+              + " (redistribute deferred to the new group)."
+            );
+            ::sync();
+        }
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        return;
+    }
+
+    // Unknown direction: legacy reconstructPar path (safety net).
     runTime.writeNow();
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -1018,6 +1507,14 @@ void dmrRestart(const std::string& casePath, bool allRegions)
             "decomposer", "scotch"
         );
 
+        // NewDistributor (used by the in-process redistributes) reads
+        // its own 'distributor' key, separate from 'decomposer'.
+        dmrUpdateDictEntry
+        (
+            casePath, "system/decomposeParDict",
+            "distributor", "scotch"
+        );
+
         dmrUpdateDictEntry
         (
             casePath, "system/controlDict",
@@ -1037,6 +1534,15 @@ void dmrRestart(const std::string& casePath, bool allRegions)
             (
                 casePath,
                 "Shrink restart: data already in N_new processor layout."
+            );
+        }
+        else if (worldOk && world.dir == DmrDir::Grow)
+        {
+            dmrLifecycleLog
+            (
+                casePath,
+                "Grow restart: staging empty time dirs on the new ranks;"
+                " redistribute runs in the solver hook."
             );
         }
         else
@@ -1089,6 +1595,35 @@ void dmrRestart(const std::string& casePath, bool allRegions)
             }
 
             dmrLifecycleLog(casePath, "Decomposition complete.");
+        }
+    }
+
+    // GROW pre-step, collective: ranks beyond the old world have no
+    // processor directory yet, and Time::setControls FATALs unless
+    // every rank resolves the same startFrom-latestTime instant. Each
+    // new rank stages its processor dir with an EMPTY restart-time
+    // dir; mesh and fields arrive later via dmrGrowRedistribute.
+    if (worldOk && world.dir == DmrDir::Grow)
+    {
+        const std::string t = dmrLatestProcTimeName(casePath);
+
+        if (t.empty())
+        {
+            std::fprintf
+            (
+                stderr,
+                "DMR: FATAL — no time directories in '%s/processor0'.\n",
+                casePath.c_str()
+            );
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        if (myRank >= world.nOld)
+        {
+            Foam::mkDir
+            (
+                casePath + "/processor" + std::to_string(myRank) + "/" + t
+            );
         }
     }
 

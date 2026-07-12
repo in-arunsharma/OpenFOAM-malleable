@@ -87,6 +87,10 @@ int main(int argc, char *argv[])
     #include "setRootCase.H"
     #include "createTime.H"
 
+    #ifdef FOAM_USE_DMR
+    #include "dmrGrow.H"
+    #endif
+
     // Read the solverName from the optional solver entry in controlDict
     word solverName
     (

@@ -62,6 +62,15 @@ void dmrCheckpoint(Time& runTime, bool allRegions = false);
 //  evolves the topology forward correctly.
 void dmrRestart(const std::string& casePath, bool allRegions = false);
 
+//- NEW-group hook, included between createTime.H and createMesh.H
+//  (dmrGrow.H). After a GROW reconfiguration the checkpoint exists
+//  only in the old, smaller processor layout; this redistributes it
+//  in-process to the current world size via fvMeshDistribute
+//  (loadOrCreateMesh fabricates zero-cell meshes on the ranks that
+//  have no data), replacing the serial decomposePar. No-op unless
+//  this process generation follows a DMR GROW reconfiguration.
+void dmrGrowRedistribute(Time& runTime, bool allRegions = false);
+
 //- After the time loop ends: a final reconstructPar -newTimes -rm,
 //  then sweep any remaining DMR-forced checkpoint sentinels.
 //  Uses WarningInFunction (not MPI_Abort) on failure.

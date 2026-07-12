@@ -105,6 +105,10 @@ int main(int argc, char *argv[])
     #include "setRootCase.H"
     #include "createTime.H"
 
+    #ifdef FOAM_USE_DMR
+    #include "dmrGrow.H"
+    #endif
+
     // Create the region meshes and solvers
     regionSolvers solvers(runTime);
 

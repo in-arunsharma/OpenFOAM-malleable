@@ -41,6 +41,7 @@ License
 #include "fvMeshSubset.H"
 #include "loadOrCreateMesh.H"
 #include "HashSet.H"
+#include "pointIOField.H"
 
 extern "C"
 {
@@ -599,6 +600,270 @@ static void dmrLoadFieldsGrow
 }
 
 
+// Reference-configuration transport. points0MotionSolver and its
+// family (solidBodyMeshMotion, the displacement solvers, the
+// interpolator mover) rebuild their reference points at startup via
+// readPoints0: a points0 field at a case-root time instance if one
+// exists, else constant/<region>/polyMesh/points. Neither survives a
+// redistribution by itself: the constant mesh stays in the source
+// layout, and does not exist at all on ranks added by a grow, so the
+// restarted solver would read a reference of the wrong size
+// (points0MotionSolver's size check FATALs). Resolve the reference on
+// the source layout the same way readPoints0 does (checkpoint-carried
+// field, else newest time-instance points0 at this region, else
+// per-rank constant points, valid precisely when readPoints0's own
+// fallback is) and register it on the mesh so fvMeshDistribute
+// transports it with the other point fields. dmrWritePoints0Constant
+// then re-creates the constant points file in the new layout: the
+// artefact a serial decomposePar would have produced, and the only
+// channel readPoints0's region-blind time search can see for
+// non-default regions.
+static void dmrEnsurePoints0
+(
+    Time& runTime,
+    fvMesh& mesh,
+    pointMesh& pMesh,
+    const boolList& haveMesh,                   // empty: all ranks have data
+    const autoPtr<fvMeshSubset>& subsetterPtr,  // unset: all ranks have data
+    const word& regionName,
+    PtrList<pointVectorField>& pointVectors
+)
+{
+    forAll(pointVectors, i)
+    {
+        if (pointVectors[i].name() == "points0")
+        {
+            // The checkpoint carries it; already loaded and transported
+            return;
+        }
+    }
+
+    const fileName regionDir =
+        regionName == polyMesh::defaultRegion
+      ? fileName(".")
+      : fileName(regionName);
+
+    // Only motion cases carry a reference configuration. The master
+    // decides. The dictionary lives at CASE level only: decomposePar
+    // copies meshes and fields into processor trees, never system or
+    // constant dictionaries, so probing runTime.path() (the processor
+    // directory) always misses (engine, 2026-07-13)
+    bool moving = false;
+    word inst;
+    if (Pstream::master())
+    {
+        moving = isFile
+        (
+            fileName(runTime.globalPath())
+           /runTime.constant()/regionDir/"dynamicMeshDict"
+        );
+
+        if (moving)
+        {
+            const instantList times = runTime.times();
+            forAllReverse(times, i)
+            {
+                if (times[i].name() == runTime.constant()) continue;
+
+                if (isFile(runTime.path()/times[i].name()/regionDir/"points0"))
+                {
+                    inst = times[i].name();
+                    break;
+                }
+            }
+        }
+    }
+    Pstream::scatter(moving);
+    Pstream::scatter(inst);
+
+    if (!moving)
+    {
+        return;
+    }
+
+    const bool have =
+        haveMesh.empty() || haveMesh[Pstream::myProcNo()];
+
+    autoPtr<pointVectorField> p0;
+
+    if (inst != word::null)
+    {
+        // A previous write (a topo-change or an earlier reconfiguration)
+        // left a points0 field in the current source layout: load it,
+        // AUTO_WRITE so the rewritten copy keeps readPoints0's
+        // time-instance branch working after the reconfiguration
+        if (Pstream::master())
+        {
+            p0.reset
+            (
+                new pointVectorField
+                (
+                    IOobject
+                    (
+                        "points0",
+                        inst,
+                        mesh,
+                        IOobject::MUST_READ,
+                        IOobject::AUTO_WRITE,
+                        true
+                    ),
+                    pMesh
+                )
+            );
+
+            if (subsetterPtr.valid())
+            {
+                tmp<pointVectorField> tsubfld =
+                    subsetterPtr().interpolate(p0());
+
+                for (label proci = 1; proci < Pstream::nProcs(); proci++)
+                {
+                    if (!haveMesh[proci])
+                    {
+                        OPstream toProc(Pstream::commsTypes::blocking, proci);
+                        toProc<< tsubfld();
+                    }
+                }
+            }
+        }
+        else if (!have)
+        {
+            IPstream fromMaster
+            (
+                Pstream::commsTypes::blocking,
+                Pstream::masterNo()
+            );
+            dictionary fieldDict(fromMaster);
+
+            p0.reset
+            (
+                new pointVectorField
+                (
+                    IOobject
+                    (
+                        "points0",
+                        runTime.name(),
+                        mesh,
+                        IOobject::NO_READ,
+                        IOobject::AUTO_WRITE,
+                        true
+                    ),
+                    pMesh,
+                    fieldDict
+                )
+            );
+        }
+        else
+        {
+            p0.reset
+            (
+                new pointVectorField
+                (
+                    IOobject
+                    (
+                        "points0",
+                        inst,
+                        mesh,
+                        IOobject::MUST_READ,
+                        IOobject::AUTO_WRITE,
+                        true
+                    ),
+                    pMesh
+                )
+            );
+        }
+    }
+    else
+    {
+        // First reconfiguration of the case: synthesise from the
+        // per-rank constant points (readPoints0's own fallback), which
+        // every data-carrying rank still has. NO_WRITE: transported in
+        // memory, persisted only through the constant dump
+        p0.reset
+        (
+            new pointVectorField
+            (
+                IOobject
+                (
+                    "points0",
+                    runTime.name(),
+                    mesh,
+                    IOobject::NO_READ,
+                    IOobject::NO_WRITE,
+                    true
+                ),
+                pMesh,
+                dimensionedVector(dimLength, Zero)
+            )
+        );
+
+        if (have)
+        {
+            pointIOField points
+            (
+                IOobject
+                (
+                    "points",
+                    runTime.constant(),
+                    polyMesh::meshSubDir,
+                    mesh,
+                    IOobject::MUST_READ,
+                    IOobject::NO_WRITE,
+                    false
+                )
+            );
+
+            if (points.size() != mesh.nPoints())
+            {
+                FatalErrorInFunction
+                    << "Region " << regionName << ": constant points ("
+                    << points.size() << ") do not match the mesh ("
+                    << mesh.nPoints() << " points) on processor "
+                    << Pstream::myProcNo()
+                    << "; cannot transport the motion reference"
+                    << exit(FatalError);
+            }
+
+            p0().primitiveFieldRef() = points;
+        }
+    }
+
+    pointVectors.append(p0.ptr());
+}
+
+
+// Re-create constant/<region>/polyMesh/points in the written layout
+// from the transported reference. Runs after mesh.write(); no-op when
+// dmrEnsurePoints0 did not register a reference
+static void dmrWritePoints0Constant(const fvMesh& mesh)
+{
+    if (!mesh.foundObject<pointVectorField>("points0"))
+    {
+        return;
+    }
+
+    const pointVectorField& p0 =
+        mesh.lookupObject<pointVectorField>("points0");
+
+    pointIOField points
+    (
+        IOobject
+        (
+            "points",
+            mesh.time().constant(),
+            polyMesh::meshSubDir,
+            mesh,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        p0.primitiveField()
+    );
+
+    points.write();
+}
+
+
 // fvMeshDistribute requires an internal-type patch when fields are
 // registered (findInternalPatch). The on-disk case must not carry one
 // (it clashes with the non-conformal solver machinery), so a transient
@@ -779,6 +1044,17 @@ static void dmrRunFreshRedistribute
     dmrLoadFields(pMesh, allObjects, pointSymmTensors);
     dmrLoadFields(pMesh, allObjects, pointTensors);
 
+    dmrEnsurePoints0
+    (
+        runTime,
+        mesh,
+        pMesh,
+        boolList(),
+        autoPtr<fvMeshSubset>(),
+        regionName,
+        pointVectors
+    );
+
     const bool addedPatch = dmrAddTransientInternalPatch(mesh);
 
     fvMeshDistribute(mesh).distribute(finalDecomp);
@@ -790,6 +1066,8 @@ static void dmrRunFreshRedistribute
 
     mesh.setInstance(timeName);
     mesh.write();
+
+    dmrWritePoints0Constant(mesh);
 }
 
 
@@ -823,7 +1101,172 @@ static void dmrSweepStitchCaches
 
         if (isDir(cacheT)) rmDir(cacheT);
         if (isDir(cacheC)) rmDir(cacheC);
+
+        // tetBasePtIs is the same class of derivable cache, with a
+        // sharper failure mode: a generation that ran sampling-type
+        // functionObjects allocates it, so its checkpoint writeNow
+        // WRITES it (polyMeshIO propagates writeOpt); the fresh-load
+        // re-reads it (READ_IF_PRESENT in the polyMesh ctor),
+        // fvMeshDistribute never remaps it (0 references), and
+        // mesh.write() re-emits STALE OLD-LAYOUT tet data — but only
+        // on the ranks that had data, so at restart those ranks skip
+        // the collective findFaceBasePts that the others enter:
+        // off-by-N collective desync (movingCone, 2026-07-13).
+        // Absent, every rank recomputes it collectively and
+        // consistently.
+        const fileName meshDirT =
+            runTime.path()/timeName/regionDir/"polyMesh";
+        const fileName meshDirC =
+            runTime.path()/runTime.constant()/regionDir/"polyMesh";
+
+        rm(meshDirT/"tetBasePtIs");
+        rm(meshDirC/"tetBasePtIs");
     }
+}
+
+
+// Swap-mesh transport (fvMeshTopoChangers::meshToMesh). The topo
+// changer reads constant/meshes/<meshTime>[/<region>]/polyMesh per
+// rank, lazily, at each swap time, and mesh().swap() makes the swap
+// mesh's decomposition BECOME the solver decomposition; after a
+// reconfiguration the pieces must therefore exist, complete, in the
+// current world size (ranks added by a grow have none, and after a
+// shrink the pieces beyond the new world size would silently drop
+// their cells at the next swap).
+//
+// The pieces are RE-DERIVED from the serial originals rather than
+// redistributed: constant/meshes/<t> at the CASE ROOT is static
+// reference data that survives every reconfiguration, so each rank
+// forks the stock `decomposePar -mesh <t> [-region <r>]` for a
+// round-robin share of the meshes, producing pieces for the current
+// world size (numberOfSubdomains was already rewritten for this
+// reconfiguration) that are byte-equivalent to the original case
+// preparation. Embarrassingly parallel across meshes; serial per
+// mesh, acceptable for read-only reference data.
+//
+// This replaces an fvMeshDistribute-based transport: distributing
+// the old pieces failed with "The ordering walk did not hit every
+// face exactly once" in processorPolyPatch::order on a checkMesh-
+// clean engine swap mesh (the merge of received pieces can leave the
+// two sides of a new processor interface with inconsistent edge
+// connectivity; upstream-report material, see doc 4).
+//
+// decomposePar's -force flag is NEVER used here: it removes whole
+// processor trees, including the redistributed solution. Stale
+// pieces are removed surgically instead.
+static void dmrRedistributeSwapMeshes(Time& runTime)
+{
+    const std::string casePath = runTime.globalPath();
+
+    // The master enumerates the SERIAL originals at the case root
+    wordList meshTimes;
+    wordList meshRegions;   // empty word: default-region layout
+    if (Pstream::master())
+    {
+        const fileName meshesDir =
+            fileName(casePath)/runTime.constant()/"meshes";
+
+        if (isDir(meshesDir))
+        {
+            const fileNameList times
+            (
+                readDir(meshesDir, fileType::directory)
+            );
+
+            DynamicList<word> ts;
+            DynamicList<word> rs;
+            forAll(times, i)
+            {
+                if (isDir(meshesDir/times[i]/polyMesh::meshSubDir))
+                {
+                    ts.append(word(times[i]));
+                    rs.append(word::null);
+                }
+                else
+                {
+                    const fileNameList regions
+                    (
+                        readDir(meshesDir/times[i], fileType::directory)
+                    );
+                    forAll(regions, j)
+                    {
+                        if
+                        (
+                            isDir
+                            (
+                                meshesDir/times[i]/regions[j]
+                               /polyMesh::meshSubDir
+                            )
+                        )
+                        {
+                            ts.append(word(times[i]));
+                            rs.append(word(regions[j]));
+                        }
+                    }
+                }
+            }
+
+            meshTimes.transfer(ts);
+            meshRegions.transfer(rs);
+        }
+    }
+    Pstream::scatter(meshTimes);
+    Pstream::scatter(meshRegions);
+
+    if (meshTimes.empty())
+    {
+        return;
+    }
+
+    // Master-serial, mirroring the thesis legacy path (rank 0 forks
+    // stock decomposePar per swap mesh). Concurrent forks across ranks
+    // race on the shared case directory (all read the processor-dir
+    // count and decomposeParDict); serialising on the master removes
+    // that hazard, and the swap meshes are small static reference data.
+    //
+    // decomposePar refuses ("Case is already decomposed with N domains")
+    // whenever the case-level processor* count differs from
+    // numberOfSubdomains. During a shrink the CALLER must therefore have
+    // already deleted the processor dirs beyond the new world size
+    // (dmrShrinkInPlace removes processor[nNew..nOld) before calling us),
+    // so the surviving count equals the just-rewritten numberOfSubdomains
+    // and the guard passes without -force (which would nuke the whole
+    // redistributed solution). Grow needs no such trim: the grow
+    // redistribute already populated exactly nNew processor dirs.
+    if (Pstream::master())
+    {
+        // Clear any stale pieces in the surviving processor dirs so
+        // decomposePar writes a clean decomposition
+        for (label proci = 0; proci < Pstream::nProcs(); proci++)
+        {
+            const fileName pieces =
+                fileName(casePath)/("processor" + Foam::name(proci))
+               /runTime.constant()/"meshes";
+            if (isDir(pieces))
+            {
+                rmDir(pieces);
+            }
+        }
+
+        forAll(meshTimes, meshi)
+        {
+            std::string cmd =
+                "decomposePar -mesh '" + std::string(meshTimes[meshi])
+              + "' -case '" + casePath + "'";
+            if (!meshRegions[meshi].empty())
+            {
+                cmd += " -region '" + std::string(meshRegions[meshi]) + "'";
+            }
+
+            dmrRunOrAbort(casePath, "dmr_decompose_meshes.log", cmd);
+        }
+
+        Info<< "DMR: re-decomposed " << meshTimes.size()
+            << " swap mesh(es) under constant/meshes for "
+            << Pstream::nProcs() << " ranks" << endl;
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 
@@ -1030,6 +1473,17 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
         dmrLoadFieldsGrow(haveMesh, pMesh, subsetterPtr, allObjects, pointSymmTensors);
         dmrLoadFieldsGrow(haveMesh, pMesh, subsetterPtr, allObjects, pointTensors);
 
+        dmrEnsurePoints0
+        (
+            runTime,
+            mesh,
+            pMesh,
+            haveMesh,
+            subsetterPtr,
+            regionName,
+            pointVectors
+        );
+
         const bool addedPatch = dmrAddTransientInternalPatch(mesh);
 
         autoPtr<decompositionMethod> distributor
@@ -1063,10 +1517,7 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
         mesh.setInstance(timeName);
         mesh.write();
 
-        Pout<< "DMR-GROW[r" << Pstream::myProcNo()
-            << "] region '" << regionName
-            << "' masterInstDir=" << masterInstDir
-            << " wrote mesh at " << timeName.c_str() << endl;
+        dmrWritePoints0Constant(mesh);
 
         // If the in-memory zone lists are empty, any *Zones files at
         // the write instance are stale leftovers (the dummy mesh from
@@ -1115,7 +1566,12 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
         }
     }
 
+    // Sweep the derivable caches BEFORE the swap-mesh transport: if
+    // the latter fails, the relaunched generation must never read a
+    // stale mixed-layout stitcher cache (engine, 2026-07-13)
     dmrSweepStitchCaches(runTime, timeName, regionNames);
+
+    dmrRedistributeSwapMeshes(runTime);
 
     MPI_Barrier(MPI_COMM_WORLD);
 
@@ -1218,10 +1674,18 @@ static void dmrShrinkInPlace
         dmrRunFreshRedistribute(runTime, timeName, regionNames[i]);
     }
 
+    // Sweep the derivable caches BEFORE the swap-mesh transport: if
+    // the latter fails, the relaunched generation must never read a
+    // stale mixed-layout stitcher cache (engine, 2026-07-13)
     dmrSweepStitchCaches(runTime, timeName, regionNames);
 
+    // Delete the processor dirs beyond the new world size BEFORE the
+    // swap-mesh decompose. dmrRedistributeSwapMeshes forks stock
+    // decomposePar, which FATALs unless the case-level processor count
+    // equals numberOfSubdomains (just rewritten to nNew); the stale
+    // processor[nNew..nOld) from the old layout would trip that guard
+    // (engine/movingCone swap-mesh decompose, 2026-07-18).
     MPI_Barrier(MPI_COMM_WORLD);
-
     if (Pstream::master())
     {
         for (int p = world.nNew; p < world.nOld; ++p)
@@ -1229,7 +1693,15 @@ static void dmrShrinkInPlace
             Foam::rmDir(casePath + "/processor" + std::to_string(p));
         }
         ::sync();
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
 
+    dmrRedistributeSwapMeshes(runTime);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (Pstream::master())
+    {
         dmrLifecycleLog
         (
             casePath,

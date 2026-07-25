@@ -1118,6 +1118,73 @@ static void dmrCloneFields
 }
 
 
+// Take the checkpoint fields of one type out of the reconfiguration
+// write, remembering them so they can be put back.
+template<class GeoField>
+static void dmrDemoteFieldsOfType
+(
+    const fvMesh& mesh,
+    DynamicList<regIOobject*>& demoted
+)
+{
+    const HashTable<const GeoField*> fields(mesh.lookupClass<GeoField>());
+    const wordList names(fields.sortedToc());
+
+    forAll(names, i)
+    {
+        // Transient: restored immediately after the write below. The
+        // registry hands out const access, but the write option is
+        // bookkeeping, not field data.
+        GeoField& f = const_cast<GeoField&>(*fields[names[i]]);
+
+        if (f.writeOpt() == IOobject::AUTO_WRITE)
+        {
+            f.writeOpt() = IOobject::NO_WRITE;
+            demoted.append(&f);
+        }
+    }
+}
+
+
+// The reconfiguration checkpoint and the redistribute write the same
+// fields twice: once in the old layout, then again in the new one. When
+// the redistribute sources them from memory nothing ever reads that
+// first copy, so it is pure duplicated I/O.
+//
+// It cannot simply be skipped: runTime.writeNow() also emits the state
+// the redistribute does NOT produce, notably uniform/time (time index
+// and deltaT, i.e. restart continuity). So instead of dropping the
+// write, drop the fields FROM it — demote them here, write, restore.
+// Everything else Time writes still goes out.
+//
+// Accepted consequence: with no old-layout field copy on disk, a
+// redistribute that aborts leaves the previous natural write as the
+// newest checkpoint, so the relaunch loses that one interval instead of
+// resuming at the reconfiguration instant.
+static void dmrDemoteCheckpointFields
+(
+    const fvMesh& mesh,
+    DynamicList<regIOobject*>& demoted
+)
+{
+    dmrDemoteFieldsOfType<volScalarField>(mesh, demoted);
+    dmrDemoteFieldsOfType<volVectorField>(mesh, demoted);
+    dmrDemoteFieldsOfType<volSphericalTensorField>(mesh, demoted);
+    dmrDemoteFieldsOfType<volSymmTensorField>(mesh, demoted);
+    dmrDemoteFieldsOfType<volTensorField>(mesh, demoted);
+    dmrDemoteFieldsOfType<surfaceScalarField>(mesh, demoted);
+    dmrDemoteFieldsOfType<surfaceVectorField>(mesh, demoted);
+    dmrDemoteFieldsOfType<surfaceSphericalTensorField>(mesh, demoted);
+    dmrDemoteFieldsOfType<surfaceSymmTensorField>(mesh, demoted);
+    dmrDemoteFieldsOfType<surfaceTensorField>(mesh, demoted);
+    dmrDemoteFieldsOfType<pointScalarField>(mesh, demoted);
+    dmrDemoteFieldsOfType<pointVectorField>(mesh, demoted);
+    dmrDemoteFieldsOfType<pointSphericalTensorField>(mesh, demoted);
+    dmrDemoteFieldsOfType<pointSymmTensorField>(mesh, demoted);
+    dmrDemoteFieldsOfType<pointTensorField>(mesh, demoted);
+}
+
+
 // Source the fields either from the live mesh (clone path) or from the
 // checkpoint on disk (fresh-load path), keeping the 15 call sites below
 // single.
@@ -1820,16 +1887,68 @@ static void dmrShrinkInPlace
     const std::string casePath = runTime.globalPath();
     const std::string timeName = runTime.name();
 
+    // Snapshot the live region names BEFORE anything writes or
+    // redistributes. Each dmrRunFreshRedistribute builds a
+    // non-registered fvMesh that never enters the registry, so taking
+    // the live mesh table once up front avoids any
+    // iterator-vs-mutation hazard.
+    wordList regionNames;
+    {
+        HashTable<fvMesh*> liveRegions(runTime.lookupClass<fvMesh>());
+        regionNames.setSize(liveRegions.size());
+        label i = 0;
+        forAllIter(HashTable<fvMesh*>, liveRegions, iter)
+        {
+            regionNames[i++] = iter()->name();
+        }
+    }
+
+    // When the redistribute sources the fields from memory it rewrites
+    // every one of them in the new layout, so writing them here in the
+    // old layout first is redundant I/O; keep the rest of the
+    // checkpoint (uniform/time above all).
+    DynamicList<regIOobject*> demoted;
+    if (dmrCloneEnabled())
+    {
+        forAll(regionNames, i)
+        {
+            dmrDemoteCheckpointFields
+            (
+                runTime.lookupObject<fvMesh>(regionNames[i]),
+                demoted
+            );
+        }
+    }
+
+    const double writeStart = MPI_Wtime();
+
     runTime.writeNow();
+
+    const double writeEnd = MPI_Wtime();
+
+    forAll(demoted, i)
+    {
+        demoted[i]->writeOpt() = IOobject::AUTO_WRITE;
+    }
+
     MPI_Barrier(MPI_COMM_WORLD);
 
     if (Pstream::master())
     {
+        char writeElapsed[32];
+        std::snprintf
+        (
+            writeElapsed, sizeof(writeElapsed), "%.3f", writeEnd - writeStart
+        );
+
         dmrLifecycleLog
         (
             casePath,
             "Checkpoint at t=" + timeName
           + (isDmrForced ? " (DMR-forced)" : " (writeInterval)")
+          + " in " + writeElapsed + " s ("
+          + std::to_string(demoted.size()) + " field(s) deferred to the"
+            " redistribute)"
         );
         dmrWriteWorldMeta(casePath, world);
         dmrLifecycleLog
@@ -1857,21 +1976,6 @@ static void dmrShrinkInPlace
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
-
-    // Snapshot the live region names BEFORE the redistribute loop. Each
-    // call to dmrRunFreshRedistribute constructs a non-registered fvMesh
-    // that does not appear in the registry, so iterating the live mesh
-    // table once up front avoids any iterator-vs-mutation hazard.
-    wordList regionNames;
-    {
-        HashTable<fvMesh*> liveRegions(runTime.lookupClass<fvMesh>());
-        regionNames.setSize(liveRegions.size());
-        label i = 0;
-        forAllIter(HashTable<fvMesh*>, liveRegions, iter)
-        {
-            regionNames[i++] = iter()->name();
-        }
-    }
 
     const double redistStart = MPI_Wtime();
 

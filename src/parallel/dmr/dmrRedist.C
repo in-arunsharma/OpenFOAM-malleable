@@ -42,6 +42,8 @@ License
 #include "loadOrCreateMesh.H"
 #include "HashSet.H"
 #include "pointIOField.H"
+#include "OStringStream.H"
+#include "IStringStream.H"
 
 extern "C"
 {
@@ -951,6 +953,195 @@ static void dmrRemoveTransientInternalPatch(fvMesh& mesh)
 }
 
 
+// Source the shrink-side redistribute from the live mesh in memory
+// rather than from the checkpoint on disk. Off by default while the
+// clone path is being validated against the disk path; set
+// FOAM_DMR_CLONE=1 to enable.
+static bool dmrCloneEnabled()
+{
+    static const bool enabled = []()
+    {
+        const char* env = std::getenv("FOAM_DMR_CLONE");
+        return env && std::string(env) == "1";
+    }();
+    return enabled;
+}
+
+
+// In-memory twin of the disk fresh-load: build a clean, non-registered
+// fvMesh from the LIVE solver mesh's primitives instead of re-reading
+// what we just checkpointed. Same construction fvMeshDistribute itself
+// uses for received meshes (fvMeshDistribute.C receiveMesh: from-
+// primitives fvMesh + polyPatch list + addFvPatches, no parallel
+// comms), and the same primitives its sendMesh transmits
+// (points/faces/faceOwner/faceNeighbour), so allOwner is per-face and
+// allNeighbour per-internal-face.
+//
+// register=false and the real region name mirror the disk fresh-load
+// exactly: the clone must not appear in runTime's registry beside the
+// live mesh, but must still write to the region's own directory.
+static autoPtr<fvMesh> dmrCloneLiveMesh
+(
+    const fvMesh& live,
+    Time& runTime,
+    const word& regionName
+)
+{
+    pointField points(live.points());
+    faceList faces(live.faces());
+    labelList allOwner(live.faceOwner());
+    labelList allNeighbour(live.faceNeighbour());
+
+    autoPtr<fvMesh> clonePtr
+    (
+        new fvMesh
+        (
+            IOobject
+            (
+                regionName,
+                runTime.name(),
+                runTime,
+                IOobject::NO_READ,
+                IOobject::AUTO_WRITE,
+                false
+            ),
+            move(points),
+            move(faces),
+            move(allOwner),
+            move(allNeighbour)
+        )
+    );
+    fvMesh& clone = clonePtr();
+
+    // Rebuild the boundary from the live patches. clone(bm) is virtual,
+    // so each patch type copies its own state: processorPolyPatch keeps
+    // myProcNo/neighbProcNo, cyclics keep their transform, etc. Sizes
+    // and start faces carry over unchanged because the topology is
+    // identical by construction.
+    const polyBoundaryMesh& livePatches = live.poly().boundary();
+
+    List<polyPatch*> patches(livePatches.size());
+    forAll(livePatches, patchi)
+    {
+        patches[patchi] =
+            livePatches[patchi].clone(clone.poly().boundary()).ptr();
+    }
+
+    // No parallel comms: the patch structure is already consistent
+    // across ranks (it is a copy of the live mesh's, which is)
+    clone.addFvPatches(patches, false);
+
+    return clonePtr;
+}
+
+
+// Copy the live solver's checkpoint fields of one type onto the clone.
+//
+// ONLY the AUTO_WRITE set is taken, and that filter is the correctness
+// invariant of the whole clone path: it is exactly what runTime.write()
+// would have emitted, i.e. exactly what the disk fresh-load would have
+// read back. The live registry additionally carries solver-derived and
+// cached state (rAU, HbyA, gradients, functionObject fields, retained
+// tmps) which is NO_WRITE and may differ between ranks;
+// fvMeshDistribute enumerates registered fields through fieldNames()
+// -> checkEqualWordList(), a gather/scatter-collective that FATALs
+// unless every rank presents an identical list, so letting that state
+// through is precisely what makes distribute() fail on a live mesh.
+//
+// Transport is a stream round-trip into the field's dictionary form and
+// back through the GeoField(IOobject, mesh, dictionary) constructor —
+// the same mechanism the grow path uses to rebuild fields on ranks that
+// had none, and the same representation a disk write/read pair goes
+// through. It is used in preference to a direct value copy because the
+// from-components constructor clones patch fields via
+// PatchField::clone(iF), which retains the SOURCE patch reference
+// (GeometricBoundaryField.C): the fields would still point into the
+// live mesh's boundary. Going through the dictionary rebuilds genuine
+// patch fields on the clone's own patches, carrying each BC's full
+// state (refValue, valueFraction, gradient, ...), not just its values.
+template<class GeoField>
+static void dmrCloneFields
+(
+    const fvMesh& live,
+    const fvMesh& clone,
+    const typename GeoField::Mesh& cloneFieldMesh,
+    PtrList<GeoField>& fields
+)
+{
+    const HashTable<const GeoField*> liveFields
+    (
+        live.lookupClass<GeoField>()
+    );
+
+    // sortedToc: every rank must build its list in the same order
+    const wordList names(liveFields.sortedToc());
+
+    DynamicList<word> checkpointed(names.size());
+    forAll(names, i)
+    {
+        if (liveFields[names[i]]->writeOpt() == IOobject::AUTO_WRITE)
+        {
+            checkpointed.append(names[i]);
+        }
+    }
+
+    fields.setSize(checkpointed.size());
+    forAll(checkpointed, i)
+    {
+        const GeoField& src = *liveFields[checkpointed[i]];
+
+        OStringStream os;
+        os.precision(17);   // exact round-trip of an IEEE double
+        os << src;
+
+        IStringStream is(os.str());
+        const dictionary fieldDict(is);
+
+        fields.set
+        (
+            i,
+            new GeoField
+            (
+                IOobject
+                (
+                    checkpointed[i],
+                    clone.time().name(),
+                    clone,
+                    IOobject::NO_READ,
+                    IOobject::AUTO_WRITE
+                ),
+                cloneFieldMesh,
+                fieldDict
+            )
+        );
+    }
+}
+
+
+// Source the fields either from the live mesh (clone path) or from the
+// checkpoint on disk (fresh-load path), keeping the 15 call sites below
+// single.
+template<class GeoField>
+static void dmrGatherFields
+(
+    const fvMesh* live,
+    const fvMesh& mesh,
+    const typename GeoField::Mesh& fieldMesh,
+    IOobjectList& allObjects,
+    PtrList<GeoField>& fields
+)
+{
+    if (live)
+    {
+        dmrCloneFields(*live, mesh, fieldMesh, fields);
+    }
+    else
+    {
+        dmrLoadFields(fieldMesh, allObjects, fields);
+    }
+}
+
+
 // Construct a fresh fvMesh from disk (non-registered, so it doesn't clash
 // with the live mesh still in runTime's registry), load every field type
 // into it, run fvMeshDistribute, and write the new layout. Mirrors the
@@ -963,7 +1154,8 @@ static void dmrRunFreshRedistribute
 (
     Time& runTime,
     const std::string& timeName,
-    const word& regionName
+    const word& regionName,
+    const fvMesh* live
 )
 {
     fileName meshSubDir;
@@ -976,21 +1168,33 @@ static void dmrRunFreshRedistribute
         meshSubDir = regionName / polyMesh::meshSubDir;
     }
 
-    const fileName masterInstDir =
-        runTime.findInstance(meshSubDir, "points");
-
-    fvMesh mesh
-    (
-        IOobject
+    // Either clone the live mesh in memory or re-read the checkpoint
+    // from disk. Everything downstream is identical: the clone is built
+    // to be indistinguishable from what the disk read produces.
+    autoPtr<fvMesh> meshPtr;
+    if (live)
+    {
+        meshPtr = dmrCloneLiveMesh(*live, runTime, regionName);
+    }
+    else
+    {
+        meshPtr.reset
         (
-            regionName,
-            masterInstDir,
-            runTime,
-            IOobject::MUST_READ,
-            IOobject::AUTO_WRITE,
-            false
-        )
-    );
+            new fvMesh
+            (
+                IOobject
+                (
+                    regionName,
+                    runTime.findInstance(meshSubDir, "points"),
+                    runTime,
+                    IOobject::MUST_READ,
+                    IOobject::AUTO_WRITE,
+                    false
+                )
+            )
+        );
+    }
+    fvMesh& mesh = meshPtr();
 
     autoPtr<decompositionMethod> distributor
     (
@@ -1015,16 +1219,16 @@ static void dmrRunFreshRedistribute
     PtrList<surfaceSymmTensorField>      surfSymmTensors;
     PtrList<surfaceTensorField>          surfTensors;
 
-    dmrLoadFields(mesh, allObjects, volScalars);
-    dmrLoadFields(mesh, allObjects, volVectors);
-    dmrLoadFields(mesh, allObjects, volSphereTensors);
-    dmrLoadFields(mesh, allObjects, volSymmTensors);
-    dmrLoadFields(mesh, allObjects, volTensors);
-    dmrLoadFields(mesh, allObjects, surfScalars);
-    dmrLoadFields(mesh, allObjects, surfVectors);
-    dmrLoadFields(mesh, allObjects, surfSphereTensors);
-    dmrLoadFields(mesh, allObjects, surfSymmTensors);
-    dmrLoadFields(mesh, allObjects, surfTensors);
+    dmrGatherFields(live, mesh, mesh, allObjects, volScalars);
+    dmrGatherFields(live, mesh, mesh, allObjects, volVectors);
+    dmrGatherFields(live, mesh, mesh, allObjects, volSphereTensors);
+    dmrGatherFields(live, mesh, mesh, allObjects, volSymmTensors);
+    dmrGatherFields(live, mesh, mesh, allObjects, volTensors);
+    dmrGatherFields(live, mesh, mesh, allObjects, surfScalars);
+    dmrGatherFields(live, mesh, mesh, allObjects, surfVectors);
+    dmrGatherFields(live, mesh, mesh, allObjects, surfSphereTensors);
+    dmrGatherFields(live, mesh, mesh, allObjects, surfSymmTensors);
+    dmrGatherFields(live, mesh, mesh, allObjects, surfTensors);
 
     // Point fields (e.g. pointDisplacement on moving meshes). Their mesh
     // type is pointMesh, not fvMesh, so they load against pointMesh::New.
@@ -1038,11 +1242,11 @@ static void dmrRunFreshRedistribute
     PtrList<pointSymmTensorField>      pointSymmTensors;
     PtrList<pointTensorField>          pointTensors;
 
-    dmrLoadFields(pMesh, allObjects, pointScalars);
-    dmrLoadFields(pMesh, allObjects, pointVectors);
-    dmrLoadFields(pMesh, allObjects, pointSphereTensors);
-    dmrLoadFields(pMesh, allObjects, pointSymmTensors);
-    dmrLoadFields(pMesh, allObjects, pointTensors);
+    dmrGatherFields(live, mesh, pMesh, allObjects, pointScalars);
+    dmrGatherFields(live, mesh, pMesh, allObjects, pointVectors);
+    dmrGatherFields(live, mesh, pMesh, allObjects, pointSphereTensors);
+    dmrGatherFields(live, mesh, pMesh, allObjects, pointSymmTensors);
+    dmrGatherFields(live, mesh, pMesh, allObjects, pointTensors);
 
     dmrEnsurePoints0
     (
@@ -1669,10 +1873,22 @@ static void dmrShrinkInPlace
         }
     }
 
+    const double redistStart = MPI_Wtime();
+
     forAll(regionNames, i)
     {
-        dmrRunFreshRedistribute(runTime, timeName, regionNames[i]);
+        // The live mesh is still resident on this (dying) group, so the
+        // checkpoint it was just written from can be reproduced in
+        // memory instead of being read back off disk
+        const fvMesh* live =
+            dmrCloneEnabled()
+          ? &runTime.lookupObject<fvMesh>(regionNames[i])
+          : nullptr;
+
+        dmrRunFreshRedistribute(runTime, timeName, regionNames[i], live);
     }
+
+    const double redistEnd = MPI_Wtime();
 
     // Sweep the derivable caches BEFORE the swap-mesh transport: if
     // the latter fails, the relaunched generation must never read a
@@ -1702,11 +1918,16 @@ static void dmrShrinkInPlace
 
     if (Pstream::master())
     {
+        char elapsed[32];
+        std::snprintf(elapsed, sizeof(elapsed), "%.3f", redistEnd - redistStart);
+
         dmrLifecycleLog
         (
             casePath,
             "Shrink redistribute complete ("
-          + std::to_string(regionNames.size()) + " region(s))."
+          + std::to_string(regionNames.size()) + " region(s)) in "
+          + elapsed + " s ["
+          + (dmrCloneEnabled() ? "clone" : "disk") + "]."
         );
     }
 

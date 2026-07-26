@@ -1,0 +1,3 @@
+dmrRelayout.C
+
+EXE = $(FOAM_APPBIN)/dmrRelayout

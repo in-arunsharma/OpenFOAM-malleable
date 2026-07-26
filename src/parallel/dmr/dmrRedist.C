@@ -44,6 +44,7 @@ License
 #include "pointIOField.H"
 #include "OStringStream.H"
 #include "IStringStream.H"
+#include "CompactListList.H"
 
 extern "C"
 {
@@ -58,6 +59,7 @@ extern "C"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <string>
 #include <utility>
@@ -349,8 +351,40 @@ static bool dmrQueryWorldInfo(DmrWorldInfo& w)
     if (myRank == 0)
     {
         DMRAnalytics a{};
-        if (dmr_get_analytics(&a) == DMR_SUCCESS)
+        const DMRStatus st = dmr_get_analytics(&a);
+
+        if (st == DMR_SUCCESS)
         {
+            // DMR changed DMRAnalytics::event from an enum (dmr_event_t)
+            // to a string (const char*), which also shifts every field
+            // after it. Compiling against one variant and linking the
+            // other yields a silently corrupt struct: a truncated
+            // pointer read as an enum, and node_count holding what is
+            // really world_size (observed on MN5, 2026-07-26 — the
+            // system dmr/2.0.1-dlb module vs the Slurm4DMR dmr-s4d
+            // build). The string variant #defines the event names, so
+            // that is a reliable compile-time discriminator between the
+            // two APIs.
+            #ifdef DMR_EVENT_START_SHRINK
+            // String API (dmr-s4d and later)
+            const char* ev = a.event ? a.event : "";
+
+            if
+            (
+                std::strcmp(ev, DMR_EVENT_START_EXPAND_SLURM) == 0
+             || std::strcmp(ev, DMR_EVENT_START_EXPAND_MPI) == 0
+            )
+            {
+                dir = static_cast<int>(DmrDir::Grow);
+                delta = dmr_get_procs_next_expand();
+            }
+            else if (std::strcmp(ev, DMR_EVENT_START_SHRINK) == 0)
+            {
+                dir = static_cast<int>(DmrDir::Shrink);
+                delta = dmr_get_procs_next_shrink();
+            }
+            #else
+            // Enum API (dmr-at-jobs 2.0.1 and earlier)
             switch (a.event)
             {
                 case DMR_EVENT_START_EXPAND_SLURM:
@@ -365,6 +399,39 @@ static bool dmrQueryWorldInfo(DmrWorldInfo& w)
                 default:
                     break;
             }
+            #endif
+        }
+
+        // The direction MUST be resolved here: a shrink has to run on the
+        // old (larger) group, because fvMeshDistribute needs max(N,N')
+        // ranks, so it cannot be deferred to the new group the way a grow
+        // can. When it comes back Unknown the run stops, so record enough
+        // to tell WHY rather than guessing later: whether the analytics
+        // call itself failed, or whether it succeeded with an event this
+        // switch does not handle (the CE policy emits events the ROUND
+        // policy never does, e.g. DMR_EVENT_TALP_CHECK_CE_ACC).
+        if (dir == static_cast<int>(DmrDir::Unknown))
+        {
+            #ifdef DMR_EVENT_START_SHRINK
+            const char* evStr = a.event ? a.event : "(null)";
+            #else
+            char evBuf[32];
+            std::snprintf(evBuf, sizeof(evBuf), "%d", static_cast<int>(a.event));
+            const char* evStr = evBuf;
+            #endif
+
+            // A struct-layout mismatch shows up here as a nonsense
+            // world_size with node_count holding its value instead.
+            std::fprintf
+            (
+                stderr,
+                "DMR: direction UNKNOWN — dmr_get_analytics status=%d,"
+                " event='%s', world_size=%d, node_count=%d,"
+                " pending_nodes=%d, CE=%f\n",
+                static_cast<int>(st), evStr,
+                a.world_size, a.node_count, a.pending_nodes,
+                a.communication_efficiency
+            );
         }
     }
 
@@ -953,16 +1020,33 @@ static void dmrRemoveTransientInternalPatch(fvMesh& mesh)
 }
 
 
+// The serial reconstructPar/decomposePar fallback is the rank-0 gather
+// this pipeline exists to remove. It is only reached when the
+// reconfiguration direction cannot be determined, which is a bug to fix
+// rather than a condition to tolerate, so it is DISABLED by default:
+// stopping loudly beats silently gathering a large case onto one node.
+// Set FOAM_DMR_ALLOW_SERIAL_FALLBACK=1 to restore the old behaviour.
+static bool dmrLegacyFallbackAllowed()
+{
+    static const bool allowed = []()
+    {
+        const char* env = std::getenv("FOAM_DMR_ALLOW_SERIAL_FALLBACK");
+        return env && std::string(env) == "1";
+    }();
+    return allowed;
+}
+
+
 // Source the shrink-side redistribute from the live mesh in memory
-// rather than from the checkpoint on disk. Off by default while the
-// clone path is being validated against the disk path; set
-// FOAM_DMR_CLONE=1 to enable.
+// rather than from the checkpoint on disk. On by default (validated
+// byte-identical against the disk path); set FOAM_DMR_CLONE=0 to fall
+// back to re-reading the checkpoint.
 static bool dmrCloneEnabled()
 {
     static const bool enabled = []()
     {
         const char* env = std::getenv("FOAM_DMR_CLONE");
-        return env && std::string(env) == "1";
+        return !env || std::string(env) != "0";
     }();
     return enabled;
 }
@@ -1541,6 +1625,689 @@ static void dmrRedistributeSwapMeshes(Time& runTime)
 }
 
 
+// * * * * * * * * * Uniform (MIN-layout) output write  * * * * * * * * * * //
+//
+// A malleable run writes its natural output in whatever layout it
+// happens to be running at, so the time series ends up decomposed
+// N ways at one time and N' ways at the next: not a readable case,
+// because a decomposed case has ONE decomposition across all times.
+//
+// The fix is to emit every natural write in the layout the run is
+// always able to produce, MIN = policy-min nodes x procs-per-node,
+// without ever gathering onto rank 0. To keep the solver running while
+// that happens, the write is handed to a SECOND MPI WORLD spawned for
+// the purpose: the live world copies its state to it rank-for-rank,
+// the helper redistributes to MIN and writes, then frees its memory and
+// exits. The solver does not write this step itself and does not wait.
+//
+// The two worlds are the same size N because fvMeshDistribute needs
+// max(N_src, N_dst) ranks and MIN <= N, so the handoff is a straight
+// 1:1 rank-to-rank copy with no re-decomposition in flight. Nothing
+// goes through disk on the way. Verified separately (2026-07-25) that
+// a spawned process runs as a full OpenFOAM application with its own
+// MPI_COMM_WORLD, so Pstream and fvMeshDistribute behave normally
+// inside the helper; the parent intercommunicator is used only for the
+// handoff, via raw MPI byte transfer.
+
+// Target world size for the uniform output: policy-min NODES times
+// procs-per-node. Taken from the environment because that is how the
+// launcher configures DMR itself (DMR_DEFAULT_POLICY_MIN /
+// DMR_PROCS_PER_NODE); the library exposes a setter for the policy
+// minimum but no getter.
+static int dmrMinWorldSize()
+{
+    const char* minNodes = std::getenv("DMR_DEFAULT_POLICY_MIN");
+    const char* ppn = std::getenv("DMR_PROCS_PER_NODE");
+
+    const int n = minNodes ? std::atoi(minNodes) : 1;
+    const int p = ppn ? std::atoi(ppn) : 1;
+
+    return (n > 0 ? n : 1) * (p > 0 ? p : 1);
+}
+
+
+// Emit every natural write in the MIN layout via a spawned helper, so
+// the output series shares one decomposition and is directly readable.
+// On by default; set FOAM_DMR_UNIFORM_WRITE=0 to write in the running
+// layout instead (which leaves the series unreadable across
+// reconfigurations, but needs no MPI_Comm_spawn).
+static bool dmrUniformWriteEnabled()
+{
+    static const bool enabled = []()
+    {
+        const char* env = std::getenv("FOAM_DMR_UNIFORM_WRITE");
+        return !env || std::string(env) != "0";
+    }();
+    return enabled;
+}
+
+
+// Send/receive one serialised blob over the spawn intercommunicator.
+// Parent rank i talks only to child rank i.
+static void dmrSendBlob(const std::string& s, MPI_Comm inter, int peer)
+{
+    int n = static_cast<int>(s.size());
+    MPI_Send(&n, 1, MPI_INT, peer, 0, inter);
+    MPI_Send(s.data(), n, MPI_CHAR, peer, 1, inter);
+}
+
+
+static std::string dmrRecvBlob(MPI_Comm inter, int peer)
+{
+    int n = 0;
+    MPI_Recv(&n, 1, MPI_INT, peer, 0, inter, MPI_STATUS_IGNORE);
+    std::string s(n, '\0');
+    MPI_Recv(&s[0], n, MPI_CHAR, peer, 1, inter, MPI_STATUS_IGNORE);
+    return s;
+}
+
+
+// Serialise this rank's slice of one field type into the fields blob,
+// as a sub-dictionary per field. Only the AUTO_WRITE set is sent: it is
+// exactly what a natural write would have emitted, and it keeps the
+// live registry's derived/cached state (which differs between ranks)
+// out of the helper, for the same reason the clone path filters it.
+template<class GeoField>
+static void dmrWriteFieldsBlob(const fvMesh& mesh, OStringStream& os)
+{
+    const HashTable<const GeoField*> fields(mesh.lookupClass<GeoField>());
+    const wordList names(fields.sortedToc());
+
+    os  << GeoField::typeName << nl << token::BEGIN_BLOCK << nl;
+
+    forAll(names, i)
+    {
+        const GeoField& f = *fields[names[i]];
+
+        if (f.writeOpt() != IOobject::AUTO_WRITE) continue;
+
+        os  << names[i] << nl << token::BEGIN_BLOCK << nl;
+        f.writeData(os);
+        os  << nl << token::END_BLOCK << nl;
+    }
+
+    os  << token::END_BLOCK << nl;
+}
+
+
+// Rebuild one field type on the helper's mesh from the received blob.
+template<class GeoField>
+static void dmrReadFieldsBlob
+(
+    const dictionary& all,
+    const fvMesh& mesh,
+    const typename GeoField::Mesh& fieldMesh,
+    PtrList<GeoField>& fields
+)
+{
+    if (!all.found(GeoField::typeName))
+    {
+        return;
+    }
+
+    const dictionary& sub = all.subDict(GeoField::typeName);
+    const wordList names(sub.toc());
+
+    fields.setSize(names.size());
+    forAll(names, i)
+    {
+        fields.set
+        (
+            i,
+            new GeoField
+            (
+                IOobject
+                (
+                    names[i],
+                    mesh.time().name(),
+                    mesh,
+                    IOobject::NO_READ,
+                    IOobject::AUTO_WRITE
+                ),
+                fieldMesh,
+                sub.subDict(names[i])
+            )
+        );
+    }
+}
+
+
+void dmrSpawnUniformWrite(Time& runTime, bool allRegions)
+{
+    if (!dmrUniformWriteEnabled())
+    {
+        return;
+    }
+
+    const int minSize = dmrMinWorldSize();
+    int worldSize = 1;
+    MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
+
+    // Already uniform: the natural write is in the target layout
+    if (worldSize <= minSize)
+    {
+        return;
+    }
+
+    const std::string casePath = runTime.globalPath();
+
+    // Region set, in a deterministic order on every rank
+    wordList regionNames;
+    {
+        HashTable<fvMesh*> liveRegions(runTime.lookupClass<fvMesh>());
+        regionNames = liveRegions.sortedToc();
+    }
+
+    if (regionNames.empty())
+    {
+        return;
+    }
+
+    // Spawn a helper world of the same size. argv mirrors how the
+    // solver itself was launched so the helper resolves the same case.
+    const std::string helper
+    (
+        std::string(std::getenv("FOAM_APPBIN") ? std::getenv("FOAM_APPBIN") : ".")
+      + "/dmrRelayout"
+    );
+
+    std::vector<char*> argvChild;
+    static char optCase[] = "-case";
+    static char optParallel[] = "-parallel";
+    std::vector<char> caseBuf(casePath.begin(), casePath.end());
+    caseBuf.push_back('\0');
+
+    argvChild.push_back(optCase);
+    argvChild.push_back(caseBuf.data());
+    argvChild.push_back(optParallel);
+    argvChild.push_back(nullptr);
+
+    std::vector<char> helperBuf(helper.begin(), helper.end());
+    helperBuf.push_back('\0');
+
+    // Provision the helper exactly the way DMR provisions its own spawned
+    // processes (dmr_core.c, the MPI_Comm_spawn_multiple call): the
+    // PMIX_* keys add the hosts and slots for the NEW processes and allow
+    // them to overload the cores. They apply only to the spawned world, so
+    // the solver's own placement is untouched and DMR's node accounting
+    // (identify_nodes -> MPI_Comm_split_type on its INTERNAL_COMM_WORLD)
+    // still sees the run exactly as before. Passing MPI_INFO_NULL instead
+    // is what made the spawn fail with "all nodes already filled" once the
+    // allocation was exactly filled by the solver.
+    MPI_Info spawnInfo = MPI_INFO_NULL;
+    {
+        char procName[MPI_MAX_PROCESSOR_NAME];
+        int nameLen = 0;
+        MPI_Get_processor_name(procName, &nameLen);
+
+        std::vector<char> allNames
+        (
+            std::size_t(worldSize)*MPI_MAX_PROCESSOR_NAME, '\0'
+        );
+        MPI_Allgather
+        (
+            procName, MPI_MAX_PROCESSOR_NAME, MPI_CHAR,
+            allNames.data(), MPI_MAX_PROCESSOR_NAME, MPI_CHAR,
+            MPI_COMM_WORLD
+        );
+
+        // One entry per distinct node, carrying the number of helper
+        // ranks to place there (mirrors this world's own distribution)
+        std::vector<std::string> nodes;
+        std::vector<int> counts;
+        for (int r = 0; r < worldSize; ++r)
+        {
+            const std::string n(&allNames[std::size_t(r)*MPI_MAX_PROCESSOR_NAME]);
+            const auto it = std::find(nodes.begin(), nodes.end(), n);
+            if (it == nodes.end())
+            {
+                nodes.push_back(n);
+                counts.push_back(1);
+            }
+            else
+            {
+                counts[it - nodes.begin()]++;
+            }
+        }
+
+        std::string hostSpec;
+        for (std::size_t i = 0; i < nodes.size(); ++i)
+        {
+            if (i) hostSpec += ",";
+            hostSpec += nodes[i] + ":" + std::to_string(counts[i]);
+        }
+
+        MPI_Info_create(&spawnInfo);
+        MPI_Info_set(spawnInfo, "PMIX_ADD_HOST", hostSpec.c_str());
+        MPI_Info_set(spawnInfo, "PMIX_HOST", hostSpec.c_str());
+        MPI_Info_set(spawnInfo, "PMIX_MAPBY", ":OVERSUBSCRIBE");
+        MPI_Info_set(spawnInfo, "PMIX_BINDTO", ":overload-allowed");
+    }
+
+    MPI_Comm inter = MPI_COMM_NULL;
+    std::vector<int> errcodes(worldSize, 0);
+
+    // A refused spawn must degrade to "this output time stays in the
+    // running layout", never kill the solver: the default
+    // MPI_ERRORS_ARE_FATAL would abort before the return code is read.
+    MPI_Errhandler oldHandler = MPI_ERRHANDLER_NULL;
+    MPI_Comm_get_errhandler(MPI_COMM_WORLD, &oldHandler);
+    MPI_Comm_set_errhandler(MPI_COMM_WORLD, MPI_ERRORS_RETURN);
+
+    const int rc = MPI_Comm_spawn
+    (
+        helperBuf.data(),
+        argvChild.data(),
+        worldSize,
+        spawnInfo,
+        0,
+        MPI_COMM_WORLD,
+        &inter,
+        errcodes.data()
+    );
+
+    MPI_Comm_set_errhandler(MPI_COMM_WORLD, oldHandler);
+
+    if (spawnInfo != MPI_INFO_NULL)
+    {
+        MPI_Info_free(&spawnInfo);
+    }
+
+    if (rc != MPI_SUCCESS || inter == MPI_COMM_NULL)
+    {
+        if (Pstream::master())
+        {
+            dmrLifecycleLog
+            (
+                casePath,
+                "Uniform write: MPI_Comm_spawn failed; natural write left"
+                " in the running layout."
+            );
+        }
+        return;
+    }
+
+    const int myRank = Pstream::myProcNo();
+
+    // Header: what the helper needs before it can interpret the rest
+    {
+        // Quoted: a time name like "0.05" would otherwise read back as
+        // a scalar rather than a word
+        // 17 significant digits = max_digits10 for an IEEE double, the
+        // minimum that round-trips a double through text exactly.
+        // deltaT below sets the step the run resumes with, and
+        // OpenFOAM's default writePrecision of 6 would round it.
+        OStringStream os;
+        os.precision(17);
+        os  << "time" << token::SPACE << string(runTime.name())
+            << token::END_STATEMENT << nl
+            << "timeIndex" << token::SPACE << runTime.timeIndex()
+            << token::END_STATEMENT << nl
+            << "deltaT" << token::SPACE << runTime.deltaTValue()
+            << token::END_STATEMENT << nl
+            << "minRanks" << token::SPACE << minSize
+            << token::END_STATEMENT << nl
+            << "regions" << token::SPACE << regionNames
+            << token::END_STATEMENT << nl;
+
+        dmrSendBlob(os.str(), inter, myRank);
+    }
+
+    forAll(regionNames, regioni)
+    {
+        const fvMesh& mesh =
+            runTime.lookupObject<fvMesh>(regionNames[regioni]);
+
+        // Mesh primitives, in the order fvMeshDistribute::sendMesh uses
+        {
+            OStringStream os;
+            os  << mesh.points()
+                << CompactListList<label>(mesh.faces())
+                << mesh.faceOwner()
+                << mesh.faceNeighbour()
+                << mesh.poly().boundary();
+
+            dmrSendBlob(os.str(), inter, myRank);
+        }
+
+        // Fields, as one dictionary of per-type sub-dictionaries
+        {
+            OStringStream os;
+            os.precision(17);   // exact round-trip of an IEEE double
+
+            dmrWriteFieldsBlob<volScalarField>(mesh, os);
+            dmrWriteFieldsBlob<volVectorField>(mesh, os);
+            dmrWriteFieldsBlob<volSphericalTensorField>(mesh, os);
+            dmrWriteFieldsBlob<volSymmTensorField>(mesh, os);
+            dmrWriteFieldsBlob<volTensorField>(mesh, os);
+            dmrWriteFieldsBlob<surfaceScalarField>(mesh, os);
+            dmrWriteFieldsBlob<surfaceVectorField>(mesh, os);
+            dmrWriteFieldsBlob<surfaceSphericalTensorField>(mesh, os);
+            dmrWriteFieldsBlob<surfaceSymmTensorField>(mesh, os);
+            dmrWriteFieldsBlob<surfaceTensorField>(mesh, os);
+            dmrWriteFieldsBlob<pointScalarField>(mesh, os);
+            dmrWriteFieldsBlob<pointVectorField>(mesh, os);
+            dmrWriteFieldsBlob<pointSphericalTensorField>(mesh, os);
+            dmrWriteFieldsBlob<pointSymmTensorField>(mesh, os);
+            dmrWriteFieldsBlob<pointTensorField>(mesh, os);
+
+            dmrSendBlob(os.str(), inter, myRank);
+        }
+    }
+
+    // Hand off and let go: the helper owns the write from here. Both
+    // sides call disconnect, it is collective over the two worlds.
+    MPI_Comm_disconnect(&inter);
+
+    if (Pstream::master())
+    {
+        dmrLifecycleLog
+        (
+            casePath,
+            "Uniform write at t=" + runTime.name() + ": handed "
+          + std::to_string(regionNames.size()) + " region(s) to a "
+          + std::to_string(worldSize) + "-rank helper for "
+          + std::to_string(minSize) + "-way output."
+        );
+    }
+}
+
+
+// A DMR-forced checkpoint is restart state, not output: it carries
+// whatever layout the reconfiguration produced, so it is unreadable as
+// part of the uniform output series, and at real mesh sizes the
+// accumulated copies are a serious waste of disk.
+//
+// Mark each one with a sentinel and drop every SUPERSEDED one from this
+// rank's own processor directory (no cross-rank collisions). The newest
+// is always kept: it IS the state the next generation restarts from.
+// Same policy as the serial path's sweep in dmrCheckpoint, applied to
+// the processor trees. OpenFOAM time names must be ordered as floats,
+// not as strings, or "0.17" sorts before "0.085".
+static void dmrPurgeSupersededCheckpoints
+(
+    const Time& runTime,
+    const std::string& timeName
+)
+{
+    const std::string dir(runTime.path()/fileName(timeName));
+
+    if (FILE* s = std::fopen((dir + "/.dmr_checkpoint").c_str(), "w"))
+    {
+        std::fclose(s);
+    }
+
+    const std::string pattern(std::string(runTime.path()) + "/*/.dmr_checkpoint");
+
+    glob_t g;
+    if (glob(pattern.c_str(), 0, nullptr, &g) != 0)
+    {
+        return;
+    }
+
+    const std::string suffix("/.dmr_checkpoint");
+    std::vector<std::pair<double, std::string>> stamped;
+    stamped.reserve(g.gl_pathc);
+
+    for (size_t i = 0; i < g.gl_pathc; ++i)
+    {
+        std::string p(g.gl_pathv[i]);
+        p.resize(p.size() - suffix.size());
+
+        const std::string tName(p.substr(p.find_last_of('/') + 1));
+        try
+        {
+            stamped.emplace_back(std::stod(tName), p);
+        }
+        catch (const std::exception&)
+        {}
+    }
+    globfree(&g);
+
+    std::sort(stamped.begin(), stamped.end());
+
+    // Keep the newest; the rest are superseded restart state
+    for (size_t i = 0; i + 1 < stamped.size(); ++i)
+    {
+        Foam::rmDir(stamped[i].second);
+    }
+}
+
+
+void dmrWrite(Time& runTime, bool allRegions)
+{
+    int worldSize = 1;
+    MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
+
+    const bool uniform =
+        dmrUniformWriteEnabled()
+     && runTime.writeTime()
+     && worldSize > dmrMinWorldSize();
+
+    // Complete handoff: on the uniform path the solver performs NO I/O.
+    // It gives its state to the helper world and carries straight on;
+    // the helper writes the fields, the mesh AND the non-field state
+    // (uniform/time) in the MIN layout. Writing anything here would be
+    // work the helper immediately supersedes, and it would race the
+    // helper's cleanup of the directories belonging to the ranks outside
+    // that layout — which is why this used to have to be sequenced.
+    if (uniform)
+    {
+        dmrSpawnUniformWrite(runTime, allRegions);
+        return;
+    }
+
+    runTime.write();
+}
+
+
+void dmrRelayoutFromParent(Time& runTime)
+{
+    MPI_Comm parent = MPI_COMM_NULL;
+    MPI_Comm_get_parent(&parent);
+
+    if (parent == MPI_COMM_NULL)
+    {
+        FatalErrorInFunction
+            << "dmrRelayout must be started by MPI_Comm_spawn from a"
+            << " running solver; it has no parent communicator."
+            << exit(FatalError);
+    }
+
+    const int myRank = Pstream::myProcNo();
+
+    // Header
+    word timeName;
+    label minRanks = 1;
+    label timeIndex = 0;
+    scalar deltaT = 0;
+    wordList regionNames;
+    {
+        IStringStream is(dmrRecvBlob(parent, myRank));
+        const dictionary header(is);
+
+        string timeStr;
+        header.lookup("time") >> timeStr;
+        timeName = word(timeStr);
+
+        minRanks = readLabel(header.lookup("minRanks"));
+        timeIndex = readLabel(header.lookup("timeIndex"));
+        deltaT = readScalar(header.lookup("deltaT"));
+        header.lookup("regions") >> regionNames;
+    }
+
+    // Adopt the parent's position in time rather than this process's own
+    // start state. uniform/time carries the time index and deltaT a
+    // restart resumes from, and with an adjustable time step those are
+    // the SOLVER's current values, which the helper cannot derive.
+    runTime.setTime(instant(timeName), timeIndex);
+    runTime.setDeltaT(deltaT);
+
+    // Drain every blob first, then let the parent go. MPI_Comm_disconnect
+    // is collective over BOTH worlds, so any work done before it is work
+    // the solver sits blocked in its own disconnect waiting for. Taking
+    // the data and disconnecting immediately is what makes the relayout
+    // genuinely concurrent with the solver rather than merely offloaded.
+    List<string> meshBlobs(regionNames.size());
+    List<string> fieldBlobs(regionNames.size());
+
+    forAll(regionNames, regioni)
+    {
+        meshBlobs[regioni] = dmrRecvBlob(parent, myRank);
+        fieldBlobs[regioni] = dmrRecvBlob(parent, myRank);
+    }
+
+    MPI_Comm_disconnect(&parent);
+
+    forAll(regionNames, regioni)
+    {
+        const word& regionName = regionNames[regioni];
+
+        // Mesh, from the primitives the parent sent
+        autoPtr<fvMesh> meshPtr;
+        {
+            IStringStream is(meshBlobs[regioni]);
+
+            pointField points(is);
+            faceList faces = CompactListList<label>(is).list<face>();
+            labelList allOwner(is);
+            labelList allNeighbour(is);
+            PtrList<entry> patchEntries(is);
+
+            meshPtr.reset
+            (
+                new fvMesh
+                (
+                    IOobject
+                    (
+                        regionName,
+                        timeName,
+                        runTime,
+                        IOobject::NO_READ,
+                        IOobject::AUTO_WRITE,
+                        false
+                    ),
+                    move(points),
+                    move(faces),
+                    move(allOwner),
+                    move(allNeighbour)
+                )
+            );
+
+            List<polyPatch*> patches(patchEntries.size());
+            forAll(patchEntries, patchi)
+            {
+                patches[patchi] = polyPatch::New
+                (
+                    patchEntries[patchi].keyword(),
+                    patchEntries[patchi].dict(),
+                    patchi,
+                    meshPtr().poly().boundary()
+                ).ptr();
+            }
+            meshPtr().addFvPatches(patches, false);
+        }
+
+        fvMesh& mesh = meshPtr();
+
+        // Fields
+        PtrList<volScalarField>              volScalars;
+        PtrList<volVectorField>              volVectors;
+        PtrList<volSphericalTensorField>     volSphereTensors;
+        PtrList<volSymmTensorField>          volSymmTensors;
+        PtrList<volTensorField>              volTensors;
+        PtrList<surfaceScalarField>          surfScalars;
+        PtrList<surfaceVectorField>          surfVectors;
+        PtrList<surfaceSphericalTensorField> surfSphereTensors;
+        PtrList<surfaceSymmTensorField>      surfSymmTensors;
+        PtrList<surfaceTensorField>          surfTensors;
+        PtrList<pointScalarField>            pointScalars;
+        PtrList<pointVectorField>            pointVectors;
+        PtrList<pointSphericalTensorField>   pointSphereTensors;
+        PtrList<pointSymmTensorField>        pointSymmTensors;
+        PtrList<pointTensorField>            pointTensors;
+
+        {
+            IStringStream is(fieldBlobs[regioni]);
+            const dictionary all(is);
+
+            pointMesh& pMesh = const_cast<pointMesh&>(pointMesh::New(mesh));
+
+            dmrReadFieldsBlob(all, mesh, mesh, volScalars);
+            dmrReadFieldsBlob(all, mesh, mesh, volVectors);
+            dmrReadFieldsBlob(all, mesh, mesh, volSphereTensors);
+            dmrReadFieldsBlob(all, mesh, mesh, volSymmTensors);
+            dmrReadFieldsBlob(all, mesh, mesh, volTensors);
+            dmrReadFieldsBlob(all, mesh, mesh, surfScalars);
+            dmrReadFieldsBlob(all, mesh, mesh, surfVectors);
+            dmrReadFieldsBlob(all, mesh, mesh, surfSphereTensors);
+            dmrReadFieldsBlob(all, mesh, mesh, surfSymmTensors);
+            dmrReadFieldsBlob(all, mesh, mesh, surfTensors);
+            dmrReadFieldsBlob(all, mesh, pMesh, pointScalars);
+            dmrReadFieldsBlob(all, mesh, pMesh, pointVectors);
+            dmrReadFieldsBlob(all, mesh, pMesh, pointSphereTensors);
+            dmrReadFieldsBlob(all, mesh, pMesh, pointSymmTensors);
+            dmrReadFieldsBlob(all, mesh, pMesh, pointTensors);
+        }
+
+        // Redistribute this world's N-way copy down to the MIN layout.
+        // Ranks at or beyond minRanks end up empty and are cleaned up
+        // after the write.
+        labelList finalDecomp;
+        {
+            dictionary decomposeDict
+            (
+                decompositionMethod::decomposeParDict(runTime)
+            );
+            decomposeDict.set("numberOfSubdomains", minRanks);
+
+            autoPtr<decompositionMethod> distributor
+            (
+                decompositionMethod::NewDistributor(decomposeDict)
+            );
+            finalDecomp = distributor().decompose(mesh, mesh.cellCentres());
+        }
+
+        const bool addedPatch = dmrAddTransientInternalPatch(mesh);
+
+        fvMeshDistribute(mesh).distribute(finalDecomp);
+
+        if (addedPatch)
+        {
+            dmrRemoveTransientInternalPatch(mesh);
+        }
+
+        mesh.setInstance(timeName);
+        mesh.write();
+    }
+
+    // The solver performs no I/O at a natural write any more, so the
+    // non-field state it used to emit (uniform/time above all) is
+    // written here instead. The meshes built above are non-registered,
+    // so this writes only what Time itself owns.
+    runTime.writeNow();
+
+    // Derivable caches, as after any redistribute
+    dmrSweepStitchCaches(runTime, timeName, regionNames);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Ranks outside the MIN layout hold nothing at this time: drop the
+    // empty directories they just wrote so the output series is exactly
+    // minRanks wide.
+    if (Pstream::myProcNo() >= minRanks)
+    {
+        const fileName stale(runTime.path()/timeName);
+        if (isDir(stale))
+        {
+            rmDir(stale);
+        }
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 void dmrGrowRedistribute(Time& runTime, bool allRegions)
@@ -1844,6 +2611,13 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
 
     dmrRedistributeSwapMeshes(runTime);
 
+    // As on the shrink side: this is now the restart state, so older
+    // forced checkpoints are superseded
+    if (dmrUniformWriteEnabled())
+    {
+        dmrPurgeSupersededCheckpoints(runTime, timeName);
+    }
+
     MPI_Barrier(MPI_COMM_WORLD);
 
     if (Pstream::master())
@@ -2020,6 +2794,14 @@ static void dmrShrinkInPlace
 
     MPI_Barrier(MPI_COMM_WORLD);
 
+    // This checkpoint is now the restart state; older ones are dead
+    // weight (only meaningful with the uniform write, which is what
+    // makes the surviving natural writes the readable series)
+    if (dmrUniformWriteEnabled())
+    {
+        dmrPurgeSupersededCheckpoints(runTime, timeName);
+    }
+
     if (Pstream::master())
     {
         char elapsed[32];
@@ -2122,6 +2904,39 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
                 casePath,
                 "Reconfig direction unknown (DMR analytics unavailable)."
             );
+        }
+
+        // The legacy serial reconstructPar/decomposePar path below is the
+        // rank-0 gather this pipeline exists to remove: on a large case it
+        // is ruinously slow and can exhaust the memory of rank 0's node.
+        // Falling into it silently, as happened on the first CE-policy run
+        // (2026-07-26), wastes the allocation and produces a result that
+        // does not represent the parallel pipeline at all.
+        //
+        // Known cause of an unknown direction: dmr_get_analytics() reports
+        // only the LATEST event, and the CE policy emits
+        // DMR_EVENT_TALP_CHECK_CE_ACC after the start-of-reconfiguration
+        // event that dmrQueryWorldInfo switches on. Fix that rather than
+        // relying on this fallback.
+        if (!dmrLegacyFallbackAllowed())
+        {
+            if (Pstream::master())
+            {
+                dmrLifecycleLog
+                (
+                    casePath,
+                    "FATAL: refusing the serial reconstruct fallback."
+                    " Set FOAM_DMR_ALLOW_SERIAL_FALLBACK=1 to permit it."
+                );
+            }
+
+            FatalErrorInFunction
+                << "DMR reconfiguration direction could not be determined,"
+                << " and the serial reconstructPar fallback is disabled."
+                << nl
+                << "The checkpoint at this time has been written; the run"
+                << " is stopping rather than performing a rank-0 gather."
+                << exit(FatalError);
         }
 
         dmrLifecycleLog(casePath, "Reconstructing processor directories...");
@@ -2444,72 +3259,27 @@ void dmrRestart(const std::string& casePath, bool allRegions)
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-void dmrFinalize(const std::string& casePath, bool allRegions)
+void dmrFinalize(const std::string& casePath, bool /*allRegions*/)
 {
     MPI_Barrier(MPI_COMM_WORLD);
 
+    // Nothing to do. The run's output is already written in the uniform
+    // MIN layout by the natural-write path, so it is directly readable as
+    // a decomposed case: there is nothing to reconstruct. The serial
+    // reconstructPar that used to run here was removed deliberately — it
+    // is a rank-0 gather, exactly the bottleneck this pipeline exists to
+    // eliminate, and its -rm plus the processor-directory cleanup that
+    // followed it would delete the very series that was produced.
+    // Superseded DMR-forced checkpoints are already dropped as they are
+    // superseded (dmrPurgeSupersededCheckpoints), so nothing accumulates.
     if (Pstream::master())
     {
-        dmrLifecycleLog(casePath, "Final reconstruction to serial...");
-
-        // -latestTime (not -newTimes): with in-process SHRINK each
-        // reconfiguration writes a new processor-side polyMesh at the SHRINK
-        // time, which trips reconstructPar's mesh-evolution check (bug
-        // 0004368-style) when it tries to chain through the whole time
-        // sequence. Reconstructing the final time is enough for post-run
-        // analysis; intermediate serial snapshots can be produced manually
-        // with `reconstructPar -time T` if needed.
-        std::string cmd =
-            "reconstructPar -latestTime -rm -case '" + casePath + "'";
-        if (allRegions) cmd += " -allRegions";
-
-        // Soft fail: the simulation has already finished, so on
-        // reconstruct failure leave processor* dirs in place for
-        // inspection rather than killing the job.
-        const int ret =
-            dmrRunOrAbort(casePath, "dmr_final.log", cmd, /*abort=*/false);
-
-        if (ret != 0)
-        {
-            WarningInFunction
-                << "DMR: final reconstructPar failed (exit " << ret
-                << "). Processor directories preserved for inspection; "
-                << "see " << dmrLogPath(casePath, "dmr_final.log").c_str()
-                << nl;
-        }
-        else
-        {
-            dmrLifecycleLog(casePath, "Final reconstruction complete.");
-
-            // Cleanup processor* dirs only on successful reconstruct;
-            // on failure leave them in place for the user to inspect.
-            glob_t pg;
-            const std::string ppattern = casePath + "/processor*";
-            if (glob(ppattern.c_str(), GLOB_ONLYDIR, nullptr, &pg) == 0)
-            {
-                for (size_t i = 0; i < pg.gl_pathc; ++i)
-                {
-                    Foam::rmDir(pg.gl_pathv[i]);
-                }
-                globfree(&pg);
-            }
-        }
-
-        // Sweep any remaining DMR-forced sentinel dirs — superseded by
-        // the final reconstructPar above.
-        const std::string pattern = casePath + "/*/.dmr_checkpoint";
-        glob_t g;
-        if (glob(pattern.c_str(), 0, nullptr, &g) == 0)
-        {
-            const std::string suffix = "/.dmr_checkpoint";
-            for (size_t i = 0; i < g.gl_pathc; ++i)
-            {
-                std::string p(g.gl_pathv[i]);
-                p.resize(p.size() - suffix.size());
-                Foam::rmDir(p);
-            }
-            globfree(&g);
-        }
+        dmrLifecycleLog
+        (
+            casePath,
+            "Finalize: output already written in the MIN layout;"
+            " no reconstruction needed."
+        );
     }
 
     MPI_Barrier(MPI_COMM_WORLD);

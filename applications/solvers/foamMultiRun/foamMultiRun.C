@@ -253,7 +253,11 @@ int main(int argc, char *argv[])
 
         solvers.setGlobalPrefix();
 
+        #ifdef FOAM_USE_DMR
+        #include "dmrWrite.H"
+        #else
         runTime.write();
+        #endif
 
         #ifdef FOAM_USE_DMR
         #include "dmrCheck.H"

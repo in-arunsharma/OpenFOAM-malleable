@@ -76,6 +76,29 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions = false);
 //  Uses WarningInFunction (not MPI_Abort) on failure.
 void dmrFinalize(const std::string& casePath, bool allRegions = false);
 
+//- Replaces runTime.write() in the solver's time loop (dmrWrite.H).
+//  Behaves exactly like it unless the uniform-output path is active,
+//  in which case the fields are left out of this write and handed to a
+//  spawned helper that re-emits them in the MIN layout instead.
+void dmrWrite(Time& runTime, bool allRegions = false);
+
+//- Natural-write hook. A malleable run writes its output in whatever
+//  layout it is running at, so the time series ends up decomposed
+//  differently from one write to the next and is not readable as a
+//  case. This hands the state to a second MPI world spawned for the
+//  purpose (same size, so the copy is 1:1 rank-to-rank and nothing
+//  goes through disk), which redistributes it to the MIN layout
+//  (policy-min nodes x procs-per-node), writes it, and exits while the
+//  solver keeps running. No-op unless FOAM_DMR_UNIFORM_WRITE=1, or if
+//  the run is already at the MIN layout.
+void dmrSpawnUniformWrite(Time& runTime, bool allRegions = false);
+
+//- Body of the spawned dmrRelayout helper: receive one rank's slice of
+//  the mesh and fields from the parent world, redistribute to the MIN
+//  layout, write it, and drop the directories of the ranks that fall
+//  outside that layout. Aborts if not started via MPI_Comm_spawn.
+void dmrRelayoutFromParent(Time& runTime);
+
 } // End namespace Foam
 
 

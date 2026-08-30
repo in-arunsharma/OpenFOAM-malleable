@@ -1020,6 +1020,59 @@ static void dmrRemoveTransientInternalPatch(fvMesh& mesh)
 }
 
 
+// Run the distributor and return one destination per cell.
+//
+// ptscotch returns a SIZE-1 list for a ZERO-CELL mesh, which
+// fvMeshDistribute rejects with
+//     "Size of distribution:1 mesh nCells:0"   (fvMeshDistribute.C:1819)
+// Zero-cell meshes are normal on the grow path: loadOrCreateMesh fabricates
+// them on the ranks that hold no data yet, so every grow onto new ranks hit
+// this (MN5, 2026-07-26, 448 -> 560). Serial scotch happens to return an
+// empty list and so never showed the problem.
+//
+// decompose() is collective, so it cannot be skipped on the empty ranks -
+// they must call it with everyone else. The result is corrected afterwards
+// instead: a mesh with no cells has, trivially, an empty distribution.
+static labelList dmrDecompose
+(
+    decompositionMethod& distributor,
+    const fvMesh& mesh
+)
+{
+    labelList decomp(distributor.decompose(mesh, mesh.cellCentres()));
+
+    if (mesh.nCells() == 0 && decomp.size() != 0)
+    {
+        // Logged so a run can PROVE the guard is present and firing: its
+        // absence in the output means an older libfoamDmr is loaded.
+        Pout<< "DMR: distributor returned " << decomp.size()
+            << " entries for a 0-cell mesh; truncating to 0" << endl;
+
+        decomp.setSize(0);
+    }
+
+    return decomp;
+}
+
+
+// Partitioning method used for the in-process redistributes. ptscotch is
+// the parallel one (it registers only as a distributor, unlike scotch
+// which is also decomposePar's serial decomposer). If partitioning
+// dominates the reconfiguration cost, hierarchical or simple are far
+// cheaper at the price of partition quality — which matters much less
+// here than for an initial decomposition, since the mesh is
+// re-partitioned again at the next reconfiguration anyway.
+static std::string dmrDistributorName()
+{
+    static const std::string name = []()
+    {
+        const char* env = std::getenv("FOAM_DMR_DISTRIBUTOR");
+        return (env && *env) ? std::string(env) : std::string("ptscotch");
+    }();
+    return name;
+}
+
+
 // The serial reconstructPar/decomposePar fallback is the rank-0 gather
 // this pipeline exists to remove. It is only reached when the
 // reconfiguration direction cannot be determined, which is a bug to fix
@@ -1354,8 +1407,7 @@ static void dmrRunFreshRedistribute
             decompositionMethod::decomposeParDict(runTime)
         )
     );
-    const labelList finalDecomp =
-        distributor().decompose(mesh, mesh.cellCentres());
+    const labelList finalDecomp = dmrDecompose(distributor(), mesh);
 
     IOobjectList allObjects(mesh, runTime.name());
 
@@ -1682,6 +1734,80 @@ static bool dmrUniformWriteEnabled()
 }
 
 
+// The intercommunicator of the helper world that is still writing, or
+// MPI_COMM_NULL when none is outstanding. At most ONE helper is alive at
+// a time (see dmrWaitForHelper).
+static MPI_Comm dmrHelperComm = MPI_COMM_NULL;
+
+
+// Wait for the outstanding helper to finish, if there is one.
+//
+// MPI_Comm_disconnect is collective over BOTH worlds and returns only
+// once each side has called it. The helper calls it as its LAST action,
+// so the parent calling it here blocks exactly until the helper has
+// finished writing. That is the whole synchronisation mechanism: no
+// extra protocol, no polling.
+//
+// The parent deliberately does NOT call this at the natural write - that
+// would make the handoff synchronous again. It is called only where a
+// still-running helper would otherwise be destroyed:
+//
+//   * before spawning a replacement (bounds the system to one helper,
+//     so helpers cannot accumulate if writes outpace them);
+//   * at every exit of dmrCheckpoint, because dmr_reconfigure() tears
+//     down and restarts the DVM the helper lives in;
+//   * at dmrFinalize, for the same reason at end of run.
+//
+// By then the parent has already done its own checkpoint and
+// redistribute work, which is independent of the helper's, so in
+// practice the helper finished long ago and this returns immediately.
+static void dmrWaitForHelper()
+{
+    if (dmrHelperComm == MPI_COMM_NULL)
+    {
+        return;
+    }
+
+    // A helper that died leaves this collective unsatisfied. Ask for the
+    // error to be returned rather than aborting the solver, so the
+    // failure is diagnosable; it cannot rescue a genuinely hung peer,
+    // which is why the helper also drops a .complete sentinel for
+    // after-the-fact checking.
+    //
+    // No attempt is made to save and restore the previous handler: this
+    // communicator is destroyed by the disconnect below, and the default
+    // is a predefined handler that must not be freed.
+    MPI_Comm_set_errhandler(dmrHelperComm, MPI_ERRORS_RETURN);
+
+    const int rc = MPI_Comm_disconnect(&dmrHelperComm);
+
+    if (rc != MPI_SUCCESS)
+    {
+        WarningInFunction
+            << "MPI_Comm_disconnect from the uniform-write helper failed"
+            << " (code " << rc << "). The output time it was writing may"
+            << " be incomplete; check for its .complete sentinel." << endl;
+
+        // On failure the handle may be left valid. Drop it rather than
+        // retry: a second attempt would block on the same dead peer, and
+        // hanging the solver is worse than leaking one communicator.
+        dmrHelperComm = MPI_COMM_NULL;
+    }
+}
+
+
+// Scope guard so the wait cannot be missed on an exit path added later:
+// dmrCheckpoint returns from several places, and every one of them is
+// immediately followed by dmr_reconfigure() killing the helper.
+namespace
+{
+struct dmrHelperBarrier
+{
+    ~dmrHelperBarrier() { dmrWaitForHelper(); }
+};
+}
+
+
 // Send/receive one serialised blob over the spawn intercommunicator.
 // Parent rank i talks only to child rank i.
 static void dmrSendBlob(const std::string& s, MPI_Comm inter, int peer)
@@ -1778,6 +1904,13 @@ void dmrSpawnUniformWrite(Time& runTime, bool allRegions)
     {
         return;
     }
+
+    // At most one helper at a time. If the previous one is somehow still
+    // writing when the next output time arrives, wait for it here rather
+    // than accumulating helper worlds (and their processes, and their
+    // intercommunicators) without bound. Normally a no-op: the helper
+    // finished many timesteps ago.
+    dmrWaitForHelper();
 
     const int minSize = dmrMinWorldSize();
     int worldSize = 1;
@@ -1995,9 +2128,12 @@ void dmrSpawnUniformWrite(Time& runTime, bool allRegions)
         }
     }
 
-    // Hand off and let go: the helper owns the write from here. Both
-    // sides call disconnect, it is collective over the two worlds.
-    MPI_Comm_disconnect(&inter);
+    // Hand off and carry on. The intercommunicator is deliberately NOT
+    // disconnected here: disconnect is collective and would block until
+    // the helper finished, making the write synchronous again. It is
+    // kept so the wait can happen later, at the one point where the
+    // helper would otherwise be killed (see dmrWaitForHelper).
+    dmrHelperComm = inter;
 
     if (Pstream::master())
     {
@@ -2143,11 +2279,15 @@ void dmrRelayoutFromParent(Time& runTime)
     runTime.setTime(instant(timeName), timeIndex);
     runTime.setDeltaT(deltaT);
 
-    // Drain every blob first, then let the parent go. MPI_Comm_disconnect
-    // is collective over BOTH worlds, so any work done before it is work
-    // the solver sits blocked in its own disconnect waiting for. Taking
-    // the data and disconnecting immediately is what makes the relayout
-    // genuinely concurrent with the solver rather than merely offloaded.
+    // Drain every blob up front so the transfer itself is over quickly.
+    // The disconnect is deliberately left to the END of this function:
+    // it is collective with the parent, and the parent uses it as its
+    // "helper has finished" signal (dmrWaitForHelper). Concurrency comes
+    // from WHEN THE PARENT WAITS - only at a reconfiguration, after its
+    // own checkpoint and redistribute work - not from disconnecting
+    // early here. Disconnecting early would leave this process writing
+    // with no way for the parent to know, and the DVM teardown at
+    // dmr_reconfigure() would kill it mid-write.
     List<string> meshBlobs(regionNames.size());
     List<string> fieldBlobs(regionNames.size());
 
@@ -2156,8 +2296,6 @@ void dmrRelayoutFromParent(Time& runTime)
         meshBlobs[regioni] = dmrRecvBlob(parent, myRank);
         fieldBlobs[regioni] = dmrRecvBlob(parent, myRank);
     }
-
-    MPI_Comm_disconnect(&parent);
 
     forAll(regionNames, regioni)
     {
@@ -2265,7 +2403,7 @@ void dmrRelayoutFromParent(Time& runTime)
             (
                 decompositionMethod::NewDistributor(decomposeDict)
             );
-            finalDecomp = distributor().decompose(mesh, mesh.cellCentres());
+            finalDecomp = dmrDecompose(distributor(), mesh);
         }
 
         const bool addedPatch = dmrAddTransientInternalPatch(mesh);
@@ -2305,6 +2443,26 @@ void dmrRelayoutFromParent(Time& runTime)
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
+
+    // Sentinel, written LAST by every rank that keeps this time: an
+    // output directory without it was produced by a helper that died
+    // before finishing, so the time is suspect and should be discarded
+    // rather than trusted. The parent's wait normally prevents that, but
+    // it cannot rescue a helper that crashes outright.
+    if (Pstream::myProcNo() < minRanks)
+    {
+        const fileName marker(runTime.path()/timeName/".complete");
+        if (FILE* f = std::fopen(marker.c_str(), "w"))
+        {
+            std::fclose(f);
+        }
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Signals the parent that this helper is done (its dmrWaitForHelper
+    // returns here). Must be the last thing this process does.
+    MPI_Comm_disconnect(&parent);
 }
 
 
@@ -2531,8 +2689,7 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
                 decompositionMethod::decomposeParDict(runTime)
             )
         );
-        const labelList finalDecomp =
-            distributor().decompose(mesh, mesh.cellCentres());
+        const labelList finalDecomp = dmrDecompose(distributor(), mesh);
 
         fvMeshDistribute(mesh).distribute(finalDecomp);
 
@@ -2742,10 +2899,19 @@ static void dmrShrinkInPlace
             casePath, "system/decomposeParDict",
             "decomposer", "scotch"
         );
+        // ptscotch, not scotch. Both register as distributors, but
+        // ptscotch registers ONLY as a distributor — it exists for
+        // exactly this case, redistributing an already-decomposed mesh
+        // in parallel. Plain scotch also registers as a decomposer and
+        // is what decomposePar uses serially. On MN5 a 2800 -> 1792
+        // reconfiguration of a 100M-cell case sat in
+        // distributor().decompose() for over an hour without emitting
+        // anything (2026-07-26), which is what prompted the change.
+        // Overridable per run via FOAM_DMR_DISTRIBUTOR.
         dmrUpdateDictEntry
         (
             casePath, "system/decomposeParDict",
-            "distributor", "scotch"
+            "distributor", dmrDistributorName()
         );
     }
 
@@ -2825,6 +2991,17 @@ static void dmrShrinkInPlace
 
 void dmrCheckpoint(Time& runTime, bool allRegions)
 {
+    // Everything below is followed by dmr_reconfigure(), which tears down
+    // and restarts the DVM the uniform-write helper lives in, killing it
+    // mid-write. Wait for it before that happens - but on the way OUT, so
+    // this rank's own checkpoint and redistribute (hundreds of seconds on
+    // a large case) overlap the helper's write rather than serialising
+    // with it. There is no data dependency between them: the helper is
+    // writing a previous output time, this rank is handling the current
+    // reconfiguration. Declared as a scope guard so it also covers the
+    // early returns below, and any added later.
+    const dmrHelperBarrier helperBarrier;
+
     DmrWorldInfo world;
     const bool worldOk = dmrQueryWorldInfo(world);
     const bool isDmrForced = !runTime.writeTime();
@@ -3133,10 +3310,19 @@ void dmrRestart(const std::string& casePath, bool allRegions)
 
         // NewDistributor (used by the in-process redistributes) reads
         // its own 'distributor' key, separate from 'decomposer'.
+        // ptscotch, not scotch. Both register as distributors, but
+        // ptscotch registers ONLY as a distributor — it exists for
+        // exactly this case, redistributing an already-decomposed mesh
+        // in parallel. Plain scotch also registers as a decomposer and
+        // is what decomposePar uses serially. On MN5 a 2800 -> 1792
+        // reconfiguration of a 100M-cell case sat in
+        // distributor().decompose() for over an hour without emitting
+        // anything (2026-07-26), which is what prompted the change.
+        // Overridable per run via FOAM_DMR_DISTRIBUTOR.
         dmrUpdateDictEntry
         (
             casePath, "system/decomposeParDict",
-            "distributor", "scotch"
+            "distributor", dmrDistributorName()
         );
 
         dmrUpdateDictEntry
@@ -3261,6 +3447,10 @@ void dmrRestart(const std::string& casePath, bool allRegions)
 
 void dmrFinalize(const std::string& casePath, bool /*allRegions*/)
 {
+    // End of run: the helper must finish before this process group exits,
+    // or the last output time is left half written.
+    dmrWaitForHelper();
+
     MPI_Barrier(MPI_COMM_WORLD);
 
     // Nothing to do. The run's output is already written in the uniform

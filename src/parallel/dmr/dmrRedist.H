@@ -78,19 +78,35 @@ void dmrFinalize(const std::string& casePath, bool allRegions = false);
 
 //- Replaces runTime.write() in the solver's time loop (dmrWrite.H).
 //  Behaves exactly like it unless the uniform-output path is active,
-//  in which case the fields are left out of this write and handed to a
-//  spawned helper that re-emits them in the MIN layout instead.
+//  in which case the write is redirected to dmrUniformWriteInPlace,
+//  which emits the MIN layout instead of the running one.
 void dmrWrite(Time& runTime, bool allRegions = false);
 
 //- Natural-write hook. A malleable run writes its output in whatever
 //  layout it is running at, so the time series ends up decomposed
 //  differently from one write to the next and is not readable as a
-//  case. This hands the state to a second MPI world spawned for the
-//  purpose (same size, so the copy is 1:1 rank-to-rank and nothing
-//  goes through disk), which redistributes it to the MIN layout
-//  (policy-min nodes x procs-per-node), writes it, and exits while the
-//  solver keeps running. No-op unless FOAM_DMR_UNIFORM_WRITE=1, or if
-//  the run is already at the MIN layout.
+//  case. This redistributes each live mesh down to the MIN layout
+//  (policy-min nodes x procs-per-node) and writes THAT, so every
+//  output time shares one decomposition however the run was resized.
+//
+//  Runs inside the solver's own ranks, on an in-memory clone of each
+//  live mesh. fvMeshDistribute needs max(source, target) ranks and the
+//  source is the running world, so no additional processes are
+//  required: a malleable application must never need more resources to
+//  reconfigure than it currently holds. This replaces an earlier
+//  MPI_Comm_spawn of a same-width helper world, which exhausted the
+//  SysV segment limit (shmmni) once both worlds shared a node.
+//
+//  The clone is separate and non-registered, so the live mesh is not
+//  redistributed and the time loop continues at the running width. No
+//  reconfiguration is involved and the solver is not restarted: this
+//  is a natural checkpoint, not the forced one DMR takes before
+//  resizing. No-op unless FOAM_DMR_UNIFORM_WRITE is unset or non-zero,
+//  or if the run is already at the MIN layout.
+void dmrUniformWriteInPlace(Time& runTime, bool allRegions = false);
+
+//- Superseded by dmrUniformWriteInPlace; see the note there. Retained
+//  because dmrRelayout links against it.
 void dmrSpawnUniformWrite(Time& runTime, bool allRegions = false);
 
 //- Body of the spawned dmrRelayout helper: receive one rank's slice of

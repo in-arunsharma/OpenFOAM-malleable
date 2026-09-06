@@ -60,6 +60,7 @@ extern "C"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <ctime>
 #include <string>
 #include <utility>
@@ -176,103 +177,6 @@ static void dmrUpdateDictEntry
       + " '" + casePath + "/" + dictRelPath + "'";
 
     dmrRunOrAbort(casePath, "dmr_dict_updates.log", cmd);
-}
-
-
-// Return true if the given polyMesh directory contains a `faces` file
-// (i.e. a full mesh topology snapshot, not just a points-only update).
-static bool dmrPolyMeshHasTopology(const std::string& polyMeshDir)
-{
-    const std::string facesPath = polyMeshDir + "/faces";
-    struct stat st;
-    if (::stat(facesPath.c_str(), &st) == 0) return true;
-    // OpenFOAM sometimes writes compressed: faces.gz
-    const std::string facesGz = polyMeshDir + "/faces.gz";
-    return ::stat(facesGz.c_str(), &st) == 0;
-}
-
-
-// Return true if the given time directory contains a complete polyMesh
-// snapshot for THIS case (single-region or all-regions). A complete
-// snapshot is one with a `faces` file (the universal topology marker).
-// For all-regions cases, return true if any region under <time>/ has a
-// complete polyMesh — decomposePar -allRegions will replay topology for
-// every such region uniformly.
-static bool dmrTimeDirHasMeshWrite
-(
-    const std::string& casePath,
-    const std::string& timeName,
-    bool allRegions
-)
-{
-    if (!allRegions)
-    {
-        return dmrPolyMeshHasTopology
-        (
-            casePath + "/" + timeName + "/polyMesh"
-        );
-    }
-
-    // all-regions: glob <case>/<time>/*/polyMesh
-    const std::string pattern =
-        casePath + "/" + timeName + "/*/polyMesh";
-    glob_t g;
-    if (glob(pattern.c_str(), 0, nullptr, &g) != 0)
-    {
-        return false;
-    }
-    bool any = false;
-    for (size_t i = 0; i < g.gl_pathc && !any; ++i)
-    {
-        if (dmrPolyMeshHasTopology(g.gl_pathv[i])) any = true;
-    }
-    globfree(&g);
-    return any;
-}
-
-
-// Build the comma-separated -time argument for decomposePar:
-// "<latest_mesh_write>,<restartTime>" for moving-mesh cases,
-// "<restartTime>" otherwise. Lets decomposePar evolve the mesh forward
-// from the most recent topology snapshot — see bug 0004368.
-static std::string dmrBuildDecomposeTimeArg
-(
-    const std::string& casePath,
-    const std::string& restartTime,
-    bool allRegions
-)
-{
-    const std::string pattern = casePath + "/[0-9]*";
-    glob_t g;
-    if (glob(pattern.c_str(), 0, nullptr, &g) != 0)
-    {
-        return restartTime;
-    }
-
-    const double restartT = std::stod(restartTime);
-
-    double bestT = -1.0;
-    std::string bestName;
-    for (size_t i = 0; i < g.gl_pathc; ++i)
-    {
-        std::string p(g.gl_pathv[i]);
-        const std::string name = p.substr(p.find_last_of('/') + 1);
-        double t;
-        try { t = std::stod(name); }
-        catch (const std::exception&) { continue; }
-
-        if (t >= restartT) continue;
-        if (!dmrTimeDirHasMeshWrite(casePath, name, allRegions)) continue;
-        if (t > bestT)
-        {
-            bestT = t;
-            bestName = name;
-        }
-    }
-    globfree(&g);
-
-    if (bestName.empty()) return restartTime;
-    return bestName + "," + restartTime;
 }
 
 
@@ -543,30 +447,6 @@ static bool dmrReadWorldMeta
     w.nNew = payload[1];
     w.dir = static_cast<DmrDir>(payload[2]);
     return true;
-}
-
-
-// Load all on-disk fields of a given GeoField type into a PtrList,
-// registering each with the supplied mesh. Matches the loading pattern
-// redistributePar uses on its freshly-constructed mesh.
-template<class GeoField>
-static void dmrLoadFields
-(
-    const typename GeoField::Mesh& mesh,
-    IOobjectList& allObjects,
-    PtrList<GeoField>& fields
-)
-{
-    IOobjectList objects(allObjects.lookupClass(GeoField::typeName));
-    const wordList names(objects.toc());
-
-    fields.setSize(names.size());
-    forAll(names, i)
-    {
-        IOobject& io = objects[names[i]];
-        io.writeOpt() = IOobject::AUTO_WRITE;
-        fields.set(i, new GeoField(io, mesh));
-    }
 }
 
 
@@ -1020,6 +900,134 @@ static void dmrRemoveTransientInternalPatch(fvMesh& mesh)
 }
 
 
+// Never let a partition boundary fall across a zero-area face.
+//
+// fvPatch::nf() is Sf()/mag(Sf()). It is evaluated on every COUPLED patch,
+// so a face with mag(Sf) == 0 is harmless while it stays internal and
+// divides by zero the moment it becomes a processor face. That is what
+// fvMeshDistribute::distribute() does at the end of a redistribute, via
+// correctCoupledPatchFields -> deltaCoeffs -> fvPatch::delta() -> nf().
+//
+// Axisymmetric (wedge) meshes have exactly such faces: the cell face on
+// the axis collapses to a line as r -> 0. The solver never trips over
+// them because it only needs deltaCoeffs on faces that are not processor
+// faces; only a re-cut promotes an axis face to a processor face, which
+// is why this appears at a reconfiguration and not during time stepping,
+// and why it is intermittent (it needs the partitioner to cut there).
+//
+// Rather than repair the geometry or guard the division, both of which
+// are OpenFOAM's own code, forbid the cut: any two cells sharing a
+// degenerate face are pinned to the same destination. Union-find, so a
+// chain of collapsed faces collapses to one group. A no-op on meshes that
+// have no such faces, which is a single pass over the internal faces.
+static label dmrPinDegenerateFaces(const fvMesh& mesh, labelList& decomp)
+{
+    const label nCells = mesh.nCells();
+    if (nCells == 0 || decomp.size() != nCells)
+    {
+        return 0;
+    }
+
+    const scalarField& magSf = mesh.magSf().primitiveField();
+    const labelUList& own = mesh.faceOwner();
+    const labelUList& nei = mesh.faceNeighbour();
+    const label nInt = mesh.nInternalFaces();
+
+    // Absolute, not relative to the mesh scale: the failure is division by
+    // EXACTLY zero, so the threshold only has to separate a true zero (and
+    // anything that underflowed to one) from the smallest legitimate face.
+    // A relative threshold would start pinning healthy small faces on
+    // finely resolved meshes and quietly damage the load balance.
+    const scalar tol = vSmall;
+
+    labelList root(identityMap(nCells));
+
+    // find with path halving
+    auto find = [&root](label i)
+    {
+        while (root[i] != i)
+        {
+            root[i] = root[root[i]];
+            i = root[i];
+        }
+        return i;
+    };
+
+    label nPinned = 0;
+    for (label facei = 0; facei < nInt; ++facei)
+    {
+        if (magSf[facei] > tol)
+        {
+            continue;
+        }
+
+        const label a = find(own[facei]);
+        const label b = find(nei[facei]);
+        if (a != b)
+        {
+            root[a > b ? a : b] = (a < b ? a : b);
+        }
+        ++nPinned;
+    }
+
+    // Face-area census of the mesh we are about to redistribute, over
+    // internal AND boundary faces. This is what says whether a zero-area
+    // face is being HANDED to fvMeshDistribute or CREATED inside it, which
+    // are different problems with different owners.
+    {
+        const scalarField& allMag = mesh.magSf();
+        scalar mn = great, mx = 0;
+        label nTiny = 0;
+        forAll(allMag, i)
+        {
+            mn = min(mn, allMag[i]);
+            mx = max(mx, allMag[i]);
+            if (allMag[i] <= vSmall) ++nTiny;
+        }
+        scalar bMn = great;
+        label nbTiny = 0, nbFaces = 0;
+        forAll(mesh.boundary(), patchi)
+        {
+            const scalarField& pm = mesh.boundary()[patchi].magSf();
+            forAll(pm, i)
+            {
+                bMn = min(bMn, pm[i]);
+                if (pm[i] <= vSmall) ++nbTiny;
+                ++nbFaces;
+            }
+        }
+        Pout<< "DMR: faceArea census before distribute:"
+            << " internal min=" << mn << " max=" << mx
+            << " zero=" << nTiny
+            << " | boundary faces=" << nbFaces
+            << " min=" << (nbFaces ? bMn : 0) << " zero=" << nbTiny
+            << " | pinned=" << nPinned << endl;
+    }
+
+    if (nPinned == 0)
+    {
+        return 0;
+    }
+
+    // One destination per group: the group representative's, which is its
+    // lowest-numbered cell, so the choice does not depend on face order.
+    forAll(decomp, celli)
+    {
+        const label r = find(celli);
+        if (r != celli)
+        {
+            decomp[celli] = decomp[r];
+        }
+    }
+
+    Pout<< "DMR: pinned " << nPinned
+        << " zero-area face(s) (mag(Sf) <= " << tol
+        << ") so no partition boundary crosses them" << endl;
+
+    return nPinned;
+}
+
+
 // Run the distributor and return one destination per cell.
 //
 // ptscotch returns a SIZE-1 list for a ZERO-CELL mesh, which
@@ -1051,58 +1059,19 @@ static labelList dmrDecompose
         decomp.setSize(0);
     }
 
+    dmrPinDegenerateFaces(mesh, decomp);
+
     return decomp;
 }
 
 
 // Partitioning method used for the in-process redistributes. ptscotch is
-// the parallel one (it registers only as a distributor, unlike scotch
-// which is also decomposePar's serial decomposer). If partitioning
-// dominates the reconfiguration cost, hierarchical or simple are far
-// cheaper at the price of partition quality — which matters much less
-// here than for an initial decomposition, since the mesh is
-// re-partitioned again at the next reconfiguration anyway.
-static std::string dmrDistributorName()
-{
-    static const std::string name = []()
-    {
-        const char* env = std::getenv("FOAM_DMR_DISTRIBUTOR");
-        return (env && *env) ? std::string(env) : std::string("ptscotch");
-    }();
-    return name;
-}
-
-
-// The serial reconstructPar/decomposePar fallback is the rank-0 gather
-// this pipeline exists to remove. It is only reached when the
-// reconfiguration direction cannot be determined, which is a bug to fix
-// rather than a condition to tolerate, so it is DISABLED by default:
-// stopping loudly beats silently gathering a large case onto one node.
-// Set FOAM_DMR_ALLOW_SERIAL_FALLBACK=1 to restore the old behaviour.
-static bool dmrLegacyFallbackAllowed()
-{
-    static const bool allowed = []()
-    {
-        const char* env = std::getenv("FOAM_DMR_ALLOW_SERIAL_FALLBACK");
-        return env && std::string(env) == "1";
-    }();
-    return allowed;
-}
-
-
-// Source the shrink-side redistribute from the live mesh in memory
-// rather than from the checkpoint on disk. On by default (validated
-// byte-identical against the disk path); set FOAM_DMR_CLONE=0 to fall
-// back to re-reading the checkpoint.
-static bool dmrCloneEnabled()
-{
-    static const bool enabled = []()
-    {
-        const char* env = std::getenv("FOAM_DMR_CLONE");
-        return !env || std::string(env) != "0";
-    }();
-    return enabled;
-}
+// the parallel one: it registers ONLY as a distributor, which is exactly
+// this job, whereas scotch also registers as decomposePar's serial
+// decomposer. On MN5 a 2800 -> 1792 reconfiguration of a 100M-cell case
+// sat in scotch's decompose() for over an hour without emitting anything
+// (2026-07-26).
+static const char* const dmrDistributorName = "ptscotch";
 
 
 // In-memory twin of the disk fresh-load: build a clean, non-registered
@@ -1322,30 +1291,6 @@ static void dmrDemoteCheckpointFields
 }
 
 
-// Source the fields either from the live mesh (clone path) or from the
-// checkpoint on disk (fresh-load path), keeping the 15 call sites below
-// single.
-template<class GeoField>
-static void dmrGatherFields
-(
-    const fvMesh* live,
-    const fvMesh& mesh,
-    const typename GeoField::Mesh& fieldMesh,
-    IOobjectList& allObjects,
-    PtrList<GeoField>& fields
-)
-{
-    if (live)
-    {
-        dmrCloneFields(*live, mesh, fieldMesh, fields);
-    }
-    else
-    {
-        dmrLoadFields(fieldMesh, allObjects, fields);
-    }
-}
-
-
 // Construct a fresh fvMesh from disk (non-registered, so it doesn't clash
 // with the live mesh still in runTime's registry), load every field type
 // into it, run fvMeshDistribute, and write the new layout. Mirrors the
@@ -1354,62 +1299,52 @@ static void dmrGatherFields
 // is called against a mesh carrying live solver state. The region argument
 // is the polyMesh name (polyMesh::defaultRegion for single-region cases,
 // or one of the case's named regions for foamMultiRun).
+//
+// targetRanks narrows the DESTINATION width below the running world size.
+// Zero, the reconfiguration paths, means "take numberOfSubdomains from the
+// dict as it stands", i.e. redistribute across the whole world. A positive
+// value, the uniform-write path, sends everything to the first targetRanks
+// ranks and leaves the rest empty. Either way the operation is collective
+// over the whole world and needs no ranks beyond the ones already running,
+// because fvMeshDistribute's requirement is max(source, target) ranks and
+// the source width is the world width in both cases.
 static void dmrRunFreshRedistribute
 (
     Time& runTime,
     const std::string& timeName,
     const word& regionName,
-    const fvMesh* live
+    const fvMesh& live,
+    const label targetRanks = 0
 )
 {
-    fileName meshSubDir;
-    if (regionName == polyMesh::defaultRegion)
-    {
-        meshSubDir = polyMesh::meshSubDir;
-    }
-    else
-    {
-        meshSubDir = regionName / polyMesh::meshSubDir;
-    }
-
-    // Either clone the live mesh in memory or re-read the checkpoint
-    // from disk. Everything downstream is identical: the clone is built
-    // to be indistinguishable from what the disk read produces.
-    autoPtr<fvMesh> meshPtr;
-    if (live)
-    {
-        meshPtr = dmrCloneLiveMesh(*live, runTime, regionName);
-    }
-    else
-    {
-        meshPtr.reset
-        (
-            new fvMesh
-            (
-                IOobject
-                (
-                    regionName,
-                    runTime.findInstance(meshSubDir, "points"),
-                    runTime,
-                    IOobject::MUST_READ,
-                    IOobject::AUTO_WRITE,
-                    false
-                )
-            )
-        );
-    }
+    // Always from the live mesh in memory, never re-read from the
+    // checkpoint on disk. The two callers both hold it: the shrink runs
+    // in the DYING group, which is still resident, and the uniform write
+    // runs in the solver itself. Grow is the one case with no live mesh
+    // to clone (its group is a fresh set of processes and the ranks that
+    // held the data are gone), and it has its own reader built for that,
+    // loadOrCreateMesh, which tolerates ranks holding nothing.
+    autoPtr<fvMesh> meshPtr(dmrCloneLiveMesh(live, runTime, regionName));
     fvMesh& mesh = meshPtr();
 
-    autoPtr<decompositionMethod> distributor
-    (
-        decompositionMethod::NewDistributor
+    labelList finalDecomp;
+    {
+        dictionary decomposeDict
         (
             decompositionMethod::decomposeParDict(runTime)
-        )
-    );
-    const labelList finalDecomp = dmrDecompose(distributor(), mesh);
+        );
 
-    IOobjectList allObjects(mesh, runTime.name());
+        if (targetRanks > 0)
+        {
+            decomposeDict.set("numberOfSubdomains", targetRanks);
+        }
+
+        autoPtr<decompositionMethod> distributor
+        (
+            decompositionMethod::NewDistributor(decomposeDict)
+        );
+        finalDecomp = dmrDecompose(distributor(), mesh);
+    }
 
     PtrList<volScalarField>              volScalars;
     PtrList<volVectorField>              volVectors;
@@ -1422,21 +1357,21 @@ static void dmrRunFreshRedistribute
     PtrList<surfaceSymmTensorField>      surfSymmTensors;
     PtrList<surfaceTensorField>          surfTensors;
 
-    dmrGatherFields(live, mesh, mesh, allObjects, volScalars);
-    dmrGatherFields(live, mesh, mesh, allObjects, volVectors);
-    dmrGatherFields(live, mesh, mesh, allObjects, volSphereTensors);
-    dmrGatherFields(live, mesh, mesh, allObjects, volSymmTensors);
-    dmrGatherFields(live, mesh, mesh, allObjects, volTensors);
-    dmrGatherFields(live, mesh, mesh, allObjects, surfScalars);
-    dmrGatherFields(live, mesh, mesh, allObjects, surfVectors);
-    dmrGatherFields(live, mesh, mesh, allObjects, surfSphereTensors);
-    dmrGatherFields(live, mesh, mesh, allObjects, surfSymmTensors);
-    dmrGatherFields(live, mesh, mesh, allObjects, surfTensors);
+    dmrCloneFields(live, mesh, mesh, volScalars);
+    dmrCloneFields(live, mesh, mesh, volVectors);
+    dmrCloneFields(live, mesh, mesh, volSphereTensors);
+    dmrCloneFields(live, mesh, mesh, volSymmTensors);
+    dmrCloneFields(live, mesh, mesh, volTensors);
+    dmrCloneFields(live, mesh, mesh, surfScalars);
+    dmrCloneFields(live, mesh, mesh, surfVectors);
+    dmrCloneFields(live, mesh, mesh, surfSphereTensors);
+    dmrCloneFields(live, mesh, mesh, surfSymmTensors);
+    dmrCloneFields(live, mesh, mesh, surfTensors);
 
     // Point fields (e.g. pointDisplacement on moving meshes). Their mesh
-    // type is pointMesh, not fvMesh, so they load against pointMesh::New.
+    // type is pointMesh, not fvMesh, so they clone against pointMesh::New.
     // fvMeshDistribute maps every field registered on the mesh, so these
-    // must be loaded (and thereby registered) before distribute() runs.
+    // must be cloned (and thereby registered) before distribute() runs.
     pointMesh& pMesh = const_cast<pointMesh&>(pointMesh::New(mesh));
 
     PtrList<pointScalarField>          pointScalars;
@@ -1445,11 +1380,11 @@ static void dmrRunFreshRedistribute
     PtrList<pointSymmTensorField>      pointSymmTensors;
     PtrList<pointTensorField>          pointTensors;
 
-    dmrGatherFields(live, mesh, pMesh, allObjects, pointScalars);
-    dmrGatherFields(live, mesh, pMesh, allObjects, pointVectors);
-    dmrGatherFields(live, mesh, pMesh, allObjects, pointSphereTensors);
-    dmrGatherFields(live, mesh, pMesh, allObjects, pointSymmTensors);
-    dmrGatherFields(live, mesh, pMesh, allObjects, pointTensors);
+    dmrCloneFields(live, mesh, pMesh, pointScalars);
+    dmrCloneFields(live, mesh, pMesh, pointVectors);
+    dmrCloneFields(live, mesh, pMesh, pointSphereTensors);
+    dmrCloneFields(live, mesh, pMesh, pointSymmTensors);
+    dmrCloneFields(live, mesh, pMesh, pointTensors);
 
     dmrEnsurePoints0
     (
@@ -1474,7 +1409,18 @@ static void dmrRunFreshRedistribute
     mesh.setInstance(timeName);
     mesh.write();
 
-    dmrWritePoints0Constant(mesh);
+    // constant/<region>/polyMesh/points is the motion reference: SHARED
+    // with the run, not private to this output time. Rewriting it in the
+    // written layout is right when the solver is about to be replaced
+    // (the reconfiguration paths, targetRanks == 0), and is corruption at
+    // a natural write, where those same processor directories keep
+    // serving a solver that is still running at its own width. The
+    // transported reference reaches the time directory either way, as the
+    // points0 field mesh.write() has just emitted.
+    if (targetRanks == 0)
+    {
+        dmrWritePoints0Constant(mesh);
+    }
 }
 
 
@@ -2210,6 +2156,125 @@ static void dmrPurgeSupersededCheckpoints
 }
 
 
+void dmrUniformWriteInPlace(Time& runTime, bool allRegions)
+{
+    // The region set comes from the registry below rather than from this
+    // flag: every live fvMesh has to be redistributed, because the
+    // MIN-layout series is only readable as a case if all of them are.
+    (void)allRegions;
+
+    const label minRanks = dmrMinWorldSize();
+    const std::string timeName = runTime.name();
+
+    // Live meshes, in an order that is identical on every rank: everything
+    // below is collective, so the regions must be visited in lockstep.
+    wordList regionNames;
+    {
+        HashTable<fvMesh*> liveRegions(runTime.lookupClass<fvMesh>());
+        regionNames = liveRegions.sortedToc();
+    }
+
+    // Preconditions, checked BEFORE the first collective so that a case
+    // this path cannot serve degrades to an ordinary write rather than
+    // half-writing. Past this point there is no fallback: a failure
+    // inside fvMeshDistribute leaves the ranks at different points in a
+    // collective sequence, and continuing from there is not recoverable.
+    if (minRanks < 1 || regionNames.empty())
+    {
+        runTime.write();
+        return;
+    }
+
+    // Redistribute a CLONE of each live mesh down to the MIN layout.
+    //
+    // This is the difference between a natural write and the forced
+    // checkpoint DMR takes before a reconfiguration. There the solver is
+    // about to be torn down, so the live mesh may be consumed. Here the
+    // time loop continues immediately afterwards at the running width, so
+    // the live mesh must come through untouched. dmrCloneLiveMesh gives a
+    // separate, non-registered fvMesh built from the live mesh's
+    // primitives; fvMeshDistribute only ever sees that clone, and the
+    // clone dies with the autoPtr on return. The live mesh is neither
+    // redistributed nor re-instanced nor written.
+    forAll(regionNames, i)
+    {
+        dmrRunFreshRedistribute
+        (
+            runTime,
+            timeName,
+            regionNames[i],
+            runTime.lookupObject<fvMesh>(regionNames[i]),
+            minRanks
+        );
+    }
+
+    // The non-field state, uniform/time, which the clones do not carry.
+    //
+    // NOT runTime.write(), and not runTime.writeNow(): in the helper
+    // world those were safe because its registry held nothing but the
+    // clones, whereas here runTime owns the LIVE meshes and their fields.
+    // Either call would walk that registry and emit the running N-way
+    // layout on top of the MIN-way layout just written, into the same
+    // directories. writeTimeDict is the narrow part that is actually
+    // wanted.
+    runTime.writeTimeDict();
+
+    // Derivable caches, as after any redistribute
+    dmrSweepStitchCaches(runTime, timeName, regionNames);
+
+    // Each rank only ever touches its OWN processor directory below, so
+    // the three barriers are not there to order file accesses against one
+    // another. Each buys something different:
+    //
+    //   1. the COLLATED file handler routes writes through master ranks
+    //      and is genuinely collective, so a rank running ahead into the
+    //      rmDir below could overtake a write still in flight. No-op
+    //      under the default uncollated handler.
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Ranks outside the MIN layout received no cells, so what they just
+    // wrote is an empty mesh. Drop it, leaving the output series exactly
+    // minRanks wide and readable as a case.
+    if (Pstream::myProcNo() >= minRanks)
+    {
+        const fileName stale(runTime.path()/timeName);
+        if (isDir(stale))
+        {
+            rmDir(stale);
+        }
+    }
+
+    //   2. promotes what the sentinel MEANS, from "this rank's slice
+    //      finished" to "the whole output time finished", which is the
+    //      reading that makes it useful for rejecting a partial write.
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Sentinel, written LAST by every rank that keeps this time: an
+    // output directory without it was produced by a write that died
+    // partway, so the time is suspect and should be discarded rather
+    // than trusted.
+    if (Pstream::myProcNo() < minRanks)
+    {
+        const fileName marker(runTime.path()/timeName/".complete");
+        if (FILE* f = std::fopen(marker.c_str(), "w"))
+        {
+            std::fclose(f);
+        }
+    }
+
+    //   3. keeps the write's skew OUT OF THE CE READING. Correctness does
+    //      not need it: the next timestep's first linear solve is a
+    //      collective that resynchronises anyway. But that is the whole
+    //      problem. The tail above is uncollective filesystem work, so
+    //      ranks leave at different times, and without a barrier that
+    //      spread is absorbed by the next timestep's first collective,
+    //      where TALP charges it to the solver instead of to the write.
+    //      CE is what the controller reconfigures on, so a write must not
+    //      be able to depress it.
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+
 void dmrWrite(Time& runTime, bool allRegions)
 {
     int worldSize = 1;
@@ -2220,17 +2285,45 @@ void dmrWrite(Time& runTime, bool allRegions)
      && runTime.writeTime()
      && worldSize > dmrMinWorldSize();
 
-    // Complete handoff: on the uniform path the solver performs NO I/O.
-    // It gives its state to the helper world and carries straight on;
-    // the helper writes the fields, the mesh AND the non-field state
-    // (uniform/time) in the MIN layout. Writing anything here would be
-    // work the helper immediately supersedes, and it would race the
-    // helper's cleanup of the directories belonging to the ranks outside
-    // that layout — which is why this used to have to be sequenced.
+    // On the uniform path the solver does its own I/O, but writes the
+    // MIN-layout copy rather than its running layout: a plain
+    // runTime.write() here would emit the N-way state into the very
+    // directories the MIN-way state is going to, and the two would
+    // interleave.
     if (uniform)
     {
-        dmrSpawnUniformWrite(runTime, allRegions);
+        dmrUniformWriteInPlace(runTime, allRegions);
         return;
+    }
+
+    // At MIN width the running layout already IS the target, so this is
+    // an ordinary write. It must still emit its own polyMesh.
+    //
+    // OpenFOAM resolves a time directory that carries no mesh by searching
+    // backwards for the nearest one that does, and under the uniform-write
+    // regime the nearest one is a mesh this run is not using: the uniform
+    // write re-decomposes from scratch at every output time, whereas the
+    // layout the solver is actually running at came from the last
+    // reconfiguration. Both are MIN-wide, so nothing looks wrong, but they
+    // assign different cells to each rank and give the patches different
+    // sizes. The fields then read against the wrong partition, which
+    // surfaces far away as a boundary field whose value list does not
+    // match its patch. Writing the mesh makes every output time
+    // self-contained, which is the invariant the whole series relies on.
+    //
+    // setInstance, not a bare write flag: it re-arms points AND topology
+    // for writing (setPointsWrite/setTopologyWrite, which polyMesh clears
+    // after each write so a static mesh is emitted once) and points them
+    // at this time directory rather than the one the mesh was read from.
+    // It touches only IOobject instances and write options, never
+    // topology or geometry, so the running solver is unaffected.
+    if (dmrUniformWriteEnabled() && runTime.writeTime())
+    {
+        HashTable<fvMesh*> liveRegions(runTime.lookupClass<fvMesh>());
+        forAllIter(HashTable<fvMesh*>, liveRegions, iter)
+        {
+            iter()->setInstance(runTime.name());
+        }
     }
 
     runTime.write();
@@ -2834,21 +2927,18 @@ static void dmrShrinkInPlace
         }
     }
 
-    // When the redistribute sources the fields from memory it rewrites
-    // every one of them in the new layout, so writing them here in the
-    // old layout first is redundant I/O; keep the rest of the
-    // checkpoint (uniform/time above all).
+    // The redistribute sources the fields from memory and rewrites every
+    // one of them in the new layout, so writing them here in the old
+    // layout first is redundant I/O; keep the rest of the checkpoint
+    // (uniform/time above all).
     DynamicList<regIOobject*> demoted;
-    if (dmrCloneEnabled())
+    forAll(regionNames, i)
     {
-        forAll(regionNames, i)
-        {
-            dmrDemoteCheckpointFields
-            (
-                runTime.lookupObject<fvMesh>(regionNames[i]),
-                demoted
-            );
-        }
+        dmrDemoteCheckpointFields
+        (
+            runTime.lookupObject<fvMesh>(regionNames[i]),
+            demoted
+        );
     }
 
     const double writeStart = MPI_Wtime();
@@ -2899,19 +2989,10 @@ static void dmrShrinkInPlace
             casePath, "system/decomposeParDict",
             "decomposer", "scotch"
         );
-        // ptscotch, not scotch. Both register as distributors, but
-        // ptscotch registers ONLY as a distributor — it exists for
-        // exactly this case, redistributing an already-decomposed mesh
-        // in parallel. Plain scotch also registers as a decomposer and
-        // is what decomposePar uses serially. On MN5 a 2800 -> 1792
-        // reconfiguration of a 100M-cell case sat in
-        // distributor().decompose() for over an hour without emitting
-        // anything (2026-07-26), which is what prompted the change.
-        // Overridable per run via FOAM_DMR_DISTRIBUTOR.
         dmrUpdateDictEntry
         (
             casePath, "system/decomposeParDict",
-            "distributor", dmrDistributorName()
+            "distributor", dmrDistributorName
         );
     }
 
@@ -2922,14 +3003,15 @@ static void dmrShrinkInPlace
     forAll(regionNames, i)
     {
         // The live mesh is still resident on this (dying) group, so the
-        // checkpoint it was just written from can be reproduced in
-        // memory instead of being read back off disk
-        const fvMesh* live =
-            dmrCloneEnabled()
-          ? &runTime.lookupObject<fvMesh>(regionNames[i])
-          : nullptr;
-
-        dmrRunFreshRedistribute(runTime, timeName, regionNames[i], live);
+        // checkpoint it was just written from is reproduced in memory
+        // rather than read back off disk
+        dmrRunFreshRedistribute
+        (
+            runTime,
+            timeName,
+            regionNames[i],
+            runTime.lookupObject<fvMesh>(regionNames[i])
+        );
     }
 
     const double redistEnd = MPI_Wtime();
@@ -2978,8 +3060,7 @@ static void dmrShrinkInPlace
             casePath,
             "Shrink redistribute complete ("
           + std::to_string(regionNames.size()) + " region(s)) in "
-          + elapsed + " s ["
-          + (dmrCloneEnabled() ? "clone" : "disk") + "]."
+          + elapsed + " s."
         );
     }
 
@@ -3046,7 +3127,15 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
         return;
     }
 
-    // Unknown direction: legacy reconstructPar path (safety net).
+    // Unknown direction. Nothing correct is left to do: the redistribute
+    // has to know which way the world is changing, and a checkpoint
+    // written for the wrong target does not match the group that will
+    // read it. Flush what we have, say why, and stop.
+    //
+    // dmr_get_analytics() reports only the LATEST event, and the CE
+    // policy emits DMR_EVENT_TALP_CHECK_CE_ACC after the
+    // start-of-reconfiguration event dmrQueryWorldInfo switches on. That
+    // is the known way to arrive here.
     runTime.writeNow();
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -3054,190 +3143,31 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
     if (Pstream::master())
     {
         const std::string casePath = runTime.globalPath();
-        const std::string timeName = runTime.name();
 
         dmrLifecycleLog
         (
             casePath,
-            "Checkpoint at t=" + timeName
+            "Checkpoint at t=" + runTime.name()
           + (isDmrForced ? " (DMR-forced)" : " (writeInterval)")
         );
-
-        if (worldOk)
-        {
-            dmrWriteWorldMeta(casePath, world);
-            dmrLifecycleLog
-            (
-                casePath,
-                std::string("Reconfig ") + dmrDirToStr(world.dir)
-              + ": N_old=" + std::to_string(world.nOld)
-              + " -> N_new=" + std::to_string(world.nNew)
-            );
-        }
-        else
-        {
-            dmrLifecycleLog
-            (
-                casePath,
-                "Reconfig direction unknown (DMR analytics unavailable)."
-            );
-        }
-
-        // The legacy serial reconstructPar/decomposePar path below is the
-        // rank-0 gather this pipeline exists to remove: on a large case it
-        // is ruinously slow and can exhaust the memory of rank 0's node.
-        // Falling into it silently, as happened on the first CE-policy run
-        // (2026-07-26), wastes the allocation and produces a result that
-        // does not represent the parallel pipeline at all.
-        //
-        // Known cause of an unknown direction: dmr_get_analytics() reports
-        // only the LATEST event, and the CE policy emits
-        // DMR_EVENT_TALP_CHECK_CE_ACC after the start-of-reconfiguration
-        // event that dmrQueryWorldInfo switches on. Fix that rather than
-        // relying on this fallback.
-        if (!dmrLegacyFallbackAllowed())
-        {
-            if (Pstream::master())
-            {
-                dmrLifecycleLog
-                (
-                    casePath,
-                    "FATAL: refusing the serial reconstruct fallback."
-                    " Set FOAM_DMR_ALLOW_SERIAL_FALLBACK=1 to permit it."
-                );
-            }
-
-            FatalErrorInFunction
-                << "DMR reconfiguration direction could not be determined,"
-                << " and the serial reconstructPar fallback is disabled."
-                << nl
-                << "The checkpoint at this time has been written; the run"
-                << " is stopping rather than performing a rank-0 gather."
-                << exit(FatalError);
-        }
-
-        dmrLifecycleLog(casePath, "Reconstructing processor directories...");
-
-        // -newTimes merges only times not yet in serial. -rm is omitted
-        // because on dynamic meshes removing processor*/<earlier>/
-        // mid-walk trips the facesInstance check in
-        // domainDecomposition::readUpdateReconstruct; we sweep below
-        // after reconstructPar has exited.
-        std::string cmd =
-            "reconstructPar -newTimes -case '" + casePath + "'";
-        if (allRegions) cmd += " -allRegions";
-
-        dmrRunOrAbort(casePath, "dmr_reconstruct.log", cmd);
-
-        // Remove processor*/<time>/ only when the serial <time>/ exists,
-        // so a silent reconstruct no-op cannot delete data.
-        {
-            glob_t pg;
-            const std::string ppattern = casePath + "/processor*";
-            if (glob(ppattern.c_str(), GLOB_ONLYDIR, nullptr, &pg) == 0)
-            {
-                for (size_t i = 0; i < pg.gl_pathc; ++i)
-                {
-                    const std::string procDir(pg.gl_pathv[i]);
-                    glob_t tg;
-                    const std::string tpattern = procDir + "/[0-9]*";
-                    if (glob(tpattern.c_str(), GLOB_ONLYDIR, nullptr, &tg) == 0)
-                    {
-                        for (size_t j = 0; j < tg.gl_pathc; ++j)
-                        {
-                            const std::string procTimeDir(tg.gl_pathv[j]);
-                            const auto slash = procTimeDir.find_last_of('/');
-                            const std::string tName =
-                                procTimeDir.substr(slash + 1);
-                            const std::string serialTimeDir =
-                                casePath + "/" + tName;
-                            if (Foam::isDir(serialTimeDir))
-                            {
-                                Foam::rmDir(procTimeDir);
-                            }
-                        }
-                        globfree(&tg);
-                    }
-                }
-                globfree(&pg);
-            }
-        }
-
-        // sync() guards against filesystem coherence delays we observed
-        // on Docker bind mounts before the new group's decomposePar
-        // reads what we wrote. No-op on POSIX-coherent FS (GPFS, Lustre,
-        // ext4).
-        ::sync();
-
-        dmrLifecycleLog(casePath, "Reconstruction complete.");
-
-        // Sentinel-based checkpoint cleanup. The sweep deletes prior
-        // off-cadence DMR-forced checkpoints — their data is already
-        // in memory and is not needed for restart — EXCEPT any time
-        // directory whose polyMesh/ holds a mesh-write (faces file):
-        // those are anchors that a future decomposePar's -time chain
-        // needs (bug 0004368).
-        //
-        // OF time names compare as floats, not as version-sort strings
-        // (which would mis-order "0.17" before "0.085").
-        if (isDmrForced)
-        {
-            const std::string sentinel =
-                casePath + "/" + timeName + "/.dmr_checkpoint";
-            if (FILE* s = std::fopen(sentinel.c_str(), "w"))
-                std::fclose(s);
-
-            const std::string pattern = casePath + "/*/.dmr_checkpoint";
-            glob_t g;
-            if (glob(pattern.c_str(), 0, nullptr, &g) == 0)
-            {
-                const std::string suffix = "/.dmr_checkpoint";
-                std::vector<std::pair<double, std::string>> dirs;
-                dirs.reserve(g.gl_pathc);
-                for (size_t i = 0; i < g.gl_pathc; ++i)
-                {
-                    std::string p(g.gl_pathv[i]);
-                    p.resize(p.size() - suffix.size());
-                    const auto slash = p.find_last_of('/');
-                    const std::string tName = p.substr(slash + 1);
-                    try
-                    {
-                        dirs.emplace_back(std::stod(tName), p);
-                    }
-                    catch (const std::exception&) {}
-                }
-                globfree(&g);
-
-                std::sort(dirs.begin(), dirs.end());
-
-                // Drop newest (last); remove rest unless mesh-write anchor.
-                for (size_t i = 0; i + 1 < dirs.size(); ++i)
-                {
-                    const std::string& abs = dirs[i].second;
-                    const auto slash = abs.find_last_of('/');
-                    const std::string tName = abs.substr(slash + 1);
-
-                    if (dmrTimeDirHasMeshWrite(casePath, tName, allRegions))
-                    {
-                        // Keep mesh-write anchors; just drop the sentinel
-                        // so the next sweep does not retry.
-                        const std::string thisSentinel =
-                            abs + "/.dmr_checkpoint";
-                        ::unlink(thisSentinel.c_str());
-                        continue;
-                    }
-
-                    Foam::rmDir(abs);
-                }
-            }
-        }
+        dmrLifecycleLog
+        (
+            casePath,
+            "FATAL: reconfiguration direction unknown"
+            " (DMR analytics unavailable)."
+        );
     }
 
-    // Hold old-group ranks in lockstep before they exit DMR_AUTO and
-    // proceed into MPI_Finalize via dmr_reconfigure().
-    MPI_Barrier(MPI_COMM_WORLD);
+    FatalErrorInFunction
+        << "DMR reconfiguration direction could not be determined." << nl
+        << "The checkpoint at this time has been written; the run is"
+        << " stopping rather than continuing with an unknown target"
+        << " layout." << nl
+        << "dmrQueryWorldInfo reads dmr_get_analytics(), which reports"
+        << " only the latest event; the CE policy can overwrite the"
+        << " start-of-reconfiguration event before this point."
+        << exit(FatalError);
 }
-
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -3310,19 +3240,10 @@ void dmrRestart(const std::string& casePath, bool allRegions)
 
         // NewDistributor (used by the in-process redistributes) reads
         // its own 'distributor' key, separate from 'decomposer'.
-        // ptscotch, not scotch. Both register as distributors, but
-        // ptscotch registers ONLY as a distributor — it exists for
-        // exactly this case, redistributing an already-decomposed mesh
-        // in parallel. Plain scotch also registers as a decomposer and
-        // is what decomposePar uses serially. On MN5 a 2800 -> 1792
-        // reconfiguration of a 100M-cell case sat in
-        // distributor().decompose() for over an hour without emitting
-        // anything (2026-07-26), which is what prompted the change.
-        // Overridable per run via FOAM_DMR_DISTRIBUTOR.
         dmrUpdateDictEntry
         (
             casePath, "system/decomposeParDict",
-            "distributor", dmrDistributorName()
+            "distributor", dmrDistributorName
         );
 
         dmrUpdateDictEntry
@@ -3357,54 +3278,24 @@ void dmrRestart(const std::string& casePath, bool allRegions)
         }
         else
         {
-            const std::string restartTime = dmrLatestTimeName(casePath);
-            if (restartTime.empty())
-            {
-                std::fprintf
-                (
-                    stderr,
-                    "DMR: FATAL — no time directories found in '%s'.\n",
-                    casePath.c_str()
-                );
-                MPI_Abort(MPI_COMM_WORLD, 1);
-            }
+            // Both directions place the data themselves. There is no
+            // third way to obtain it: only the direction says which group
+            // holds it and which layout it is in.
+            dmrLifecycleLog
+            (
+                casePath,
+                "FATAL: reconfiguration direction unknown at restart"
+                " (no world meta from the old group)."
+            );
 
-            // For moving-mesh cases the polyMesh topology is only written
-            // at mesh-swap times; between those, time directories contain
-            // only a `points` file. decomposePar evolves topology forward
-            // via a comma-separated time chain (e.g. -time 0.1,0.8) — see
-            // bug 0004368 on bugs.openfoam.org.
-            const std::string timeArg =
-                dmrBuildDecomposeTimeArg(casePath, restartTime, allRegions);
-
-            std::string cmd =
-                "decomposePar -force -time " + timeArg + " -cellProc"
-              + " -case '" + casePath + "'";
-            if (allRegions) cmd += " -allRegions";
-
-            dmrRunOrAbort(casePath, "dmr_decompose.log", cmd);
-
-            // Engine-style cases keep additional sub-meshes under
-            // constant/meshes/<name> that -allRegions does not visit.
-            const std::string subMeshGlob =
-                casePath + "/constant/meshes/*";
-            glob_t mg;
-            if (glob(subMeshGlob.c_str(), GLOB_ONLYDIR, nullptr, &mg) == 0)
-            {
-                for (size_t i = 0; i < mg.gl_pathc; ++i)
-                {
-                    const std::string p(mg.gl_pathv[i]);
-                    const auto slash = p.find_last_of('/');
-                    const std::string meshName = p.substr(slash + 1);
-                    const std::string mcmd =
-                        "decomposePar -mesh " + meshName
-                      + " -region fluid -case '" + casePath + "'";
-                    dmrRunOrAbort(casePath, "dmr_decompose.log", mcmd);
-                }
-                globfree(&mg);
-            }
-
-            dmrLifecycleLog(casePath, "Decomposition complete.");
+            std::fprintf
+            (
+                stderr,
+                "DMR: FATAL - reconfiguration direction unknown at"
+                " restart; refusing to guess the layout of '%s'.\n",
+                casePath.c_str()
+            );
+            MPI_Abort(MPI_COMM_WORLD, 1);
         }
     }
 

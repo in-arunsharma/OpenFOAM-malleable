@@ -54,11 +54,13 @@ extern "C"
 #include <mpi.h>
 #include <glob.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <limits>
 #include <ctime>
@@ -1308,6 +1310,77 @@ static void dmrDemoteCheckpointFields
 // over the whole world and needs no ranks beyond the ones already running,
 // because fvMeshDistribute's requirement is max(source, target) ranks and
 // the source width is the world width in both cases.
+// Children currently writing an output time, one per region per write.
+static std::vector<pid_t>& dmrWriterPids()
+{
+    static std::vector<pid_t> pids;
+    return pids;
+}
+
+
+// Off by setting FOAM_DMR_ASYNC_WRITE=0. This exists because fork under
+// an MPI runtime is the one part of the design that depends on the
+// runtime behaving (some builds warn or misbehave when a process forks
+// with registered memory), so there has to be a way to take it out of the
+// picture while diagnosing something else. It changes timing only: the
+// bytes written are identical either way.
+static bool dmrAsyncWriteEnabled()
+{
+    static const bool enabled = []()
+    {
+        const char* env = std::getenv("FOAM_DMR_ASYNC_WRITE");
+        return !env || std::string(env) != "0";
+    }();
+    return enabled;
+}
+
+
+// Written LAST, after the data, by whoever wrote it: an output directory
+// without it came from a write that died partway, so the time is suspect.
+// With the asynchronous write this is the ONLY way to tell a finished
+// time from one still being written, because the solver has moved on.
+static void dmrWriteCompleteSentinel
+(
+    const Time& runTime,
+    const std::string& timeName
+)
+{
+    const fileName marker(runTime.path()/timeName/".complete");
+    if (FILE* f = std::fopen(marker.c_str(), "w"))
+    {
+        std::fclose(f);
+    }
+}
+
+
+// Reap the writers from the previous output time.
+//
+// Must be called before anything that would race them: the next write to
+// the same directories, a reconfiguration (which tears down this process
+// group entirely), and the end of the run. Cheap in the normal case,
+// where they finished many timesteps ago.
+static void dmrWaitForWriters()
+{
+    std::vector<pid_t>& pids = dmrWriterPids();
+    for (const pid_t pid : pids)
+    {
+        int status = 0;
+        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR)
+        {}
+
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        {
+            WarningInFunction
+                << "asynchronous write process " << label(pid)
+                << " did not exit cleanly; the output time it was writing"
+                << " has no .complete marker and should be discarded"
+                << endl;
+        }
+    }
+    pids.clear();
+}
+
+
 static void dmrRunFreshRedistribute
 (
     Time& runTime,
@@ -1407,7 +1480,73 @@ static void dmrRunFreshRedistribute
     }
 
     mesh.setInstance(timeName);
+
+    // Ranks outside the target layout received no cells, so they have
+    // nothing to emit. Returning here rather than writing an empty mesh
+    // and deleting it afterwards also removes the only reason the write
+    // and the cleanup ever had to be ordered against each other.
+    if (targetRanks > 0 && Pstream::myProcNo() >= targetRanks)
+    {
+        return;
+    }
+
+    // The uniform write's output is emitted by a FORKED CHILD so the time
+    // loop does not wait for the disk. Reasons this is a fork and not a
+    // thread, and not a second MPI world:
+    //
+    //  - a thread cannot do it. Every Pstream operation draws on process-
+    //    global state (UPstream::msgType_, worldComm, the communicator
+    //    stacks), so two threads inside OpenFOAM interleave message tags
+    //    and mismatch each other's exchanges. OpenFOAM's own async writer,
+    //    OFstreamCollator, respects the same boundary: it gathers on the
+    //    calling thread and lets the thread do nothing but write bytes.
+    //  - a spawned MPI world can do it, and did, but it needs ranks it
+    //    does not have. At solver width on full nodes that doubled the
+    //    processes per node and exhausted MN5's SysV segment limit.
+    //  - fork gives the isolation of a process for free: the child owns a
+    //    private copy of every one of those globals, and because it does
+    //    NO MPI it allocates no new segments, which is the resource the
+    //    limit actually counts.
+    //
+    // Writing is safe in the child because it is pure local file I/O:
+    // fileOperation::writeObject is mkDir + NewOFstream + writeHeader +
+    // writeData, with no Pstream anywhere on the uncollated path. The
+    // child's pages are copy-on-write and it only reads them, so it costs
+    // page tables rather than a copy of the mesh.
+    //
+    // _exit, never exit: the child must not run atexit handlers or flush
+    // the parent's stdio, and must not reach MPI_Finalize.
+    if (targetRanks > 0 && dmrAsyncWriteEnabled())
+    {
+        dmrWaitForWriters();
+
+        const pid_t pid = ::fork();
+        if (pid == 0)
+        {
+            mesh.write();
+            dmrWriteCompleteSentinel(runTime, timeName);
+            ::_exit(0);
+        }
+        else if (pid > 0)
+        {
+            dmrWriterPids().push_back(pid);
+            return;
+        }
+
+        // fork failed: fall through and write here rather than lose the
+        // output time
+        WarningInFunction
+            << "fork() for the asynchronous write failed ("
+            << std::strerror(errno) << "); writing synchronously" << endl;
+    }
+
     mesh.write();
+
+    if (targetRanks > 0)
+    {
+        dmrWriteCompleteSentinel(runTime, timeName);
+        return;
+    }
 
     // constant/<region>/polyMesh/points is the motion reference: SHARED
     // with the run, not private to this output time. Rewriting it in the
@@ -2222,19 +2361,10 @@ void dmrUniformWriteInPlace(Time& runTime, bool allRegions)
     // Derivable caches, as after any redistribute
     dmrSweepStitchCaches(runTime, timeName, regionNames);
 
-    // Each rank only ever touches its OWN processor directory below, so
-    // the three barriers are not there to order file accesses against one
-    // another. Each buys something different:
-    //
-    //   1. the COLLATED file handler routes writes through master ranks
-    //      and is genuinely collective, so a rank running ahead into the
-    //      rmDir below could overtake a write still in flight. No-op
-    //      under the default uncollated handler.
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // Ranks outside the MIN layout received no cells, so what they just
-    // wrote is an empty mesh. Drop it, leaving the output series exactly
-    // minRanks wide and readable as a case.
+    // Ranks outside the MIN layout received no cells, so there is nothing
+    // of theirs in this output time. They do not write it at all (the
+    // write above is skipped for them), which leaves only a directory a
+    // previous generation may have left behind.
     if (Pstream::myProcNo() >= minRanks)
     {
         const fileName stale(runTime.path()/timeName);
@@ -2244,33 +2374,15 @@ void dmrUniformWriteInPlace(Time& runTime, bool allRegions)
         }
     }
 
-    //   2. promotes what the sentinel MEANS, from "this rank's slice
-    //      finished" to "the whole output time finished", which is the
-    //      reading that makes it useful for rejecting a partial write.
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // Sentinel, written LAST by every rank that keeps this time: an
-    // output directory without it was produced by a write that died
-    // partway, so the time is suspect and should be discarded rather
-    // than trusted.
-    if (Pstream::myProcNo() < minRanks)
-    {
-        const fileName marker(runTime.path()/timeName/".complete");
-        if (FILE* f = std::fopen(marker.c_str(), "w"))
-        {
-            std::fclose(f);
-        }
-    }
-
-    //   3. keeps the write's skew OUT OF THE CE READING. Correctness does
-    //      not need it: the next timestep's first linear solve is a
-    //      collective that resynchronises anyway. But that is the whole
-    //      problem. The tail above is uncollective filesystem work, so
-    //      ranks leave at different times, and without a barrier that
-    //      spread is absorbed by the next timestep's first collective,
-    //      where TALP charges it to the solver instead of to the write.
-    //      CE is what the controller reconfigures on, so a write must not
-    //      be able to depress it.
+    // One barrier, and it is not there to order file accesses: each rank
+    // touches only its own processor directory, and the writers are now
+    // separate processes anyway. It keeps the write's SKEW out of the CE
+    // reading. The work above is uncollective filesystem work, so ranks
+    // leave it at different times, and without a barrier that spread is
+    // absorbed by the next timestep's first collective, where TALP
+    // charges it to the solver rather than to the write. CE is what the
+    // controller reconfigures on, so a write must not be able to depress
+    // it.
     MPI_Barrier(MPI_COMM_WORLD);
 }
 
@@ -2327,6 +2439,16 @@ void dmrWrite(Time& runTime, bool allRegions)
     }
 
     runTime.write();
+
+    // Same marker the asynchronous writer drops, so that "has .complete"
+    // is a single test a consumer can apply to EVERY output time rather
+    // than one that happens to hold only for the times written while the
+    // run was above MIN. This path is synchronous, so reaching here is
+    // itself the proof the time is finished.
+    if (dmrUniformWriteEnabled() && runTime.writeTime())
+    {
+        dmrWriteCompleteSentinel(runTime, runTime.name());
+    }
 }
 
 
@@ -3072,16 +3194,18 @@ static void dmrShrinkInPlace
 
 void dmrCheckpoint(Time& runTime, bool allRegions)
 {
-    // Everything below is followed by dmr_reconfigure(), which tears down
-    // and restarts the DVM the uniform-write helper lives in, killing it
-    // mid-write. Wait for it before that happens - but on the way OUT, so
-    // this rank's own checkpoint and redistribute (hundreds of seconds on
-    // a large case) overlap the helper's write rather than serialising
-    // with it. There is no data dependency between them: the helper is
-    // writing a previous output time, this rank is handling the current
-    // reconfiguration. Declared as a scope guard so it also covers the
-    // early returns below, and any added later.
-    const dmrHelperBarrier helperBarrier;
+    // Everything below is followed by dmr_reconfigure(), which tears this
+    // process group down. Any asynchronous writer still running would be
+    // killed mid-file, leaving an output time with no .complete marker.
+    // Reaped on the way OUT, so this rank's own checkpoint and
+    // redistribute overlap the writers rather than serialising with them:
+    // there is no data dependency, they are finishing a PREVIOUS output
+    // time while this handles the current reconfiguration. A scope guard,
+    // so it also covers the early returns below and any added later.
+    struct WriterJoin
+    {
+        ~WriterJoin() { dmrWaitForWriters(); }
+    } writerJoin;
 
     DmrWorldInfo world;
     const bool worldOk = dmrQueryWorldInfo(world);
@@ -3338,9 +3462,9 @@ void dmrRestart(const std::string& casePath, bool allRegions)
 
 void dmrFinalize(const std::string& casePath, bool /*allRegions*/)
 {
-    // End of run: the helper must finish before this process group exits,
-    // or the last output time is left half written.
-    dmrWaitForHelper();
+    // End of run: the asynchronous writers must finish before this
+    // process group exits, or the last output time is left half written.
+    dmrWaitForWriters();
 
     MPI_Barrier(MPI_COMM_WORLD);
 

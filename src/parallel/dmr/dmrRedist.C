@@ -902,134 +902,6 @@ static void dmrRemoveTransientInternalPatch(fvMesh& mesh)
 }
 
 
-// Never let a partition boundary fall across a zero-area face.
-//
-// fvPatch::nf() is Sf()/mag(Sf()). It is evaluated on every COUPLED patch,
-// so a face with mag(Sf) == 0 is harmless while it stays internal and
-// divides by zero the moment it becomes a processor face. That is what
-// fvMeshDistribute::distribute() does at the end of a redistribute, via
-// correctCoupledPatchFields -> deltaCoeffs -> fvPatch::delta() -> nf().
-//
-// Axisymmetric (wedge) meshes have exactly such faces: the cell face on
-// the axis collapses to a line as r -> 0. The solver never trips over
-// them because it only needs deltaCoeffs on faces that are not processor
-// faces; only a re-cut promotes an axis face to a processor face, which
-// is why this appears at a reconfiguration and not during time stepping,
-// and why it is intermittent (it needs the partitioner to cut there).
-//
-// Rather than repair the geometry or guard the division, both of which
-// are OpenFOAM's own code, forbid the cut: any two cells sharing a
-// degenerate face are pinned to the same destination. Union-find, so a
-// chain of collapsed faces collapses to one group. A no-op on meshes that
-// have no such faces, which is a single pass over the internal faces.
-static label dmrPinDegenerateFaces(const fvMesh& mesh, labelList& decomp)
-{
-    const label nCells = mesh.nCells();
-    if (nCells == 0 || decomp.size() != nCells)
-    {
-        return 0;
-    }
-
-    const scalarField& magSf = mesh.magSf().primitiveField();
-    const labelUList& own = mesh.faceOwner();
-    const labelUList& nei = mesh.faceNeighbour();
-    const label nInt = mesh.nInternalFaces();
-
-    // Absolute, not relative to the mesh scale: the failure is division by
-    // EXACTLY zero, so the threshold only has to separate a true zero (and
-    // anything that underflowed to one) from the smallest legitimate face.
-    // A relative threshold would start pinning healthy small faces on
-    // finely resolved meshes and quietly damage the load balance.
-    const scalar tol = vSmall;
-
-    labelList root(identityMap(nCells));
-
-    // find with path halving
-    auto find = [&root](label i)
-    {
-        while (root[i] != i)
-        {
-            root[i] = root[root[i]];
-            i = root[i];
-        }
-        return i;
-    };
-
-    label nPinned = 0;
-    for (label facei = 0; facei < nInt; ++facei)
-    {
-        if (magSf[facei] > tol)
-        {
-            continue;
-        }
-
-        const label a = find(own[facei]);
-        const label b = find(nei[facei]);
-        if (a != b)
-        {
-            root[a > b ? a : b] = (a < b ? a : b);
-        }
-        ++nPinned;
-    }
-
-    // Face-area census of the mesh we are about to redistribute, over
-    // internal AND boundary faces. This is what says whether a zero-area
-    // face is being HANDED to fvMeshDistribute or CREATED inside it, which
-    // are different problems with different owners.
-    {
-        const scalarField& allMag = mesh.magSf();
-        scalar mn = great, mx = 0;
-        label nTiny = 0;
-        forAll(allMag, i)
-        {
-            mn = min(mn, allMag[i]);
-            mx = max(mx, allMag[i]);
-            if (allMag[i] <= vSmall) ++nTiny;
-        }
-        scalar bMn = great;
-        label nbTiny = 0, nbFaces = 0;
-        forAll(mesh.boundary(), patchi)
-        {
-            const scalarField& pm = mesh.boundary()[patchi].magSf();
-            forAll(pm, i)
-            {
-                bMn = min(bMn, pm[i]);
-                if (pm[i] <= vSmall) ++nbTiny;
-                ++nbFaces;
-            }
-        }
-        Pout<< "DMR: faceArea census before distribute:"
-            << " internal min=" << mn << " max=" << mx
-            << " zero=" << nTiny
-            << " | boundary faces=" << nbFaces
-            << " min=" << (nbFaces ? bMn : 0) << " zero=" << nbTiny
-            << " | pinned=" << nPinned << endl;
-    }
-
-    if (nPinned == 0)
-    {
-        return 0;
-    }
-
-    // One destination per group: the group representative's, which is its
-    // lowest-numbered cell, so the choice does not depend on face order.
-    forAll(decomp, celli)
-    {
-        const label r = find(celli);
-        if (r != celli)
-        {
-            decomp[celli] = decomp[r];
-        }
-    }
-
-    Pout<< "DMR: pinned " << nPinned
-        << " zero-area face(s) (mag(Sf) <= " << tol
-        << ") so no partition boundary crosses them" << endl;
-
-    return nPinned;
-}
-
-
 // Run the distributor and return one destination per cell.
 //
 // ptscotch returns a SIZE-1 list for a ZERO-CELL mesh, which
@@ -1060,8 +932,6 @@ static labelList dmrDecompose
 
         decomp.setSize(0);
     }
-
-    dmrPinDegenerateFaces(mesh, decomp);
 
     return decomp;
 }
@@ -1471,6 +1341,43 @@ static void dmrRunFreshRedistribute
     );
 
     const bool addedPatch = dmrAddTransientInternalPatch(mesh);
+
+    // Drop the fvMesh geometry caches before the redistribute. Without
+    // this, a rank that hands away ALL its cells dies with SIGFPE inside
+    // fvMeshDistribute::distribute(), and the reason is a dangling slice,
+    // not a degenerate mesh:
+    //
+    //   - Sf/magSf/C/Cf on an fvMesh are shallow slices over
+    //     primitiveMesh::faceAreas() etc. (SlicedGeometricField ->
+    //     UList::shallowCopy), built on demand and cached in the fvMesh.
+    //   - Every topology change inside distribute() goes through
+    //     polyTopoChange::changeMesh -> polyMesh::resetPrimitives ->
+    //     initMesh -> primitiveMesh::reset -> clearOut(), which FREES the
+    //     arrays those slices point at, and never calls the virtual
+    //     fvMesh::topoChange that would have dropped the slices too.
+    //   - The only fv-level invalidation on the path is fvMesh::addPatch,
+    //     reached from addProcPatches. A rank left with no cells has no
+    //     neighbours, adds no processor patch, and is never cleared.
+    //   - correctCoupledPatchFields then asks for deltaCoeffs, which
+    //     evaluates every patch's fvPatch::nf() = Sf()/magSf() through
+    //     the stale slices: the old size (hundreds of faces on a mesh that
+    //     now has none) over freed memory. Whether that memory holds an
+    //     exact zero is up to the allocator, which is why it is
+    //     intermittent, shrink-only, and independent of the geometry.
+    //
+    // Instrumented and confirmed on the stock redistributePar reproducer
+    // (movingCone, 4 -> 2, moved state): the emptied ranks show
+    // nFaces=0 with a magSf slice of size 805 reading negative and zero
+    // areas, while ranks that keep cells are fully consistent. Clearing
+    // here makes distribute() rebuild the slices from the current
+    // primitives when it first needs them, and it does not rebuild them
+    // earlier than that, so the clear holds through to the fault point.
+    // Verified: the reproducer goes from exit 136 to exit 0 with FP
+    // trapping ON, checkMesh OK, all fields finite.
+    //
+    // This belongs upstream (clear fv geometry after repatch, or route
+    // the changes through fvMesh::topoChange); reported with the above.
+    mesh.clearGeom();
 
     fvMeshDistribute(mesh).distribute(finalDecomp);
 
@@ -2905,6 +2812,13 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
             )
         );
         const labelList finalDecomp = dmrDecompose(distributor(), mesh);
+
+        // Same invariant as the shrink path (see dmrRunFreshRedistribute
+        // for the full account): never hand fvMeshDistribute stale
+        // geometry slices. Grow empties no rank, so it is not known to
+        // fault, but the guard costs only a demand-driven recompute and
+        // removes any reliance on that asymmetry.
+        mesh.clearGeom();
 
         fvMeshDistribute(mesh).distribute(finalDecomp);
 

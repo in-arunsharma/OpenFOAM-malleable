@@ -24,16 +24,18 @@ License
 Description
     Checkpoint / restart helpers for DMR-driven malleable solvers.
 
-    On reconfiguration the OLD process group calls dmrCheckpoint() to
-    flush its fields and reconstruct them to serial on disk; the NEW
-    group calls dmrRestart() to update the case dictionaries and
-    decompose for the new process count. dmrFinalize() runs after the
-    time loop ends.
-
-    reconstructPar and decomposePar are invoked as subprocesses;
-    in-process reuse fails with MPI_ERR_TRUNCATE on the post-restart
-    communicator. Compiled into libfoamDmr, linked by foamRun and
-    foamMultiRun.
+    On reconfiguration the OLD process group calls dmrCheckpoint(): a
+    checkpoint at the current time and, for a SHRINK, the in-memory
+    redistribution of every region into the new layout (clone,
+    fvMeshDistribute, re-stitch of the non-conformal couplings, write).
+    The NEW group calls dmrRestart() to update the case dictionaries;
+    after a GROW it redistributes the checkpoint in-process to the larger
+    world (dmrGrowRedistribute). dmrFinalize() runs after the time loop
+    ends. Output is written in the MIN layout by the uniform write, so
+    nothing is ever reconstructed to serial. The one stock utility still
+    forked is decomposePar, per swap mesh under constant/meshes of a
+    mesh-to-mesh case (dmrRedistributeSwapMeshes). Compiled into
+    libfoamDmr, linked by foamRun and foamMultiRun.
 
 \*---------------------------------------------------------------------------*/
 
@@ -49,17 +51,19 @@ Description
 namespace Foam
 {
 
-//- OLD-group callback: writeNow + reconstructPar -newTimes -rm.
-//  Aborts via MPI_Abort on subprocess failure to avoid handing a
-//  partial state to the new group.
+//- OLD-group callback: joins any asynchronous writers, writes the
+//  checkpoint (writeNow), and for a SHRINK redistributes every region
+//  in memory into the new layout and writes that (dmrShrinkInPlace).
+//  An unknown reconfiguration direction is a hard stop (FatalError):
+//  there is no serial fallback.
 void dmrCheckpoint(Time& runTime, bool allRegions = false);
 
-//- NEW-group callback (inside DMR_AUTO restart phase): update
-//  decomposeParDict (numberOfSubdomains, decomposer) and controlDict
-//  (startFrom latestTime), then decomposePar for the new process count.
-//  For moving-mesh cases the -time argument is a comma-separated chain
-//  starting from the most recent polyMesh-write time so decomposePar
-//  evolves the topology forward correctly.
+//- NEW-group callback (inside DMR_AUTO restart phase): reads the world
+//  metadata the old group left, updates decomposeParDict
+//  (numberOfSubdomains, decomposer, distributor) and controlDict
+//  (startFrom latestTime). No decomposition: after a SHRINK the data is
+//  already in the new layout, after a GROW dmrGrowRedistribute brings
+//  it there in-process. An unknown direction aborts (MPI_Abort).
 void dmrRestart(const std::string& casePath, bool allRegions = false);
 
 //- NEW-group hook, included between createTime.H and createMesh.H
@@ -71,9 +75,9 @@ void dmrRestart(const std::string& casePath, bool allRegions = false);
 //  this process generation follows a DMR GROW reconfiguration.
 void dmrGrowRedistribute(Time& runTime, bool allRegions = false);
 
-//- After the time loop ends: a final reconstructPar -newTimes -rm,
-//  then sweep any remaining DMR-forced checkpoint sentinels.
-//  Uses WarningInFunction (not MPI_Abort) on failure.
+//- After the time loop ends: joins the asynchronous writers so every
+//  output time is complete before the process exits. Nothing is
+//  reconstructed: the output already sits in the MIN layout.
 void dmrFinalize(const std::string& casePath, bool allRegions = false);
 
 //- Replaces runTime.write() in the solver's time loop (dmrWrite.H).

@@ -27,6 +27,15 @@ License
 #include "OSspecific.H"
 #include "Pstream.H"
 #include "fvMesh.H"
+#include "fvMeshStitcher.H"
+#include "nonConformalFvPatch.H"
+#include "mixedFvPatchField.H"
+#include "fixedGradientFvPatchField.H"
+#include "surfaceInterpolate.H"
+#include "surfaceToVolVelocity.H"
+#include "nullObject.H"
+#include "nonConformalMappedPolyFacesFvsPatchLabelField.H"
+#include "solver.H"
 #include "fvMeshDistribute.H"
 #include "decompositionMethod.H"
 #include "polyDistributionMap.H"
@@ -456,12 +465,17 @@ static bool dmrReadWorldMeta
 // the master interpolates each field to zero size (via the subsetter)
 // and sends it to them, keeping the field set identical on every rank
 // before fvMeshDistribute runs. Mirrors redistributePar.C's readFields.
+// Read on the ranks that hold a mesh. The ranks the grow added get their
+// zero-sized copies later, from the master, once every region is
+// conformal again (dmrSendZeroFieldsGrow): the copies come from
+// fvMeshSubset::interpolate, which needs the base fvPatch::start(), and a
+// non-conformal patch with faces has none (engine grow, 2026-09-10). The
+// read itself must happen stitched, in the sizes the checkpoint has.
 template<class GeoField>
-static void dmrLoadFieldsGrow
+static void dmrReadFieldsGrow
 (
     const boolList& haveMesh,
     const typename GeoField::Mesh& mesh,
-    const autoPtr<fvMeshSubset>& subsetterPtr,
     IOobjectList& allObjects,
     PtrList<GeoField>& fields
 )
@@ -481,36 +495,92 @@ static void dmrLoadFieldsGrow
             << abort(FatalError);
     }
 
+    if (!haveMesh[Pstream::myProcNo()])
+    {
+        return;
+    }
+
     fields.setSize(masterNames.size());
+
+    forAll(masterNames, i)
+    {
+        IOobject& io = objects[masterNames[i]];
+        io.writeOpt() = IOobject::AUTO_WRITE;
+
+        fields.set(i, new GeoField(io, mesh));
+    }
+}
+
+
+// The registry a field of the given mesh type lives in
+static const objectRegistry& dmrFieldDb(const fvMesh& mesh)
+{
+    return mesh;
+}
+
+static const objectRegistry& dmrFieldDb(const pointMesh& mesh)
+{
+    return mesh();
+}
+
+
+// The zero-sized copies for the ranks without a mesh, from the master's
+// registered fields, which are conformal by now. The copies are stored
+// in the receiving mesh's registry, as the read fields are.
+template<class GeoField>
+static void dmrSendZeroFieldsGrow
+(
+    const boolList& haveMesh,
+    const typename GeoField::Mesh& mesh,
+    const fvMeshSubset& subsetter
+)
+{
+    const objectRegistry& db = dmrFieldDb(mesh);
+
+    // Checkpoint fields only (dmrReadFieldsGrow marks them AUTO_WRITE):
+    // the registry also holds the mesh's cached geometry (sliced fields
+    // such as magSf, NO_WRITE), which a subset cannot interpolate; on
+    // non-conformal cases the conform has cleared them by now, on the
+    // others they are still there (movingCone grow, 2026-09-10)
+    wordList names;
+    if (Pstream::master())
+    {
+        const HashTable<const GeoField*> all(db.lookupClass<GeoField>());
+
+        DynamicList<word> writable;
+        forAllConstIter(typename HashTable<const GeoField*>, all, iter)
+        {
+            if (iter()->writeOpt() == IOobject::AUTO_WRITE)
+            {
+                writable.append(iter.key());
+            }
+        }
+
+        names.transfer(writable);
+        sort(names);
+    }
+    Pstream::scatter(names);
 
     if (Pstream::master())
     {
-        forAll(masterNames, i)
+        forAll(names, i)
         {
-            IOobject& io = objects[masterNames[i]];
-            io.writeOpt() = IOobject::AUTO_WRITE;
+            tmp<GeoField> tsubfld =
+                subsetter.interpolate(db.lookupObject<GeoField>(names[i]));
 
-            fields.set(i, new GeoField(io, mesh));
-
-            // Zero-sized copy to every rank without a mesh
-            if (subsetterPtr.valid())
+            for (label proci = 1; proci < Pstream::nProcs(); proci++)
             {
-                tmp<GeoField> tsubfld = subsetterPtr().interpolate(fields[i]);
-
-                for (label proci = 1; proci < Pstream::nProcs(); proci++)
+                if (!haveMesh[proci])
                 {
-                    if (!haveMesh[proci])
-                    {
-                        OPstream toProc(Pstream::commsTypes::blocking, proci);
-                        toProc<< tsubfld();
-                    }
+                    OPstream toProc(Pstream::commsTypes::blocking, proci);
+                    toProc<< tsubfld();
                 }
             }
         }
     }
     else if (!haveMesh[Pstream::myProcNo()])
     {
-        forAll(masterNames, i)
+        forAll(names, i)
         {
             IPstream fromMaster
             (
@@ -519,16 +589,15 @@ static void dmrLoadFieldsGrow
             );
             dictionary fieldDict(fromMaster);
 
-            fields.set
+            regIOobject::store
             (
-                i,
                 new GeoField
                 (
                     IOobject
                     (
-                        masterNames[i],
-                        mesh.db().time().name(),
-                        mesh.db(),
+                        names[i],
+                        db.time().name(),
+                        db,
                         IOobject::NO_READ,
                         IOobject::AUTO_WRITE
                     ),
@@ -536,16 +605,6 @@ static void dmrLoadFieldsGrow
                     fieldDict
                 )
             );
-        }
-    }
-    else
-    {
-        forAll(masterNames, i)
-        {
-            IOobject& io = objects[masterNames[i]];
-            io.writeOpt() = IOobject::AUTO_WRITE;
-
-            fields.set(i, new GeoField(io, mesh));
         }
     }
 }
@@ -587,6 +646,12 @@ static void dmrEnsurePoints0
             // The checkpoint carries it; already loaded and transported
             return;
         }
+    }
+
+    // The grow path hands its read fields to the registry before this
+    if (mesh.foundObject<pointVectorField>("points0"))
+    {
+        return;
     }
 
     const fileName regionDir =
@@ -1005,9 +1070,24 @@ static autoPtr<fvMesh> dmrCloneLiveMesh
             livePatches[patchi].clone(clone.poly().boundary()).ptr();
     }
 
-    // No parallel comms: the patch structure is already consistent
-    // across ranks (it is a copy of the live mesh's, which is)
-    clone.addFvPatches(patches, false);
+    // validBoundary = true, i.e. run polyBoundaryMesh::topoChange() and
+    // calcGeometry() on the clone. That is a collective, and every rank
+    // is here in lockstep, so it is safe. It is also REQUIRED, not merely
+    // consistent: processorPolyPatch's clone constructor leaves
+    // neighbFaceCentres_/neighbFaceAreas_/neighbFaceCellCentres_ EMPTY
+    // (only the topoChange exchange fills them), and any cyclic-type
+    // patch field evaluates at construction (cyclicFvPatchField's
+    // dictionary constructor ends with evaluate()), which computes
+    // interpolation weights for EVERY patch and, on a conformal mesh,
+    // reads those three lists through processorFvPatch::makeWeights.
+    // With them empty, coupledFvPatch::makeWeights indexes past the end
+    // and the clone dies with SIGSEGV while the fields are still being
+    // rebuilt (engine2Valve2D, nonConformalCyclic patch fields, first
+    // shrink). Cases without cyclic patch fields never evaluate at
+    // construction, which is why cavity/drivAer/movingCone never saw it.
+    // fvMeshDistribute::receiveMesh gets away with `false` because it
+    // maps fields rather than constructing them from dictionaries.
+    clone.addFvPatches(patches, true);
 
     return clonePtr;
 }
@@ -1251,13 +1331,28 @@ static void dmrWaitForWriters()
 }
 
 
-static void dmrRunFreshRedistribute
+// Hand the cloned fields to the clone's registry, which then owns and
+// deletes them with the clone. The clone outlives the PtrLists
+// dmrCloneFields fills (it is returned to callers that write it later),
+// and a field owned by a list that has gone out of scope has already
+// checked itself out: the write finds a mesh with no fields on it.
+template<class FieldType>
+static void dmrStoreFields(PtrList<FieldType>& fields)
+{
+    forAll(fields, i)
+    {
+        regIOobject::store(fields.set(i, nullptr).ptr());
+    }
+}
+
+
+static autoPtr<fvMesh> dmrRedistributeToClone
 (
     Time& runTime,
     const std::string& timeName,
     const word& regionName,
     const fvMesh& live,
-    const label targetRanks = 0
+    const label targetRanks
 )
 {
     // Always from the live mesh in memory, never re-read from the
@@ -1340,6 +1435,22 @@ static void dmrRunFreshRedistribute
         pointVectors
     );
 
+    dmrStoreFields(volScalars);
+    dmrStoreFields(volVectors);
+    dmrStoreFields(volSphereTensors);
+    dmrStoreFields(volSymmTensors);
+    dmrStoreFields(volTensors);
+    dmrStoreFields(surfScalars);
+    dmrStoreFields(surfVectors);
+    dmrStoreFields(surfSphereTensors);
+    dmrStoreFields(surfSymmTensors);
+    dmrStoreFields(surfTensors);
+    dmrStoreFields(pointScalars);
+    dmrStoreFields(pointVectors);
+    dmrStoreFields(pointSphereTensors);
+    dmrStoreFields(pointSymmTensors);
+    dmrStoreFields(pointTensors);
+
     const bool addedPatch = dmrAddTransientInternalPatch(mesh);
 
     // Drop the fvMesh geometry caches before the redistribute. Without
@@ -1387,6 +1498,30 @@ static void dmrRunFreshRedistribute
     }
 
     mesh.setInstance(timeName);
+
+    return meshPtr;
+}
+
+
+// Clone, redistribute and WRITE one region. The uniform write uses this.
+// The multi-region shrink does not: it keeps every region's clone alive
+// until all are written, because non-conformal couplings between regions
+// have to be re-stitched across the new layout before anything is
+// written (dmrRestitchClones).
+static void dmrRunFreshRedistribute
+(
+    Time& runTime,
+    const std::string& timeName,
+    const word& regionName,
+    const fvMesh& live,
+    const label targetRanks = 0
+)
+{
+    autoPtr<fvMesh> meshPtr
+    (
+        dmrRedistributeToClone(runTime, timeName, regionName, live, targetRanks)
+    );
+    fvMesh& mesh = meshPtr();
 
     // Ranks outside the target layout received no cells, so they have
     // nothing to emit. Returning here rather than writing an empty mesh
@@ -1483,7 +1618,8 @@ static void dmrSweepStitchCaches
 (
     Time& runTime,
     const std::string& timeName,
-    const wordList& regionNames
+    const wordList& regionNames,
+    const bool keepTimeCache = false
 )
 {
     forAll(regionNames, i)
@@ -1498,7 +1634,10 @@ static void dmrSweepStitchCaches
         const fileName cacheC =
             runTime.path()/runTime.constant()/regionDir/"fvMesh";
 
-        if (isDir(cacheT)) rmDir(cacheT);
+        // The time-instance cache is kept only when it was just produced
+        // for THIS layout by the destination re-stitch; the constant one
+        // always belongs to the launch layout and is always stale
+        if (!keepTimeCache && isDir(cacheT)) rmDir(cacheT);
         if (isDir(cacheC)) rmDir(cacheC);
 
         // tetBasePtIs is the same class of derivable cache, with a
@@ -2590,6 +2729,21 @@ void dmrRelayoutFromParent(Time& runTime)
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
+// Shared with the shrink path, defined with it below
+static bool dmrHasNonConformalPatches(const PtrList<fvMesh>& clones);
+static void dmrPostConstructAll(PtrList<fvMesh>& meshes);
+static void dmrConnectAll(const wordList& regionNames, PtrList<fvMesh>& meshes);
+static void dmrConformAll(const wordList& regionNames, PtrList<fvMesh>& meshes);
+static void dmrFillAfterStitch
+(
+    fvMesh& mesh,
+    const word& regionName,
+    const std::string& timeName,
+    const label nNew
+);
+static void dmrLoadSolverLibraries(const Time& runTime);
+
+
 void dmrGrowRedistribute(Time& runTime, bool allRegions)
 {
     // Only a process generation that follows a DMR GROW reconfiguration
@@ -2646,11 +2800,31 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
         regionNames = wordList(1, word(polyMesh::defaultRegion));
     }
 
+    dmrLoadSolverLibraries(runTime);
+
+    const label nRegions = regionNames.size();
+
+    // Same structure as the shrink (dmrShrinkInPlace): every region
+    // through each phase before the next, because the non-conformal
+    // couplings between regions need all of them at once, for the stitch
+    // that lets the fields be read in the sizes the checkpoint has, and
+    // for the re-stitch on the new layout before the write.
+    //
+    // Phase 1: every region's mesh, loaded (or fabricated empty on the
+    // ranks the grow added) and REGISTERED under the region name, so
+    // that the mapped walls find their neighbours when stitched. The
+    // meshes stay conformal and unstitched here: loadOrCreateMesh does
+    // not post-construct.
+    PtrList<fvMesh> meshes(nRegions);
+    List<fileName> meshSubDirs(nRegions);
+    List<fileName> masterInstDirs(nRegions);
+    List<boolList> haveMeshes(nRegions);
+
     forAll(regionNames, regioni)
     {
         const word& regionName = regionNames[regioni];
 
-        fileName meshSubDir;
+        fileName& meshSubDir = meshSubDirs[regioni];
         if (regionName == polyMesh::defaultRegion)
         {
             meshSubDir = polyMesh::meshSubDir;
@@ -2661,32 +2835,37 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
         }
 
         // Only the master is guaranteed to have the mesh on disk
-        fileName masterInstDir;
+        fileName& masterInstDir = masterInstDirs[regioni];
         if (Pstream::master())
         {
             masterInstDir = runTime.findInstance(meshSubDir, "points");
         }
         Pstream::scatter(masterInstDir);
 
-        boolList haveMesh(Pstream::nProcs(), false);
+        boolList& haveMesh = haveMeshes[regioni];
+        haveMesh.setSize(Pstream::nProcs(), false);
         haveMesh[Pstream::myProcNo()] =
             isDir(runTime.path()/masterInstDir/meshSubDir);
         Pstream::gatherList(haveMesh);
         Pstream::scatterList(haveMesh);
 
-        autoPtr<fvMesh> meshPtr = loadOrCreateMesh
+        meshes.set
         (
-            IOobject
+            regioni,
+            loadOrCreateMesh
             (
-                regionName,
-                masterInstDir,
-                runTime,
-                IOobject::MUST_READ,
-                IOobject::AUTO_WRITE,
-                false
-            )
+                IOobject
+                (
+                    regionName,
+                    masterInstDir,
+                    runTime,
+                    IOobject::MUST_READ,
+                    IOobject::AUTO_WRITE,
+                    true
+                )
+            ).ptr()
         );
-        fvMesh& mesh = meshPtr();
+        fvMesh& mesh = meshes[regioni];
 
         // loadOrCreateMesh's dummy zones must never reach the written
         // mesh: the unoriented dummyFaceZone FATALs in a later
@@ -2703,6 +2882,98 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
             mesh.faceZones().clear();
             mesh.cellZones().clear();
         }
+    }
+
+    // Phase 2: stitch the regions together, from geometry. The maps on
+    // disk are the old world's (their mapped-wall offset tables are
+    // sized for it) and are not loaded. Cases without non-conformal
+    // patches never touch the stitcher, as on the shrink side.
+    const bool stitched = dmrHasNonConformalPatches(meshes);
+    if (stitched)
+    {
+        dmrPostConstructAll(meshes);
+        dmrConnectAll(regionNames, meshes);
+    }
+
+    // Phase 3: the fields, read in the sizes the checkpoint has (written
+    // unconformed, by the shrink or by the solver), and handed to each
+    // mesh's registry so the redistribute transports them
+    forAll(regionNames, regioni)
+    {
+        const boolList& haveMesh = haveMeshes[regioni];
+        fvMesh& mesh = meshes[regioni];
+
+        IOobjectList allObjects(mesh, runTime.name());
+
+        PtrList<volScalarField>              volScalars;
+        PtrList<volVectorField>              volVectors;
+        PtrList<volSphericalTensorField>     volSphereTensors;
+        PtrList<volSymmTensorField>          volSymmTensors;
+        PtrList<volTensorField>              volTensors;
+        PtrList<surfaceScalarField>          surfScalars;
+        PtrList<surfaceVectorField>          surfVectors;
+        PtrList<surfaceSphericalTensorField> surfSphereTensors;
+        PtrList<surfaceSymmTensorField>      surfSymmTensors;
+        PtrList<surfaceTensorField>          surfTensors;
+
+        dmrReadFieldsGrow(haveMesh, mesh, allObjects, volScalars);
+        dmrReadFieldsGrow(haveMesh, mesh, allObjects, volVectors);
+        dmrReadFieldsGrow(haveMesh, mesh, allObjects, volSphereTensors);
+        dmrReadFieldsGrow(haveMesh, mesh, allObjects, volSymmTensors);
+        dmrReadFieldsGrow(haveMesh, mesh, allObjects, volTensors);
+        dmrReadFieldsGrow(haveMesh, mesh, allObjects, surfScalars);
+        dmrReadFieldsGrow(haveMesh, mesh, allObjects, surfVectors);
+        dmrReadFieldsGrow(haveMesh, mesh, allObjects, surfSphereTensors);
+        dmrReadFieldsGrow(haveMesh, mesh, allObjects, surfSymmTensors);
+        dmrReadFieldsGrow(haveMesh, mesh, allObjects, surfTensors);
+
+        pointMesh& pMesh = const_cast<pointMesh&>(pointMesh::New(mesh));
+
+        PtrList<pointScalarField>          pointScalars;
+        PtrList<pointVectorField>          pointVectors;
+        PtrList<pointSphericalTensorField> pointSphereTensors;
+        PtrList<pointSymmTensorField>      pointSymmTensors;
+        PtrList<pointTensorField>          pointTensors;
+
+        dmrReadFieldsGrow(haveMesh, pMesh, allObjects, pointScalars);
+        dmrReadFieldsGrow(haveMesh, pMesh, allObjects, pointVectors);
+        dmrReadFieldsGrow(haveMesh, pMesh, allObjects, pointSphereTensors);
+        dmrReadFieldsGrow(haveMesh, pMesh, allObjects, pointSymmTensors);
+        dmrReadFieldsGrow(haveMesh, pMesh, allObjects, pointTensors);
+
+        dmrStoreFields(volScalars);
+        dmrStoreFields(volVectors);
+        dmrStoreFields(volSphereTensors);
+        dmrStoreFields(volSymmTensors);
+        dmrStoreFields(volTensors);
+        dmrStoreFields(surfScalars);
+        dmrStoreFields(surfVectors);
+        dmrStoreFields(surfSphereTensors);
+        dmrStoreFields(surfSymmTensors);
+        dmrStoreFields(surfTensors);
+        dmrStoreFields(pointScalars);
+        dmrStoreFields(pointVectors);
+        dmrStoreFields(pointSphereTensors);
+        dmrStoreFields(pointSymmTensors);
+        dmrStoreFields(pointTensors);
+    }
+
+    // Phase 4: conform for the redistribution (fvMeshDistribute requires
+    // it)
+    if (stitched)
+    {
+        dmrConformAll(regionNames, meshes);
+    }
+
+    // Phase 4b: the ranks the grow added get zero-sized copies of every
+    // field from the master, and the motion reference is resolved, now
+    // that every region is conformal again (see dmrReadFieldsGrow)
+    forAll(regionNames, regioni)
+    {
+        const word& regionName = regionNames[regioni];
+        const boolList& haveMesh = haveMeshes[regioni];
+        fvMesh& mesh = meshes[regioni];
+        pointMesh& pMesh = const_cast<pointMesh&>(pointMesh::New(mesh));
 
         // Zero-cell subsetter so the master can send zero-sized fields
         // to the ranks that have none (redistributePar.C pattern)
@@ -2743,7 +3014,7 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
             // fvMeshSubset::interpolate on a point field lazily
             // constructs the subset mesh's pointMesh, whose
             // constructor (pointBoundaryMesh::calcGeometry) is
-            // COLLECTIVE — but interpolate is only called on the
+            // COLLECTIVE, but interpolate is only called on the
             // master (zero-field sends), deadlocking every other rank
             // in the following scatter. Stock redistributePar has the
             // same defect whenever point fields are present (gdb
@@ -2751,45 +3022,25 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
             // pointMesh collectively up front makes the master-only
             // path a pure cache hit.
             (void)pointMesh::New(subsetterPtr().subMesh());
+
+            dmrSendZeroFieldsGrow<volScalarField>(haveMesh, mesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<volVectorField>(haveMesh, mesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<volSphericalTensorField>(haveMesh, mesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<volSymmTensorField>(haveMesh, mesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<volTensorField>(haveMesh, mesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<surfaceScalarField>(haveMesh, mesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<surfaceVectorField>(haveMesh, mesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<surfaceSphericalTensorField>(haveMesh, mesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<surfaceSymmTensorField>(haveMesh, mesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<surfaceTensorField>(haveMesh, mesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<pointScalarField>(haveMesh, pMesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<pointVectorField>(haveMesh, pMesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<pointSphericalTensorField>(haveMesh, pMesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<pointSymmTensorField>(haveMesh, pMesh, subsetterPtr());
+            dmrSendZeroFieldsGrow<pointTensorField>(haveMesh, pMesh, subsetterPtr());
         }
 
-        IOobjectList allObjects(mesh, runTime.name());
-
-        PtrList<volScalarField>              volScalars;
-        PtrList<volVectorField>              volVectors;
-        PtrList<volSphericalTensorField>     volSphereTensors;
-        PtrList<volSymmTensorField>          volSymmTensors;
-        PtrList<volTensorField>              volTensors;
-        PtrList<surfaceScalarField>          surfScalars;
-        PtrList<surfaceVectorField>          surfVectors;
-        PtrList<surfaceSphericalTensorField> surfSphereTensors;
-        PtrList<surfaceSymmTensorField>      surfSymmTensors;
-        PtrList<surfaceTensorField>          surfTensors;
-
-        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, volScalars);
-        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, volVectors);
-        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, volSphereTensors);
-        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, volSymmTensors);
-        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, volTensors);
-        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, surfScalars);
-        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, surfVectors);
-        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, surfSphereTensors);
-        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, surfSymmTensors);
-        dmrLoadFieldsGrow(haveMesh, mesh, subsetterPtr, allObjects, surfTensors);
-
-        pointMesh& pMesh = const_cast<pointMesh&>(pointMesh::New(mesh));
-
-        PtrList<pointScalarField>          pointScalars;
-        PtrList<pointVectorField>          pointVectors;
-        PtrList<pointSphericalTensorField> pointSphereTensors;
-        PtrList<pointSymmTensorField>      pointSymmTensors;
-        PtrList<pointTensorField>          pointTensors;
-
-        dmrLoadFieldsGrow(haveMesh, pMesh, subsetterPtr, allObjects, pointScalars);
-        dmrLoadFieldsGrow(haveMesh, pMesh, subsetterPtr, allObjects, pointVectors);
-        dmrLoadFieldsGrow(haveMesh, pMesh, subsetterPtr, allObjects, pointSphereTensors);
-        dmrLoadFieldsGrow(haveMesh, pMesh, subsetterPtr, allObjects, pointSymmTensors);
-        dmrLoadFieldsGrow(haveMesh, pMesh, subsetterPtr, allObjects, pointTensors);
+        PtrList<pointVectorField> pointVectors;
 
         dmrEnsurePoints0
         (
@@ -2802,6 +3053,14 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
             pointVectors
         );
 
+        dmrStoreFields(pointVectors);
+    }
+
+    // Phase 5: redistribute every region
+    forAll(regionNames, regioni)
+    {
+        fvMesh& mesh = meshes[regioni];
+
         const bool addedPatch = dmrAddTransientInternalPatch(mesh);
 
         autoPtr<decompositionMethod> distributor
@@ -2813,7 +3072,7 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
         );
         const labelList finalDecomp = dmrDecompose(distributor(), mesh);
 
-        // Same invariant as the shrink path (see dmrRunFreshRedistribute
+        // Same invariant as the shrink path (see dmrRedistributeToClone
         // for the full account): never hand fvMeshDistribute stale
         // geometry slices. Grow empties no rank, so it is not known to
         // fault, but the guard costs only a demand-driven recompute and
@@ -2839,6 +3098,30 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
         }
 
         mesh.setInstance(timeName);
+    }
+
+    // Phase 6: re-stitch on the new layout, fill the coupling faces and
+    // write, map included (its offset tables are this world's)
+    if (stitched)
+    {
+        dmrConnectAll(regionNames, meshes);
+
+        forAll(regionNames, regioni)
+        {
+            dmrFillAfterStitch
+            (
+                meshes[regioni], regionNames[regioni], timeName, world.nNew
+            );
+        }
+    }
+
+    forAll(regionNames, regioni)
+    {
+        fvMesh& mesh = meshes[regioni];
+        const fileName& meshSubDir = meshSubDirs[regioni];
+        const fileName& masterInstDir = masterInstDirs[regioni];
+        const boolList& haveMesh = haveMeshes[regioni];
+
         mesh.write();
 
         dmrWritePoints0Constant(mesh);
@@ -2890,10 +3173,14 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
         }
     }
 
-    // Sweep the derivable caches BEFORE the swap-mesh transport: if
+    // The meshes leave the registry before the solver builds its own
+    meshes.clear();
+
+    // Sweep the old-layout caches BEFORE the swap-mesh transport: if
     // the latter fails, the relaunched generation must never read a
-    // stale mixed-layout stitcher cache (engine, 2026-07-13)
-    dmrSweepStitchCaches(runTime, timeName, regionNames);
+    // stale mixed-layout stitcher cache (engine, 2026-07-13). The map
+    // just written for the new layout is kept.
+    dmrSweepStitchCaches(runTime, timeName, regionNames, stitched);
 
     dmrRedistributeSwapMeshes(runTime);
 
@@ -2929,11 +3216,522 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
 }
 
 
+// The coupling faces after the re-stitch. fvMeshStitcher::resizePatchFields
+// (run by connect) applies setSizeFieldMapper, which by its own description
+// "does not actually map values", so at this point every non-conformal
+// patch field of every field holds uninitialised memory: measured on
+// engine2Valve2D as values of 4e+252, denormals and a NaN in phi and
+// rhoUf, and in the refValue/refGradient/valueFraction and gradient
+// entries of T and p. The solver's per-timestep path maps those faces
+// back from the conformedFvPatchField wrappers an earlier disconnect
+// installed; the clones' fields were born conformal and have none (and
+// conformedFvPatchField::unconform refCasts, so that path cannot be run
+// on them). What follows is upstream's own construction for each kind of
+// field when it has no conformed data to map from:
+//
+//   - volume fields: the adjacent cell value, "a tolerable approximation"
+//     in conformedFvPatchField::unconform for calculated conditions.
+//     Mixed and fixed-gradient conditions carry extra entries that their
+//     dictionary constructors read back at restart (coupledTemperature
+//     requires refValue/refGradient/valueFraction, fixedFluxPressure
+//     reads gradient when present), set here consistently with the
+//     value; the condition's own updateCoeffs recomputes them at the
+//     first step.
+//   - face velocities (Uf, rhoUf): the interpolated volume velocity, as
+//     fvMeshStitcher::postUnconformVolFields and fvMeshTopoChangers::
+//     meshToMesh::interpolateUfs do. Upstream resolves rhoUf through a
+//     rhoU field the solver registers only while a topology change is
+//     in progress and never writes; the clone has rho and U instead.
+//   - fluxes (phi): Sf & Uf, the reconstruction the solver modules apply
+//     after a topology change (isothermalFluid::moveMesh). The flux the
+//     live mesh carried on those faces cannot be transported (it lives on
+//     faces the conformal clone does not have); the first pressure
+//     corrector after the restart rewrites it.
+//
+// Any other surface field with coupling faces is a convention with no
+// rule here and stops the run by name rather than being written
+// uninitialised.
+template<class Type>
+static void dmrFillNonConformalVolFields(fvMesh& mesh)
+{
+    UPtrList<VolField<Type>> fields(mesh.fields<VolField<Type>>());
+
+    forAll(fields, i)
+    {
+        typename VolField<Type>::Boundary& bf =
+            fields[i].boundaryFieldRefNoStoreOldTimes();
+
+        forAll(bf, patchi)
+        {
+            fvPatchField<Type>& pf = bf[patchi];
+
+            if (!isA<nonConformalFvPatch>(pf.patch()))
+            {
+                continue;
+            }
+
+            pf == pf.patchInternalField();
+
+            if (isA<mixedFvPatchField<Type>>(pf))
+            {
+                mixedFvPatchField<Type>& mpf =
+                    refCast<mixedFvPatchField<Type>>(pf);
+                mpf.refValue() = pf;
+                mpf.refGrad() = Zero;
+                mpf.valueFraction() = 1;
+            }
+            else if (isA<fixedGradientFvPatchField<Type>>(pf))
+            {
+                refCast<fixedGradientFvPatchField<Type>>(pf).gradient() =
+                    Zero;
+            }
+        }
+    }
+}
+
+
+static void dmrFillNonConformalFaceVelocities(fvMesh& mesh)
+{
+    UPtrList<surfaceVectorField> Ufs(mesh.fields<surfaceVectorField>());
+
+    forAll(Ufs, i)
+    {
+        surfaceVectorField& Uf = Ufs[i];
+
+        tmp<surfaceVectorField> tUfi;
+
+        const volVectorField& U = surfaceToVolVelocity(Uf);
+
+        if (notNull(U) && U.dimensions() == Uf.dimensions())
+        {
+            tUfi = fvc::interpolate(U);
+        }
+        else if
+        (
+            Uf.dimensions() == dimDensity*dimVelocity
+         && mesh.foundObject<volScalarField>("rho")
+         && mesh.foundObject<volVectorField>("U")
+        )
+        {
+            tUfi = fvc::interpolate
+            (
+                mesh.lookupObject<volScalarField>("rho")
+               *mesh.lookupObject<volVectorField>("U")
+            );
+        }
+        else
+        {
+            FatalErrorInFunction
+                << "cannot reconstruct the face velocity " << Uf.name()
+                << " of region " << mesh.name()
+                << " on the non-conformal faces: no volume velocity of"
+                   " dimensions " << Uf.dimensions() << " found"
+                << exit(FatalError);
+        }
+
+        surfaceVectorField::Boundary& bf =
+            Uf.boundaryFieldRefNoStoreOldTimes();
+
+        forAll(bf, patchi)
+        {
+            if (isA<nonConformalFvPatch>(bf[patchi].patch()))
+            {
+                bf[patchi] == tUfi().boundaryField()[patchi];
+            }
+        }
+    }
+}
+
+
+static void dmrFillNonConformalFluxes(fvMesh& mesh)
+{
+    UPtrList<surfaceScalarField> fluxes(mesh.fields<surfaceScalarField>());
+    UPtrList<surfaceVectorField> Ufs(mesh.fields<surfaceVectorField>());
+
+    forAll(fluxes, i)
+    {
+        surfaceScalarField& phi = fluxes[i];
+
+        const surfaceVectorField* UfPtr = nullptr;
+
+        forAll(Ufs, j)
+        {
+            if (Ufs[j].dimensions()*dimArea == phi.dimensions())
+            {
+                UfPtr = &Ufs[j];
+                break;
+            }
+        }
+
+        if (!UfPtr)
+        {
+            FatalErrorInFunction
+                << "cannot reconstruct the flux " << phi.name()
+                << " of region " << mesh.name()
+                << " on the non-conformal faces: no face velocity of"
+                   " dimensions " << phi.dimensions()/dimArea << " found"
+                << exit(FatalError);
+        }
+
+        surfaceScalarField::Boundary& bf =
+            phi.boundaryFieldRefNoStoreOldTimes();
+
+        forAll(bf, patchi)
+        {
+            if (isA<nonConformalFvPatch>(bf[patchi].patch()))
+            {
+                bf[patchi] ==
+                (
+                    mesh.Sf().boundaryField()[patchi]
+                  & UfPtr->boundaryField()[patchi]
+                );
+            }
+        }
+    }
+}
+
+
+template<class Type>
+static void dmrCheckNoNonConformalSurfaceFields(fvMesh& mesh)
+{
+    UPtrList<SurfaceField<Type>> fields(mesh.fields<SurfaceField<Type>>());
+
+    if (fields.size())
+    {
+        FatalErrorInFunction
+            << "surface field " << fields[0].name() << " of region "
+            << mesh.name() << " has no rule for its non-conformal faces"
+            << exit(FatalError);
+    }
+}
+
+
+// Make the polyFaces map loadable by the new world. A mapped wall's entry
+// is a nonConformalMappedPolyFacesFvsPatchLabelField carrying a
+// per-processor offset table sized Pstream::nProcs() of the world that
+// stitched it, i.e. the OLD one here, and the restart's
+// nonConformalMappedFvPatchBase::map walks that table and sends to every
+// entry (engine 4 -> 2: segfault in UOPstream::write to ranks 2 and 3).
+// The ranks the new world does not have hold no cells of the clone, so
+// their blocks are empty and the table is simply cut at nNew; the
+// surviving ranks keep their numbers. polyFacesBfRef() is private to
+// fvMesh, hence the cast on a clone this code owns.
+static void dmrTruncateMappedProcOffsets(fvMesh& mesh, const label nNew)
+{
+    const surfaceLabelField::Boundary& bf = mesh.polyFacesBf();
+
+    forAll(bf, patchi)
+    {
+        if (!isA<nonConformalMappedPolyFacesFvsPatchLabelField>(bf[patchi]))
+        {
+            continue;
+        }
+
+        labelList& offsets =
+            refCast<nonConformalMappedPolyFacesFvsPatchLabelField>
+            (
+                const_cast<fvsPatchLabelField&>(bf[patchi])
+            ).procOffsets();
+
+        if (offsets.size() <= nNew)
+        {
+            continue;
+        }
+
+        for (label proci = nNew; proci < offsets.size(); ++proci)
+        {
+            if (offsets[proci] != bf[patchi].size())
+            {
+                FatalErrorInFunction
+                    << "polyFaces of patch " << bf[patchi].patch().name()
+                    << " of region " << mesh.name() << " has "
+                    << bf[patchi].size() - offsets[proci]
+                    << " faces in the block of rank " << proci
+                    << ", which the new world of " << nNew
+                    << " ranks does not have" << exit(FatalError);
+            }
+        }
+
+        offsets.setSize(nNew);
+    }
+}
+
+
+static bool dmrHasNonConformalPatches(const PtrList<fvMesh>& clones)
+{
+    forAll(clones, i)
+    {
+        forAll(clones[i].boundary(), patchi)
+        {
+            if (isA<nonConformalFvPatch>(clones[i].boundary()[patchi]))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+
+// Re-stitch the redistributed clones at the destination, so that what is
+// written is what the solver itself writes and what its restart reads.
+// Returns false, having touched nothing, for cases without non-conformal
+// patches.
+//
+// The redistribute transports the CONFORMAL state: fvMeshDistribute
+// requires it, and the clone is built from polyMesh primitives, which
+// stay conformal even while the live fvMesh is stitched (the stitched
+// state lives at the fvMesh level, as polyFacesBf plus full Sf/Cf). A
+// conformal write puts `nonuniform List 0()` on every non-conformal patch
+// field. A fresh fvMesh unconforms itself in postConstruct BEFORE any
+// field is read, so its patches already carry their coupling faces (43 on
+// the fluid-liner wall of engine2Valve2D after a 4 -> 2 shrink), and
+// `Field("value", dict, 43)` rejects a 0-element list. The reader accepts
+// `uniform` at any size, which is how the tutorial's 0/ fields survive
+// the same stitch, but an empty field cannot be written as uniform, so
+// this cannot be fixed at the write.
+//
+// OpenFOAM's own runtime load balancer never meets this: fvMesh::distribute
+// requires a conformal mesh, fvMeshStitcher::distribute is empty, and the
+// re-stitch simply happens at the next move(), in memory. Doing the same
+// here, before the write, reproduces the solver's own output: conformal
+// topology plus fields sized to the destination's stitch.
+//
+// The polyFaces map IS written, with its mapped-wall offset tables cut to
+// the new world (dmrTruncateMappedProcOffsets). The restart needs a
+// loadable map: measured on the solver's own writes, serial and 2-rank,
+// a restart with the map present runs on, and one with no map anywhere
+// (this time or an earlier one) re-stitches from geometry, completes one
+// step and dies at the second mesh update in the solver's own
+// conformedFvPatchField::unconform (movingWallSlipVelocity on an error
+// patch, "unmapped elements"). A map one write old was accepted through
+// the instance lookup, so the map's exact time is not what matters.
+//
+// The call is the STARTUP form, connect(changing=false): it resizes the
+// non-conformal patch fields to the new sizes and nothing more, which is
+// what the solver does to fields it has just read. The per-timestep form,
+// changing=true, additionally maps values back through the
+// conformedFvPatchField wrappers that only an earlier disconnect()
+// installs; the clones' fields were born conformal, have no wrappers,
+// and it would refCast-fail on them. The values those resized faces need
+// are then filled explicitly (see dmrFillNonConformalVolFields).
+//
+// It is multi-region: a mapped wall couples only if its neighbour region
+// is found by NAME in the Time registry (patchCoupleds ->
+// nonConformalMappedWallFvPatch::haveNbr), and regionNames() is the
+// transitive closure over those walls. The live meshes hold the names, so
+// they are checked out and the clones checked in for the duration, and
+// the swap is undone before the group exits. Legitimate here and only
+// here: on the shrink path the group is about to die.
+// A stationary stitcher on every mesh: no changers, no zones, and no
+// connect yet (the built-in type; the changing one needs
+// libfvMeshStitchers and a dynamicMeshDict). Once per mesh.
+static void dmrPostConstructAll(PtrList<fvMesh>& meshes)
+{
+    forAll(meshes, i)
+    {
+        meshes[i].postConstruct(false, false, fvMesh::stitchType::none);
+    }
+}
+
+
+// Stitch the regions together from geometry, the startup form
+// (changing=false, no map loaded). Collective; the meshes must be
+// registered under their region names so the mapped walls find their
+// neighbours. connect() on a region also connects its coupled
+// neighbours, so later calls in the loop are no-ops on connected meshes.
+static void dmrConnectAll(const wordList& regionNames, PtrList<fvMesh>& meshes)
+{
+    forAll(meshes, i)
+    {
+        fvMesh& mesh = meshes[i];
+
+        if (!mesh.stitcher().stitches())
+        {
+            continue;
+        }
+
+        mesh.stitcher().connect(false, true, false);
+
+        if (mesh.conformal())
+        {
+            FatalErrorInFunction
+                << "region " << regionNames[i]
+                << " is still conformal after the re-stitch"
+                << exit(FatalError);
+        }
+    }
+}
+
+
+// The reverse: conform every region (fvMeshDistribute requires it). With
+// changing=false the non-conformal patch fields are resized to zero and
+// their values dropped, which is the same information the shrink's
+// conformal clone never has; both sides rebuild it after the re-stitch.
+static void dmrConformAll(const wordList& regionNames, PtrList<fvMesh>& meshes)
+{
+    forAll(meshes, i)
+    {
+        fvMesh& mesh = meshes[i];
+
+        if (!mesh.stitcher().stitches())
+        {
+            continue;
+        }
+
+        mesh.stitcher().disconnect(false, true);
+
+        if (!mesh.conformal())
+        {
+            FatalErrorInFunction
+                << "region " << regionNames[i]
+                << " is still non-conformal after conforming"
+                << exit(FatalError);
+        }
+    }
+}
+
+
+// After the re-stitch on the new layout: the coupling faces' values, the
+// map's offset tables, and the map's write instance
+static void dmrFillAfterStitch
+(
+    fvMesh& mesh,
+    const word& regionName,
+    const std::string& timeName,
+    const label nNew
+)
+{
+    if (!mesh.stitcher().stitches())
+    {
+        return;
+    }
+
+    // Volume fields first: the face velocities interpolate their
+    // boundary values, and the fluxes use the face velocities
+    dmrFillNonConformalVolFields<scalar>(mesh);
+    dmrFillNonConformalVolFields<vector>(mesh);
+    dmrFillNonConformalVolFields<sphericalTensor>(mesh);
+    dmrFillNonConformalVolFields<symmTensor>(mesh);
+    dmrFillNonConformalVolFields<tensor>(mesh);
+    dmrFillNonConformalFaceVelocities(mesh);
+    dmrFillNonConformalFluxes(mesh);
+    dmrCheckNoNonConformalSurfaceFields<sphericalTensor>(mesh);
+    dmrCheckNoNonConformalSurfaceFields<symmTensor>(mesh);
+    dmrCheckNoNonConformalSurfaceFields<tensor>(mesh);
+
+    dmrTruncateMappedProcOffsets(mesh, nNew);
+
+    // Marks the map AUTO_WRITE at this instance, so mesh.write()
+    // emits it and the restart's connect(load=true) finds it
+    mesh.setPolyFacesBfInstance(timeName);
+
+    Info<< "DMR: re-stitched region " << regionName
+        << " on the new layout" << endl;
+}
+
+
+static bool dmrRestitchClones
+(
+    const wordList& regionNames,
+    UPtrList<fvMesh>& lives,
+    PtrList<fvMesh>& clones,
+    const std::string& timeName,
+    const label nNew
+)
+{
+    // Patch TYPES only, so consistent across ranks
+    if (!dmrHasNonConformalPatches(clones))
+    {
+        return false;
+    }
+
+    dmrPostConstructAll(clones);
+
+    // Swap the registry: region names now resolve to the redistributed
+    // meshes, which is what the neighbour lookups have to see
+    // regIOobject:: qualified: objectRegistry, also a base of fvMesh,
+    // declares checkIn(regIOobject&)/checkOut(regIOobject&) and hides the
+    // zero-argument self-registration inherited from regIOobject
+    forAll(clones, i)
+    {
+        lives[i].regIOobject::checkOut();
+        if (!clones[i].regIOobject::checkIn())
+        {
+            FatalErrorInFunction
+                << "could not register the redistributed mesh for region "
+                << regionNames[i] << exit(FatalError);
+        }
+    }
+
+    dmrConnectAll(regionNames, clones);
+
+    forAll(clones, i)
+    {
+        dmrFillAfterStitch(clones[i], regionNames[i], timeName, nNew);
+    }
+
+    return true;
+}
+
+
+// The grow hook runs between createTime and createMesh, before the
+// solver is selected, and the conditions the checkpoint fields carry
+// live in the solver modules' link dependencies (coupledTemperature in
+// the thermophysical transport library the fluid module links). Without
+// them a coupled condition reads as genericFvPatchField, which carries
+// its entries blindly and can be neither resized nor filled by type
+// (engine grow, 2026-09-10: "size of field refValue (76) is not the same
+// size as the patch (0)" from genericFvPatchField). Load what solver::New
+// will load, from the same controlDict entries foamMultiRun and foamRun
+// read.
+static void dmrLoadSolverLibraries(const Time& runTime)
+{
+    const dictionary& controlDict = runTime.controlDict();
+
+    wordHashSet solverNames;
+
+    if (controlDict.isDict("regionSolvers"))
+    {
+        const dictionary& regionSolvers = controlDict.subDict("regionSolvers");
+
+        forAllConstIter(dictionary, regionSolvers, iter)
+        {
+            if (iter().isStream())
+            {
+                solverNames.insert(word(iter().stream()));
+            }
+        }
+    }
+    else if (controlDict.found("solver"))
+    {
+        solverNames.insert(controlDict.lookup<word>("solver"));
+    }
+
+    forAllConstIter(wordHashSet, solverNames, iter)
+    {
+        solver::load(iter.key());
+    }
+}
+
+
+static void dmrRestoreRegistry(UPtrList<fvMesh>& lives, PtrList<fvMesh>& clones)
+{
+    forAll(clones, i)
+    {
+        clones[i].regIOobject::checkOut();
+        lives[i].regIOobject::checkIn();
+    }
+}
+
+
 // SHRINK on the OLD group:
-// 1. Flush the live solver state to processor*/timeName/ (writeNow).
+// 1. Flush the live solver state to processor*/timeName/ (writeNow), with
+//    the fields deferred to the redistribute.
 // 2. Update decomposeParDict for the new world size + scotch.
-// 3. Run the redistribute on a fresh mesh loaded from that just-written
-//    state (see dmrRunFreshRedistribute for the rationale).
+// 3. Redistribute every live region into a clone (in memory, never off
+//    disk), re-stitch the clones together on the new layout when the case
+//    has non-conformal couplings, write them.
 // 4. Sweep processor{N_new..N_old-1}/ - those are empty after the
 //    redistribute and the NEW group will only look at 0..N_new-1.
 static void dmrShrinkInPlace
@@ -3036,26 +3834,54 @@ static void dmrShrinkInPlace
 
     const double redistStart = MPI_Wtime();
 
+    // The live meshes are still resident on this (dying) group, so each
+    // region's checkpoint is reproduced in memory rather than read back
+    // off disk. Every region is redistributed into a clone and the clones
+    // are kept together until all are written: non-conformal couplings
+    // between regions are re-stitched across the NEW layout before the
+    // write, and that needs all of them at once.
+    UPtrList<fvMesh> lives(regionNames.size());
     forAll(regionNames, i)
     {
-        // The live mesh is still resident on this (dying) group, so the
-        // checkpoint it was just written from is reproduced in memory
-        // rather than read back off disk
-        dmrRunFreshRedistribute
+        lives.set(i, &runTime.lookupObjectRef<fvMesh>(regionNames[i]));
+    }
+
+    PtrList<fvMesh> clones(regionNames.size());
+    forAll(regionNames, i)
+    {
+        clones.set
         (
-            runTime,
-            timeName,
-            regionNames[i],
-            runTime.lookupObject<fvMesh>(regionNames[i])
+            i,
+            dmrRedistributeToClone
+            (
+                runTime, timeName, regionNames[i], lives[i], 0
+            ).ptr()
         );
     }
 
+    const bool restitched =
+        dmrRestitchClones(regionNames, lives, clones, timeName, world.nNew);
+
+    forAll(clones, i)
+    {
+        clones[i].write();
+        dmrWritePoints0Constant(clones[i]);
+    }
+
+    if (restitched)
+    {
+        dmrRestoreRegistry(lives, clones);
+    }
+    clones.clear();
+
     const double redistEnd = MPI_Wtime();
 
-    // Sweep the derivable caches BEFORE the swap-mesh transport: if
+    // Sweep the old-layout caches BEFORE the swap-mesh transport: if
     // the latter fails, the relaunched generation must never read a
-    // stale mixed-layout stitcher cache (engine, 2026-07-13)
-    dmrSweepStitchCaches(runTime, timeName, regionNames);
+    // stale mixed-layout stitcher cache (engine, 2026-07-13). The map
+    // the destination re-stitch just wrote at this time is for the new
+    // layout and is what the restart must load, so it is kept.
+    dmrSweepStitchCaches(runTime, timeName, regionNames, restitched);
 
     // Delete the processor dirs beyond the new world size BEFORE the
     // swap-mesh decompose. dmrRedistributeSwapMeshes forks stock

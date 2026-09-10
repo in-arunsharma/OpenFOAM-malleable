@@ -146,26 +146,32 @@ Foam::autoPtr<Foam::fvMesh> Foam::loadOrCreateMesh
         forAll(patchEntries, patchi)
         {
             const entry& e = patchEntries[patchi];
-            const word type(e.dict().lookup("type"));
             const word& name = e.keyword();
 
-            if
-            (
-                type != processorPolyPatch::typeName
-             && type != processorCyclicPolyPatch::typeName
-            )
-            {
-                dictionary patchDict(e.dict());
-                patchDict.set("nFaces", 0);
-                patchDict.set("startFace", 0);
+            dictionary patchDict(e.dict());
+            patchDict.set("nFaces", 0);
+            patchDict.set("startFace", 0);
 
-                patches[patchi] = polyPatch::New
+            autoPtr<polyPatch> pp
+            (
+                polyPatch::New
                 (
                     name,
                     patchDict,
-                    nPatches++,
+                    nPatches,
                     dummyMesh.poly().boundary()
-                ).ptr();
+                )
+            );
+
+            // Processor patches of every kind belong to the ranks that hold
+            // the data, not to a rank holding none. Decided by class, not
+            // by type name: the non-conformal processor cyclics the
+            // stitcher creates (nonConformalProcessorCyclic) are processor
+            // patches too, and copied here they would exchange with
+            // neighbours that never expect them.
+            if (!isA<processorPolyPatch>(pp()))
+            {
+                patches[nPatches++] = pp.ptr();
             }
         }
         patches.setSize(nPatches);
@@ -230,9 +236,24 @@ Foam::autoPtr<Foam::fvMesh> Foam::loadOrCreateMesh
             const word type(e.dict().lookup("type"));
             const word& name = e.keyword();
 
-            if (type == processorPolyPatch::typeName)
+            // Processor patches of every kind are per rank and always
+            // last; stop at the first one. Decided by class (as for the
+            // dummy above): a non-conformal processor cyclic is a
+            // processor patch whose name differs on every rank.
             {
-                break;
+                dictionary patchDict(e.dict());
+                patchDict.set("nFaces", 0);
+                patchDict.set("startFace", 0);
+
+                autoPtr<polyPatch> pp
+                (
+                    polyPatch::New(name, patchDict, patchi, patches)
+                );
+
+                if (isA<processorPolyPatch>(pp()))
+                {
+                    break;
+                }
             }
 
             if (patchi >= patches.size())

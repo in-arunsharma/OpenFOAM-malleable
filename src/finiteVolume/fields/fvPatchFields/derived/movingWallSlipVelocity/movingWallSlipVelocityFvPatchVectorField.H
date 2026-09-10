@@ -123,6 +123,12 @@ public:
 
     // Member Functions
 
+        // Mapping functions
+
+            //- Map the given fvPatchField onto this fvPatchField
+            virtual void map(const fvPatchVectorField&, const fieldMapper&);
+
+
         //- Update the coefficients associated with the patch field
         virtual void updateCoeffs();
 

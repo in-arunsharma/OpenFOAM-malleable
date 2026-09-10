@@ -97,6 +97,30 @@ movingWallSlipVelocityFvPatchVectorField
 
 // * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
 
+void Foam::movingWallSlipVelocityFvPatchVectorField::map
+(
+    const fvPatchVectorField& ptf,
+    const fieldMapper& mapper
+)
+{
+    const movingWallSlipVelocityFvPatchVectorField& mwsvptf =
+        refCast<const movingWallSlipVelocityFvPatchVectorField>(ptf);
+
+    // Faces without a source take the condition's construction state, a
+    // wall at rest with the normal projector; updateCoeffs recomputes it
+    // from the mesh motion before it is used
+    mapper(*this, ptf, vector::zero);
+    mapper(refValue(), mwsvptf.refValue(), vector::zero);
+    mapper(refGrad(), mwsvptf.refGrad(), vector::zero);
+    mapper
+    (
+        valueFraction(),
+        mwsvptf.valueFraction(),
+        [&](){ return sqr(patch().nf()); }
+    );
+}
+
+
 void Foam::movingWallSlipVelocityFvPatchVectorField::updateCoeffs()
 {
     if (updated())

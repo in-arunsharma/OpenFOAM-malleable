@@ -35,7 +35,9 @@ License
 #include "surfaceToVolVelocity.H"
 #include "nullObject.H"
 #include "nonConformalMappedPolyFacesFvsPatchLabelField.H"
+#include "nonConformalProcessorCyclicPolyPatch.H"
 #include "solver.H"
+#include "IOPtrList.H"
 #include "fvMeshDistribute.H"
 #include "decompositionMethod.H"
 #include "polyDistributionMap.H"
@@ -1331,6 +1333,38 @@ static void dmrWaitForWriters()
 }
 
 
+// Dump the boundary a mesh presents to fvMeshDistribute. Diagnostic
+// only, off unless FOAM_DMR_DUMP_PATCHES is set: it exists to compare
+// the region path, which redistributes this case 25 times a run, with
+// the swap-mesh path, which fails in the coupled-face ordering walk.
+// The swap-mesh side of the comparison is read from the piece's
+// boundary file on disk and needs no instrumentation.
+static void dmrDumpPatches(const fvMesh& mesh, const char* what)
+{
+    static const bool on = (std::getenv("FOAM_DMR_DUMP_PATCHES") != nullptr);
+
+    if (!on)
+    {
+        return;
+    }
+
+    const polyBoundaryMesh& pbm = mesh.poly().boundary();
+
+    forAll(pbm, patchi)
+    {
+        Pout<< "DMRPATCH " << what << " region=" << mesh.name()
+            << " nCells=" << mesh.nCells()
+            << " patch=" << patchi
+            << " name=" << pbm[patchi].name()
+            << " type=" << pbm[patchi].type()
+            << " size=" << pbm[patchi].size()
+            << " isProc="
+            << (isA<processorPolyPatch>(pbm[patchi]) ? 1 : 0)
+            << endl;
+    }
+}
+
+
 // Hand the cloned fields to the clone's registry, which then owns and
 // deletes them with the clone. The clone outlives the PtrLists
 // dmrCloneFields fills (it is returned to callers that write it later),
@@ -1489,6 +1523,8 @@ static autoPtr<fvMesh> dmrRedistributeToClone
     // This belongs upstream (clear fv geometry after repatch, or route
     // the changes through fvMesh::topoChange); reported with the above.
     mesh.clearGeom();
+
+    dmrDumpPatches(mesh, "region-before-distribute");
 
     fvMeshDistribute(mesh).distribute(finalDecomp);
 
@@ -1672,27 +1708,500 @@ static void dmrSweepStitchCaches
 // shrink the pieces beyond the new world size would silently drop
 // their cells at the next swap).
 //
-// The pieces are RE-DERIVED from the serial originals rather than
-// redistributed: constant/meshes/<t> at the CASE ROOT is static
-// reference data that survives every reconfiguration, so each rank
-// forks the stock `decomposePar -mesh <t> [-region <r>]` for a
-// round-robin share of the meshes, producing pieces for the current
-// world size (numberOfSubdomains was already rewritten for this
-// reconfiguration) that are byte-equivalent to the original case
-// preparation. Embarrassingly parallel across meshes; serial per
-// mesh, acceptable for read-only reference data.
+
+// IN-PROCESS swap-mesh redistribution. WRITTEN AND NOT IN USE: it fails
+// on engine2Valve2D and the caller below still forks decomposePar. Kept
+// compiled so the next attempt starts from working code rather than from
+// a description. What is established (2026-09-10, jobs 101 to 105):
 //
-// This replaces an fvMeshDistribute-based transport: distributing
-// the old pieces failed with "The ordering walk did not hit every
-// face exactly once" in processorPolyPatch::order on a checkMesh-
-// clean engine swap mesh (the merge of received pieces can leave the
-// two sides of a new processor interface with inconsistent edge
-// connectivity; upstream-report material, see doc 4).
+//   - The failure is "The ordering walk did not hit every face exactly
+//     once" in coupledPolyPatch::order, reached from
+//     processorPolyPatch::order <- polyTopoChange::reorderCoupledFaces
+//     <- fvMeshDistribute::repatch, on the FIRST swap mesh. It is the
+//     same failure recorded in July, so mesh.clearGeom() and the
+//     validBoundary patch attachment (both added since) are not its
+//     cause.
+//   - Not fixed by: the transient internal patch (the region path's
+//     one remaining difference in the call), nor by rebuilding
+//     globalMeshData the way loadOrCreateMesh does before redistributing
+//     a mesh read from disk.
+//   - The region meshes of the same case redistribute through the same
+//     fvMeshDistribute call 25 times per run without trouble, so it is
+//     not fvMeshDistribute as such. Structural difference measured
+//     between the two inputs: the swap-mesh piece carries a plain
+//     processor patch WITH faces alongside five nonConformalProcessor-
+//     Cyclic patches, and it is read from disk (nested instance
+//     constant/meshes/<t>) rather than cloned from a live mesh.
+//   - A standalone reproducer of one swap mesh cannot be built by
+//     copying it into a single-region case: its nonConformalMappedWall
+//     patches name the sibling regions and construction fails with
+//     "liner not found in table".
 //
-// decomposePar's -force flag is NEVER used here: it removes whole
-// processor trees, including the redistributed solution. Stale
-// pieces are removed surgically instead.
-static void dmrRedistributeSwapMeshes(Time& runTime)
+// Next discriminator, not yet run: print the boundary patch types and
+// sizes immediately before distribute() in BOTH paths (region and swap)
+// in one instrumented run, and diff. If the inputs are structurally
+// alike, the difference is in how the mesh object was built and the
+// swap path should build its mesh the way the region path does (clone
+// from primitives, addFvPatches(patches, true)) instead of reading it.
+//
+// Not static: it has no caller, and internal linkage would make that a
+// compiler warning on every build.
+void dmrRedistributeSwapMesh
+(
+    Time& runTime,
+    const word& meshTime,
+    const word& regionName,     // word::null: default-region layout
+    const label nNew
+)
+{
+    const word name =
+        regionName.empty() ? word(polyMesh::defaultRegion) : regionName;
+    const fileName local = fileName("meshes")/meshTime;
+    const fileName meshSubDir =
+        regionName.empty()
+      ? fileName(polyMesh::meshSubDir)
+      : fileName(regionName)/polyMesh::meshSubDir;
+    const fileName pieceDir = runTime.path()/runTime.constant()/local/meshSubDir;
+
+    // SLICE the untouched serial mesh; do not re-arrange the existing
+    // pieces. The two are different operations and only the first is
+    // wanted here. constant/meshes/<t> at the case root is static
+    // reference data that no reconfiguration ever changes, so there is a
+    // whole mesh to cut up and nothing to reconcile. Re-arranging the
+    // pieces instead means merging a layout built for the old rank count
+    // and cutting it again, which has to carry over the bookkeeping that
+    // ties those pieces together, including patches whose names encode
+    // the old rank pairing ("0to3"). On the engine's sliding interfaces
+    // that does not survive: one side of a coupling came out with 44
+    // faces against an empty partner (mesh 120, 2026-09-13).
+    //
+    // This is upstream's own documented recipe for using
+    // redistributePar as a parallel decomposePar: give the undecomposed
+    // mesh to one rank, leave the others empty, and distribute (see the
+    // header of redistributePar.C). The recipe says to COPY the mesh
+    // into processor0 and it means it: the file handler's fall-through
+    // from a processor directory to the case root applies only to global
+    // files, and mesh files are not global
+    // (uncollatedFileOperation.C, the globalFile condition around line
+    // 88). A serial mesh carries no processor patches at all, so the
+    // asymmetric-collective hazard that empty ranks would otherwise
+    // create does not arise.
+    const fileName serialDir =
+        fileName(runTime.globalPath())/runTime.constant()/local;
+    const fileName localDir = runTime.path()/runTime.constant()/local;
+
+    bool haveSerial = false;
+    if (Pstream::master())
+    {
+        haveSerial = isFile(serialDir/meshSubDir/"faces");
+
+        if (haveSerial)
+        {
+            // Stale pieces out, the serial original in
+            if (isDir(localDir)) rmDir(localDir);
+            mkDir(localDir);
+            cp(serialDir/meshSubDir.path(), localDir);
+        }
+    }
+    Pstream::scatter(haveSerial);
+
+    if (!haveSerial)
+    {
+        FatalErrorInFunction
+            << "no serial swap mesh under " << runTime.constant()/local
+            << " for " << meshTime
+            << (regionName.empty() ? "" : " of region " + regionName)
+            << exit(FatalError);
+    }
+
+    // Everyone else starts empty
+    if (!Pstream::master() && isDir(localDir))
+    {
+        rmDir(localDir);
+    }
+
+    boolList haveMesh(Pstream::nProcs(), false);
+    haveMesh[Pstream::masterNo()] = true;
+
+    // Stage markers: the step has been dying silently between the read
+    // and the write, so every stage reports before entering it
+
+    // The master's boundary entries, for the empty meshes (the same
+    // reading trick as loadOrCreateMesh: the file's class is not a list)
+    PtrList<entry> patchEntries;
+    if (Pstream::master())
+    {
+        const word oldTypeName = IOPtrList<entry>::typeName;
+        const_cast<word&>(IOPtrList<entry>::typeName) = word::null;
+        IOPtrList<entry> dictList
+        (
+            IOobject
+            (
+                "boundary",
+                runTime.constant(),
+                local/meshSubDir,
+                runTime,
+                IOobject::MUST_READ,
+                IOobject::NO_WRITE,
+                false
+            )
+        );
+        const_cast<word&>(IOPtrList<entry>::typeName) = oldTypeName;
+        const_cast<word&>(dictList.type()) = dictList.headerClassName();
+        patchEntries.transfer(dictList);
+
+        for
+        (
+            int slave = Pstream::firstSlave();
+            slave <= Pstream::lastSlave();
+            slave++
+        )
+        {
+            OPstream toSlave(Pstream::commsTypes::scheduled, slave);
+            toSlave << patchEntries;
+        }
+    }
+    else
+    {
+        IPstream fromMaster(Pstream::commsTypes::scheduled, Pstream::masterNo());
+        fromMaster >> patchEntries;
+    }
+
+
+    // Read the piece, then REBUILD the mesh from its primitives exactly
+    // as the region path does (dmrCloneLiveMesh). Reading it and handing
+    // the read object to fvMeshDistribute is what fails in the coupled-
+    // face ordering walk; the patch sets of the two inputs are the same
+    // family for family and the zones are not the trigger either (both
+    // measured, 2026-09-13), so the construction is the last difference
+    // left. addFvPatches with validBoundary true is the part that
+    // matters: it runs the processor-patch neighbour exchange that a
+    // plain read does not.
+    //
+    // The rebuilt mesh carries NO zones, as the region clone does not.
+    // If this makes the redistribution pass, transporting the swap
+    // meshes' face zones (the engine's baffles) is the next thing to
+    // add, on both paths.
+    // Only the master has a mesh to read, so this phase is inherently
+    // asymmetric: it must emit no parallel traffic at all. Without this
+    // the ranks with nothing to read run ahead into the collective
+    // inside addFvPatches while the master is still reading, their
+    // messages cross, and the run dies with MPI_ERR_TRUNCATE in
+    // MPI_Recv (engine swap mesh 120, 2026-09-13). Same guard
+    // loadOrCreateMesh uses when it fabricates meshes on some ranks
+    // only. Parallel running is restored before addFvPatches, which is
+    // collective and which every rank then enters together.
+    const bool oldParRun = Pstream::parRun();
+    Pstream::parRun() = false;
+
+    autoPtr<fvMesh> readPtr;
+
+    if (haveMesh[Pstream::myProcNo()])
+    {
+        readPtr.reset
+        (
+            new fvMesh
+            (
+                IOobject
+                (
+                    name,
+                    runTime.constant(),
+                    local,
+                    runTime,
+                    IOobject::MUST_READ,
+                    IOobject::NO_WRITE,
+                    false
+                ),
+                false
+            )
+        );
+    }
+
+
+    pointField points;
+    faceList faces;
+    labelList allOwner;
+    labelList allNeighbour;
+
+    if (readPtr.valid())
+    {
+        points = readPtr().points();
+        faces = readPtr().faces();
+        allOwner = readPtr().faceOwner();
+        allNeighbour = readPtr().faceNeighbour();
+    }
+
+    autoPtr<fvMesh> meshPtr
+    (
+        new fvMesh
+        (
+            IOobject
+            (
+                name,
+                runTime.constant(),
+                local,
+                runTime,
+                IOobject::NO_READ,
+                IOobject::AUTO_WRITE,
+                false
+            ),
+            move(points),
+            move(faces),
+            move(allOwner),
+            move(allNeighbour)
+        )
+    );
+
+    {
+        List<polyPatch*> patches;
+
+        if (readPtr.valid())
+        {
+            const polyBoundaryMesh& read = readPtr().poly().boundary();
+
+            // Every patch is cloned, the stale non-conformal processor
+            // cyclics included. Dropping them was tried and is NOT
+            // valid: it removes the ordering-walk failure, which
+            // confirms they are where the inconsistency enters, but the
+            // mesh's coupling bookkeeping then breaks and the shared
+            // point calculation segfaults
+            // (fvMeshDistribute::getCouplingData ->
+            // globalMeshData::calcGlobalCoPointSlaves ->
+            // globalPoints::addSendTransform -> dynamic_cast,
+            // 2026-09-13). The inconsistency has to be resolved inside
+            // fvMeshDistribute, not by editing the patch list here.
+            patches.setSize(read.size());
+            forAll(read, patchi)
+            {
+                patches[patchi] =
+                    read[patchi].clone(meshPtr().poly().boundary()).ptr();
+            }
+        }
+        else
+        {
+            // No piece here: the master's patches except the processor
+            // ones (decided by class, so that the non-conformal
+            // processor cyclics go too)
+            patches.setSize(patchEntries.size());
+            label nPatches = 0;
+
+            forAll(patchEntries, patchi)
+            {
+                const entry& e = patchEntries[patchi];
+
+                dictionary patchDict(e.dict());
+                patchDict.set("nFaces", 0);
+                patchDict.set("startFace", 0);
+
+                autoPtr<polyPatch> pp
+                (
+                    polyPatch::New
+                    (
+                        e.keyword(),
+                        patchDict,
+                        nPatches,
+                        meshPtr().poly().boundary()
+                    )
+                );
+
+                if (!isA<processorPolyPatch>(pp()))
+                {
+                    patches[nPatches++] = pp.ptr();
+                }
+            }
+            patches.setSize(nPatches);
+        }
+
+        Pstream::parRun() = oldParRun;
+
+
+        meshPtr().addFvPatches(patches, true);
+    }
+
+    fvMesh& mesh = meshPtr();
+
+
+    // The clone is built from primitives, which carries no zones, so the
+    // master's zones are copied over from the mesh it read. Without this
+    // the pieces lose them, and the engine's swap meshes carry real face
+    // zones (baffles_ev_port and friends) that decomposePar did put in
+    // its pieces and that the solver needs after a swap.
+    if (readPtr.valid())
+    {
+        const pointZoneList& rpz = readPtr().pointZones();
+        const faceZoneList& rfz = readPtr().faceZones();
+        const cellZoneList& rcz = readPtr().cellZones();
+
+        List<pointZone*> pz(rpz.size());
+        forAll(rpz, i)
+        {
+            pz[i] = new pointZone(rpz[i].name(), rpz[i], mesh.pointZones());
+        }
+        List<faceZone*> fz(rfz.size());
+        forAll(rfz, i)
+        {
+            fz[i] = new faceZone
+            (
+                rfz[i].name(),
+                rfz[i],
+                rfz[i].flipMap(),
+                mesh.faceZones()
+            );
+        }
+        List<cellZone*> cz(rcz.size());
+        forAll(rcz, i)
+        {
+            cz[i] = new cellZone(rcz[i].name(), rcz[i], mesh.cellZones());
+        }
+
+        mesh.addZones(pz, fz, cz);
+    }
+
+    readPtr.clear();
+
+    // Zone names from the master; empty zones of those names on the
+    // ranks without a piece, so the zone sync inside distribute sees the
+    // same names everywhere
+    wordList pointZoneNames(mesh.pointZones().toc());
+    Pstream::scatter(pointZoneNames);
+    wordList faceZoneNames(mesh.faceZones().toc());
+    Pstream::scatter(faceZoneNames);
+    wordList cellZoneNames(mesh.cellZones().toc());
+    Pstream::scatter(cellZoneNames);
+
+    if (!haveMesh[Pstream::myProcNo()])
+    {
+        List<pointZone*> pz(pointZoneNames.size());
+        forAll(pointZoneNames, i)
+        {
+            pz[i] = new pointZone
+            (
+                pointZoneNames[i],
+                labelList(0),
+                mesh.pointZones()
+            );
+        }
+        List<faceZone*> fz(faceZoneNames.size());
+        forAll(faceZoneNames, i)
+        {
+            fz[i] = new faceZone
+            (
+                faceZoneNames[i],
+                labelList(0),
+                boolList(0),
+                mesh.faceZones()
+            );
+        }
+        List<cellZone*> cz(cellZoneNames.size());
+        forAll(cellZoneNames, i)
+        {
+            cz[i] = new cellZone
+            (
+                cellZoneNames[i],
+                labelList(0),
+                mesh.cellZones()
+            );
+        }
+        mesh.addZones(pz, fz, cz);
+    }
+
+    autoPtr<decompositionMethod> distributor
+    (
+        decompositionMethod::NewDistributor
+        (
+            decompositionMethod::decomposeParDict(runTime)
+        )
+    );
+
+    // The geometric overload, decompose(mesh, cellCentres), which is
+    // what redistributePar uses for exactly this situation (all cells on
+    // one rank, the rest empty). The weights overload was tried here
+    // during an earlier, refuted experiment and leaves every cell on the
+    // master, so the mesh is never actually split.
+    Pout<< "DMRSWAP " << meshTime << " pre-decompose nCells=" << mesh.nCells()
+        << " nPatches=" << mesh.poly().boundary().size() << endl;
+
+    const labelList finalDecomp = dmrDecompose(distributor(), mesh);
+
+    {
+        labelList perDomain(Pstream::nProcs(), 0);
+        forAll(finalDecomp, celli)
+        {
+            if (finalDecomp[celli] >= 0 && finalDecomp[celli] < perDomain.size())
+            {
+                ++ perDomain[finalDecomp[celli]];
+            }
+        }
+        Pout<< "DMRSWAP " << meshTime << " decomp size=" << finalDecomp.size()
+            << " perDomain=" << perDomain << endl;
+    }
+
+    // The transient internal patch is needed here too, fields or not:
+    // without an internal-type patch fvMeshDistribute parks the faces
+    // exposed by the move on the first non-empty patch, which on these
+    // meshes is a non-conformal (coupled) one, and the coupled-face
+    // reordering after the move then fails ("The ordering walk did not
+    // hit every face exactly once", coupledPolyPatch::order, engine
+    // swap mesh 0, 2026-09-10; the same failure that was first seen in
+    // July and attributed to the merge)
+    const bool addedPatch = dmrAddTransientInternalPatch(mesh);
+
+    // Same invariant as everywhere else: no stale geometry slices into
+    // fvMeshDistribute
+    mesh.clearGeom();
+
+
+    fvMeshDistribute(mesh).distribute(finalDecomp);
+
+
+    if (addedPatch)
+    {
+        dmrRemoveTransientInternalPatch(mesh);
+    }
+
+    // The ranks the new world does not have are emptied by the
+    // decomposition and their directories are removed by the caller
+    if (Pstream::myProcNo() < nNew)
+    {
+        // A redistribution leaves the mesh's instance at the current
+        // time, so without this the pieces land in <time>/meshes/<t>
+        // instead of constant/meshes/<t> and the swap meshes on disk
+        // never change. The region path does the same with its own
+        // write time.
+        mesh.setInstance(runTime.constant());
+
+        mesh.write();
+
+
+        // The serial original is copied in whole on the master before
+        // the slice; it carries a cellProc field that a piece must not
+        // keep, and it would otherwise make a piece look like the whole
+        // mesh
+        rm(pieceDir/"cellProc");
+
+        // Leftovers of the previous decomposition that the write does
+        // not overwrite: zone files when the mesh has none, and the
+        // stock addressing files, which no longer describe anything
+        if
+        (
+            mesh.pointZones().empty()
+         && mesh.faceZones().empty()
+         && mesh.cellZones().empty()
+        )
+        {
+            rm(pieceDir/"pointZones");
+            rm(pieceDir/"faceZones");
+            rm(pieceDir/"cellZones");
+        }
+        rm(pieceDir/"cellProcAddressing");
+        rm(pieceDir/"faceProcAddressing");
+        rm(pieceDir/"pointProcAddressing");
+        rm(pieceDir/"boundaryProcAddressing");
+    }
+}
+
+
+static void dmrRedistributeSwapMeshes(Time& runTime, const label nNew)
 {
     const std::string casePath = runTime.globalPath();
 
@@ -1756,55 +2265,27 @@ static void dmrRedistributeSwapMeshes(Time& runTime)
         return;
     }
 
-    // Master-serial, mirroring the thesis legacy path (rank 0 forks
-    // stock decomposePar per swap mesh). Concurrent forks across ranks
-    // race on the shared case directory (all read the processor-dir
-    // count and decomposeParDict); serialising on the master removes
-    // that hazard, and the swap meshes are small static reference data.
-    //
-    // decomposePar refuses ("Case is already decomposed with N domains")
-    // whenever the case-level processor* count differs from
-    // numberOfSubdomains. During a shrink the CALLER must therefore have
-    // already deleted the processor dirs beyond the new world size
-    // (dmrShrinkInPlace removes processor[nNew..nOld) before calling us),
-    // so the surviving count equals the just-rewritten numberOfSubdomains
-    // and the guard passes without -force (which would nuke the whole
-    // redistributed solution). Grow needs no such trim: the grow
-    // redistribute already populated exactly nNew processor dirs.
-    if (Pstream::master())
+    const double t0 = MPI_Wtime();
+
+    forAll(meshTimes, meshi)
     {
-        // Clear any stale pieces in the surviving processor dirs so
-        // decomposePar writes a clean decomposition
-        for (label proci = 0; proci < Pstream::nProcs(); proci++)
-        {
-            const fileName pieces =
-                fileName(casePath)/("processor" + Foam::name(proci))
-               /runTime.constant()/"meshes";
-            if (isDir(pieces))
-            {
-                rmDir(pieces);
-            }
-        }
-
-        forAll(meshTimes, meshi)
-        {
-            std::string cmd =
-                "decomposePar -mesh '" + std::string(meshTimes[meshi])
-              + "' -case '" + casePath + "'";
-            if (!meshRegions[meshi].empty())
-            {
-                cmd += " -region '" + std::string(meshRegions[meshi]) + "'";
-            }
-
-            dmrRunOrAbort(casePath, "dmr_decompose_meshes.log", cmd);
-        }
-
-        Info<< "DMR: re-decomposed " << meshTimes.size()
-            << " swap mesh(es) under constant/meshes for "
-            << Pstream::nProcs() << " ranks" << endl;
+        dmrRedistributeSwapMesh
+        (
+            runTime, meshTimes[meshi], meshRegions[meshi], nNew
+        );
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
+
+    if (Pstream::master())
+    {
+        char elapsed[32];
+        std::snprintf(elapsed, sizeof(elapsed), "%.3f", MPI_Wtime() - t0);
+
+        Info<< "DMR: redistributed " << meshTimes.size()
+            << " swap mesh(es) under constant/meshes to " << nNew
+            << " ranks in " << elapsed << " s" << endl;
+    }
 }
 
 
@@ -3182,7 +3663,7 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
     // just written for the new layout is kept.
     dmrSweepStitchCaches(runTime, timeName, regionNames, stitched);
 
-    dmrRedistributeSwapMeshes(runTime);
+    dmrRedistributeSwapMeshes(runTime, Pstream::nProcs());
 
     // As on the shrink side: this is now the restart state, so older
     // forced checkpoints are superseded
@@ -3883,12 +4364,13 @@ static void dmrShrinkInPlace
     // layout and is what the restart must load, so it is kept.
     dmrSweepStitchCaches(runTime, timeName, regionNames, restitched);
 
-    // Delete the processor dirs beyond the new world size BEFORE the
-    // swap-mesh decompose. dmrRedistributeSwapMeshes forks stock
-    // decomposePar, which FATALs unless the case-level processor count
-    // equals numberOfSubdomains (just rewritten to nNew); the stale
-    // processor[nNew..nOld) from the old layout would trip that guard
-    // (engine/movingCone swap-mesh decompose, 2026-07-18).
+    // The swap meshes, while every rank the reconfiguration is about to
+    // retire still holds its own directory: the step is collective and
+    // each rank clears its stale pieces in it.
+    dmrRedistributeSwapMeshes(runTime, world.nNew);
+
+    // Delete the processor dirs beyond the new world size: the new group
+    // only reads 0..nNew-1 and nothing written there is needed again.
     MPI_Barrier(MPI_COMM_WORLD);
     if (Pstream::master())
     {
@@ -3898,10 +4380,6 @@ static void dmrShrinkInPlace
         }
         ::sync();
     }
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    dmrRedistributeSwapMeshes(runTime);
-
     MPI_Barrier(MPI_COMM_WORLD);
 
     // This checkpoint is now the restart state; older ones are dead

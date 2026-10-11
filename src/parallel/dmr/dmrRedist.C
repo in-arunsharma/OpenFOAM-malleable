@@ -1709,44 +1709,10 @@ static void dmrSweepStitchCaches
 // their cells at the next swap).
 //
 
-// IN-PROCESS swap-mesh redistribution. WRITTEN AND NOT IN USE: it fails
-// on engine2Valve2D and the caller below still forks decomposePar. Kept
-// compiled so the next attempt starts from working code rather than from
-// a description. What is established (2026-09-10, jobs 101 to 105):
-//
-//   - The failure is "The ordering walk did not hit every face exactly
-//     once" in coupledPolyPatch::order, reached from
-//     processorPolyPatch::order <- polyTopoChange::reorderCoupledFaces
-//     <- fvMeshDistribute::repatch, on the FIRST swap mesh. It is the
-//     same failure recorded in July, so mesh.clearGeom() and the
-//     validBoundary patch attachment (both added since) are not its
-//     cause.
-//   - Not fixed by: the transient internal patch (the region path's
-//     one remaining difference in the call), nor by rebuilding
-//     globalMeshData the way loadOrCreateMesh does before redistributing
-//     a mesh read from disk.
-//   - The region meshes of the same case redistribute through the same
-//     fvMeshDistribute call 25 times per run without trouble, so it is
-//     not fvMeshDistribute as such. Structural difference measured
-//     between the two inputs: the swap-mesh piece carries a plain
-//     processor patch WITH faces alongside five nonConformalProcessor-
-//     Cyclic patches, and it is read from disk (nested instance
-//     constant/meshes/<t>) rather than cloned from a live mesh.
-//   - A standalone reproducer of one swap mesh cannot be built by
-//     copying it into a single-region case: its nonConformalMappedWall
-//     patches name the sibling regions and construction fails with
-//     "liner not found in table".
-//
-// Next discriminator, not yet run: print the boundary patch types and
-// sizes immediately before distribute() in BOTH paths (region and swap)
-// in one instrumented run, and diff. If the inputs are structurally
-// alike, the difference is in how the mesh object was built and the
-// swap path should build its mesh the way the region path does (clone
-// from primitives, addFvPatches(patches, true)) instead of reading it.
-//
-// Not static: it has no caller, and internal linkage would make that a
-// compiler warning on every build.
-void dmrRedistributeSwapMesh
+// Slice one serial swap mesh (constant/meshes/<meshTime>[/<region>] at
+// the case root) into nNew pieces, in parallel, replacing the per-mesh
+// decomposePar this used to fork. Collective over the current world.
+static void dmrRedistributeSwapMesh
 (
     Time& runTime,
     const word& meshTime,
@@ -1823,9 +1789,6 @@ void dmrRedistributeSwapMesh
     boolList haveMesh(Pstream::nProcs(), false);
     haveMesh[Pstream::masterNo()] = true;
 
-    // Stage markers: the step has been dying silently between the read
-    // and the write, so every stage reports before entering it
-
     // The master's boundary entries, for the empty meshes (the same
     // reading trick as loadOrCreateMesh: the file's class is not a list)
     PtrList<entry> patchEntries;
@@ -1868,20 +1831,10 @@ void dmrRedistributeSwapMesh
     }
 
 
-    // Read the piece, then REBUILD the mesh from its primitives exactly
-    // as the region path does (dmrCloneLiveMesh). Reading it and handing
-    // the read object to fvMeshDistribute is what fails in the coupled-
-    // face ordering walk; the patch sets of the two inputs are the same
-    // family for family and the zones are not the trigger either (both
-    // measured, 2026-09-13), so the construction is the last difference
-    // left. addFvPatches with validBoundary true is the part that
-    // matters: it runs the processor-patch neighbour exchange that a
-    // plain read does not.
+    // The master reads the serial mesh and the mesh that gets distributed
+    // is rebuilt from its primitives on every rank, as the region path
+    // does (dmrCloneLiveMesh); the zones are copied over further down.
     //
-    // The rebuilt mesh carries NO zones, as the region clone does not.
-    // If this makes the redistribution pass, transporting the swap
-    // meshes' face zones (the engine's baffles) is the next thing to
-    // add, on both paths.
     // Only the master has a mesh to read, so this phase is inherently
     // asymmetric: it must emit no parallel traffic at all. Without this
     // the ranks with nothing to read run ahead into the collective
@@ -1916,7 +1869,6 @@ void dmrRedistributeSwapMesh
             )
         );
     }
-
 
     pointField points;
     faceList faces;
@@ -1953,67 +1905,70 @@ void dmrRedistributeSwapMesh
     );
 
     {
-        List<polyPatch*> patches;
+        // Every rank builds its patches the same way, from the boundary
+        // entries, the master keeping its face counts and the others
+        // getting none. The master must NOT clone the patches of the mesh
+        // it read: that read ran serially (parRun false above), so it has
+        // already computed each patch's geometry, and some patches cache
+        // that result and skip the whole calculation next time,
+        // collectives included. wedgePolyPatch::calcGeometry returns at
+        // once when its axis is set, before three reductions, so a cloned
+        // wedge on the master against freshly built ones elsewhere put the
+        // ranks out of step inside addFvPatches: the master went on to the
+        // bool reduction of checkDefinition while the others sent the
+        // label reduction of the wedge, and the master's 1-byte receive
+        // got a 4-byte message (MPI_ERR_TRUNCATE, movingCone, measured
+        // 2026-10-11: axis set on rank 0, vector::rootMax on ranks 1-3).
+        // Upstream's loadOrCreateMesh avoids this the same way: every rank
+        // constructs its patches fresh before the first collective.
+        List<polyPatch*> patches(patchEntries.size());
+        label nPatches = 0;
 
-        if (readPtr.valid())
+        forAll(patchEntries, patchi)
         {
-            const polyBoundaryMesh& read = readPtr().poly().boundary();
+            const entry& e = patchEntries[patchi];
 
-            // Every patch is cloned, the stale non-conformal processor
-            // cyclics included. Dropping them was tried and is NOT
-            // valid: it removes the ordering-walk failure, which
-            // confirms they are where the inconsistency enters, but the
-            // mesh's coupling bookkeeping then breaks and the shared
-            // point calculation segfaults
-            // (fvMeshDistribute::getCouplingData ->
-            // globalMeshData::calcGlobalCoPointSlaves ->
-            // globalPoints::addSendTransform -> dynamic_cast,
-            // 2026-09-13). The inconsistency has to be resolved inside
-            // fvMeshDistribute, not by editing the patch list here.
-            patches.setSize(read.size());
-            forAll(read, patchi)
+            dictionary patchDict(e.dict());
+            if (!readPtr.valid())
             {
-                patches[patchi] =
-                    read[patchi].clone(meshPtr().poly().boundary()).ptr();
-            }
-        }
-        else
-        {
-            // No piece here: the master's patches except the processor
-            // ones (decided by class, so that the non-conformal
-            // processor cyclics go too)
-            patches.setSize(patchEntries.size());
-            label nPatches = 0;
-
-            forAll(patchEntries, patchi)
-            {
-                const entry& e = patchEntries[patchi];
-
-                dictionary patchDict(e.dict());
                 patchDict.set("nFaces", 0);
                 patchDict.set("startFace", 0);
-
-                autoPtr<polyPatch> pp
-                (
-                    polyPatch::New
-                    (
-                        e.keyword(),
-                        patchDict,
-                        nPatches,
-                        meshPtr().poly().boundary()
-                    )
-                );
-
-                if (!isA<processorPolyPatch>(pp()))
-                {
-                    patches[nPatches++] = pp.ptr();
-                }
             }
-            patches.setSize(nPatches);
+
+            autoPtr<polyPatch> pp
+            (
+                polyPatch::New
+                (
+                    e.keyword(),
+                    patchDict,
+                    nPatches,
+                    meshPtr().poly().boundary()
+                )
+            );
+
+            // Processor patches of any kind are decided by class, so the
+            // non-conformal processor cyclics go too. A serial mesh has
+            // none; if the master finds one, the input is not serial and
+            // dropping it would lose faces.
+            if (isA<processorPolyPatch>(pp()))
+            {
+                if (readPtr.valid())
+                {
+                    FatalErrorInFunction
+                        << "swap mesh " << meshTime << " under "
+                        << runTime.constant()/local
+                        << " has processor patch " << e.keyword()
+                        << "; expected an undecomposed mesh"
+                        << exit(FatalError);
+                }
+                continue;
+            }
+
+            patches[nPatches++] = pp.ptr();
         }
+        patches.setSize(nPatches);
 
         Pstream::parRun() = oldParRun;
-
 
         meshPtr().addFvPatches(patches, true);
     }
@@ -2118,23 +2073,7 @@ void dmrRedistributeSwapMesh
     // one rank, the rest empty). The weights overload was tried here
     // during an earlier, refuted experiment and leaves every cell on the
     // master, so the mesh is never actually split.
-    Pout<< "DMRSWAP " << meshTime << " pre-decompose nCells=" << mesh.nCells()
-        << " nPatches=" << mesh.poly().boundary().size() << endl;
-
     const labelList finalDecomp = dmrDecompose(distributor(), mesh);
-
-    {
-        labelList perDomain(Pstream::nProcs(), 0);
-        forAll(finalDecomp, celli)
-        {
-            if (finalDecomp[celli] >= 0 && finalDecomp[celli] < perDomain.size())
-            {
-                ++ perDomain[finalDecomp[celli]];
-            }
-        }
-        Pout<< "DMRSWAP " << meshTime << " decomp size=" << finalDecomp.size()
-            << " perDomain=" << perDomain << endl;
-    }
 
     // The transient internal patch is needed here too, fields or not:
     // without an internal-type patch fvMeshDistribute parks the faces
@@ -2150,9 +2089,7 @@ void dmrRedistributeSwapMesh
     // fvMeshDistribute
     mesh.clearGeom();
 
-
     fvMeshDistribute(mesh).distribute(finalDecomp);
-
 
     if (addedPatch)
     {
@@ -2341,6 +2278,28 @@ static bool dmrUniformWriteEnabled()
     {
         const char* env = std::getenv("FOAM_DMR_UNIFORM_WRITE");
         return !env || std::string(env) != "0";
+    }();
+    return enabled;
+}
+
+
+// Whether superseded DMR-forced checkpoints are deleted as the run
+// proceeds. On by default; set FOAM_DMR_KEEP_CHECKPOINTS=1 to retain
+// every one of them, which is only useful for debugging a restart.
+//
+// This is separate from the uniform write on purpose. Retention has
+// nothing to do with the layout writes land in: the newest checkpoint is
+// the state the next generation restarts from and older ones are read by
+// nothing. Tying the two together costs a full mesh plus fields per
+// reconfiguration, per rank, for the whole run, which is what exhausted
+// the filesystem on MareNostrum on 2026-09-29 at the tenth checkpoint of
+// a run that wanted about fifty.
+static bool dmrPurgeCheckpointsEnabled()
+{
+    static const bool enabled = []()
+    {
+        const char* env = std::getenv("FOAM_DMR_KEEP_CHECKPOINTS");
+        return !env || std::string(env) == "0";
     }();
     return enabled;
 }
@@ -3667,7 +3626,7 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
 
     // As on the shrink side: this is now the restart state, so older
     // forced checkpoints are superseded
-    if (dmrUniformWriteEnabled())
+    if (dmrPurgeCheckpointsEnabled())
     {
         dmrPurgeSupersededCheckpoints(runTime, timeName);
     }
@@ -4383,9 +4342,8 @@ static void dmrShrinkInPlace
     MPI_Barrier(MPI_COMM_WORLD);
 
     // This checkpoint is now the restart state; older ones are dead
-    // weight (only meaningful with the uniform write, which is what
-    // makes the surviving natural writes the readable series)
-    if (dmrUniformWriteEnabled())
+    // weight, whatever layout the natural writes are landing in
+    if (dmrPurgeCheckpointsEnabled())
     {
         dmrPurgeSupersededCheckpoints(runTime, timeName);
     }

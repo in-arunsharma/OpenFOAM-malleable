@@ -53,6 +53,7 @@ License
 #include "loadOrCreateMesh.H"
 #include "HashSet.H"
 #include "pointIOField.H"
+#include "IFstream.H"
 #include "OStringStream.H"
 #include "IStringStream.H"
 #include "CompactListList.H"
@@ -222,7 +223,7 @@ static std::string dmrLatestTimeName(const std::string& casePath)
         }
         catch (const std::exception&)
         {
-            // Not a numeric dir — skip.
+            // Not a numeric dir
         }
     }
     globfree(&g);
@@ -230,9 +231,9 @@ static std::string dmrLatestTimeName(const std::string& casePath)
 }
 
 
-// Largest numeric time in processor0/. In the all-parallel pipeline
-// checkpoints exist only in the processor layout (no serial time
-// dirs), so this — not dmrLatestTimeName — names the restart time.
+// Largest numeric time in processor0/. Checkpoints exist only in the
+// processor layout, so this, not dmrLatestTimeName, names the restart
+// time.
 static std::string dmrLatestProcTimeName(const std::string& casePath)
 {
     return dmrLatestTimeName(casePath + "/processor0");
@@ -252,10 +253,10 @@ struct DmrWorldInfo
 };
 
 
-// Rank 0 queries DMR analytics + procs_next_* getters; result is broadcast
-// to every rank. Valid window: between dmr_reconfigure() returning
-// DMR_REDIST_FINALIZE and dmr_finalize() running — i.e. inside the redist
-// callback in DMR_AUTO.
+// Rank 0 queries DMR analytics and the procs_next_* getters and
+// broadcasts the result. Only valid inside the DMR_AUTO redistribution
+// callback (after dmr_reconfigure returns DMR_REDIST_FINALIZE, before
+// dmr_finalize).
 static bool dmrQueryWorldInfo(DmrWorldInfo& w)
 {
     MPI_Comm_size(MPI_COMM_WORLD, &w.nOld);
@@ -272,16 +273,11 @@ static bool dmrQueryWorldInfo(DmrWorldInfo& w)
 
         if (st == DMR_SUCCESS)
         {
-            // DMR changed DMRAnalytics::event from an enum (dmr_event_t)
-            // to a string (const char*), which also shifts every field
-            // after it. Compiling against one variant and linking the
-            // other yields a silently corrupt struct: a truncated
-            // pointer read as an enum, and node_count holding what is
-            // really world_size (observed on MN5, 2026-07-26 — the
-            // system dmr/2.0.1-dlb module vs the Slurm4DMR dmr-s4d
-            // build). The string variant #defines the event names, so
-            // that is a reliable compile-time discriminator between the
-            // two APIs.
+            // DMRAnalytics::event is an enum in older DMR and a string in
+            // newer, which also shifts every later field: compiling
+            // against one and linking the other corrupts the struct
+            // silently. The string API #defines the event names, which
+            // tells the two apart at compile time.
             #ifdef DMR_EVENT_START_SHRINK
             // String API (dmr-s4d and later)
             const char* ev = a.event ? a.event : "";
@@ -319,14 +315,11 @@ static bool dmrQueryWorldInfo(DmrWorldInfo& w)
             #endif
         }
 
-        // The direction MUST be resolved here: a shrink has to run on the
-        // old (larger) group, because fvMeshDistribute needs max(N,N')
-        // ranks, so it cannot be deferred to the new group the way a grow
-        // can. When it comes back Unknown the run stops, so record enough
-        // to tell WHY rather than guessing later: whether the analytics
-        // call itself failed, or whether it succeeded with an event this
-        // switch does not handle (the CE policy emits events the ROUND
-        // policy never does, e.g. DMR_EVENT_TALP_CHECK_CE_ACC).
+        // The direction must be known here: a shrink runs on the old
+        // (larger) group, since fvMeshDistribute needs max(N, N') ranks.
+        // If it is Unknown the run stops, so report whether the analytics
+        // call failed or returned an event not handled above (the CE
+        // policy emits some the ROUND policy never does).
         if (dir == static_cast<int>(DmrDir::Unknown))
         {
             #ifdef DMR_EVENT_START_SHRINK
@@ -463,16 +456,12 @@ static bool dmrReadWorldMeta
 }
 
 
-// Grow-side field loader: ranks without a mesh have no field files, so
-// the master interpolates each field to zero size (via the subsetter)
-// and sends it to them, keeping the field set identical on every rank
-// before fvMeshDistribute runs. Mirrors redistributePar.C's readFields.
-// Read on the ranks that hold a mesh. The ranks the grow added get their
-// zero-sized copies later, from the master, once every region is
-// conformal again (dmrSendZeroFieldsGrow): the copies come from
-// fvMeshSubset::interpolate, which needs the base fvPatch::start(), and a
-// non-conformal patch with faces has none (engine grow, 2026-09-10). The
-// read itself must happen stitched, in the sizes the checkpoint has.
+// Grow-side field reader, after redistributePar.C's readFields, on the
+// ranks that hold a mesh. The read happens stitched, in the sizes the
+// checkpoint has. The ranks the grow added get zero-sized copies later
+// (dmrSendZeroFieldsGrow), once every region is conformal again, because
+// fvMeshSubset::interpolate needs fvPatch::start(), which a
+// non-conformal patch with faces does not have.
 template<class GeoField>
 static void dmrReadFieldsGrow
 (
@@ -539,11 +528,9 @@ static void dmrSendZeroFieldsGrow
 {
     const objectRegistry& db = dmrFieldDb(mesh);
 
-    // Checkpoint fields only (dmrReadFieldsGrow marks them AUTO_WRITE):
-    // the registry also holds the mesh's cached geometry (sliced fields
-    // such as magSf, NO_WRITE), which a subset cannot interpolate; on
-    // non-conformal cases the conform has cleared them by now, on the
-    // others they are still there (movingCone grow, 2026-09-10)
+    // Checkpoint fields only (dmrReadFieldsGrow marks them AUTO_WRITE).
+    // The registry may also hold cached geometry (sliced, NO_WRITE fields
+    // such as magSf) that a subset cannot interpolate.
     wordList names;
     if (Pstream::master())
     {
@@ -612,24 +599,86 @@ static void dmrSendZeroFieldsGrow
 }
 
 
-// Reference-configuration transport. points0MotionSolver and its
-// family (solidBodyMeshMotion, the displacement solvers, the
-// interpolator mover) rebuild their reference points at startup via
-// readPoints0: a points0 field at a case-root time instance if one
-// exists, else constant/<region>/polyMesh/points. Neither survives a
-// redistribution by itself: the constant mesh stays in the source
-// layout, and does not exist at all on ranks added by a grow, so the
-// restarted solver would read a reference of the wrong size
-// (points0MotionSolver's size check FATALs). Resolve the reference on
-// the source layout the same way readPoints0 does (checkpoint-carried
-// field, else newest time-instance points0 at this region, else
-// per-rank constant points, valid precisely when readPoints0's own
-// fallback is) and register it on the mesh so fvMeshDistribute
-// transports it with the other point fields. dmrWritePoints0Constant
-// then re-creates the constant points file in the new layout: the
-// artefact a serial decomposePar would have produced, and the only
-// channel readPoints0's region-blind time search can see for
-// non-default regions.
+// Whether anything can read this region's motion reference at startup.
+// The readers of constant/<region>/polyMesh/points (or of points0, via
+// points0MotionSolver::readPoints0) are the points0MotionSolver family,
+// componentDisplacementMotionSolver, the inkJet and interpolator movers
+// and the rigidBodyMotionDisplacement point condition. Rather than list
+// them, this lists the movers that do not read it, selected the way
+// fvMeshMover::New and motionSolver::New select them, and assumes a
+// reader for anything else.
+static bool dmrMoverReadsReference(const fileName& dynamicMeshDict)
+{
+    IFstream is(dynamicMeshDict);
+    const dictionary dict(is);
+
+    // No mover: fvMeshMovers::none
+    if (!dict.found("mover"))
+    {
+        return false;
+    }
+
+    const dictionary& moverDict = dict.subDict("mover");
+    const word moverType(moverDict.lookup("type"));
+
+    if (moverType == "multiValveEngine")
+    {
+        return false;
+    }
+
+    if (moverType == "motionSolver")
+    {
+        const word solverType(moverDict.lookup("motionSolver"));
+
+        return
+            solverType != "velocityLaplacian"
+         && solverType != "velocityComponentLaplacian";
+    }
+
+    return true;
+}
+
+
+// The one reader that is a boundary condition rather than a mover, so it
+// can appear whatever the mover is
+static bool dmrHasRigidBodyDisplacementPatch(const fvMesh& mesh)
+{
+    const HashTable<const pointVectorField*> fields
+    (
+        mesh.lookupClass<pointVectorField>()
+    );
+
+    forAllConstIter(HashTable<const pointVectorField*>, fields, iter)
+    {
+        const pointVectorField::Boundary& bf = iter()->boundaryField();
+
+        forAll(bf, patchi)
+        {
+            if (bf[patchi].type() == "rigidBodyMotionDisplacement")
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+
+// Reference-configuration transport. points0MotionSolver and its family
+// rebuild their reference points at startup via readPoints0 (a points0
+// field at a time instance, else constant/<region>/polyMesh/points).
+// Neither survives a redistribution: the constant mesh stays in the old
+// layout, or is missing on ranks a grow added, and the size check in
+// points0MotionSolver fails. So resolve the reference the way
+// readPoints0 does and register it as a point field, which
+// fvMeshDistribute then transports. dmrWritePoints0Constant re-creates
+// the constant points in the new layout afterwards, the only place
+// readPoints0 looks for non-default regions.
+//
+// Only for regions where something reads the reference. Elsewhere the
+// constant points may legitimately describe another mesh: a
+// mesh-to-mesh swap replaces the mesh but not constant/polyMesh/points.
 static void dmrEnsurePoints0
 (
     Time& runTime,
@@ -661,20 +710,26 @@ static void dmrEnsurePoints0
       ? fileName(".")
       : fileName(regionName);
 
-    // Only motion cases carry a reference configuration. The master
-    // decides. The dictionary lives at CASE level only: decomposePar
-    // copies meshes and fields into processor trees, never system or
-    // constant dictionaries, so probing runTime.path() (the processor
-    // directory) always misses (engine, 2026-07-13)
+    // Only regions whose reference something reads; the master decides.
+    // dynamicMeshDict exists at case level only (decomposePar never
+    // copies dictionaries into processor directories), so it is looked up
+    // under globalPath, not path.
     bool moving = false;
     word inst;
     if (Pstream::master())
     {
-        moving = isFile
+        const fileName dynamicMeshDict
         (
             fileName(runTime.globalPath())
            /runTime.constant()/regionDir/"dynamicMeshDict"
         );
+
+        moving =
+            isFile(dynamicMeshDict)
+         && (
+                dmrMoverReadsReference(dynamicMeshDict)
+             || dmrHasRigidBodyDisplacementPatch(mesh)
+            );
 
         if (moving)
         {
@@ -706,10 +761,9 @@ static void dmrEnsurePoints0
 
     if (inst != word::null)
     {
-        // A previous write (a topo-change or an earlier reconfiguration)
-        // left a points0 field in the current source layout: load it,
-        // AUTO_WRITE so the rewritten copy keeps readPoints0's
-        // time-instance branch working after the reconfiguration
+        // An earlier write left a points0 field in the current layout.
+        // AUTO_WRITE, so readPoints0 still finds it after the
+        // reconfiguration.
         if (Pstream::master())
         {
             p0.reset
@@ -793,10 +847,9 @@ static void dmrEnsurePoints0
     }
     else
     {
-        // First reconfiguration of the case: synthesise from the
-        // per-rank constant points (readPoints0's own fallback), which
-        // every data-carrying rank still has. NO_WRITE: transported in
-        // memory, persisted only through the constant dump
+        // First reconfiguration: build it from the per-rank constant
+        // points (readPoints0's own fallback). NO_WRITE: persisted only
+        // through dmrWritePoints0Constant.
         p0.reset
         (
             new pointVectorField
@@ -882,13 +935,11 @@ static void dmrWritePoints0Constant(const fvMesh& mesh)
 }
 
 
-// fvMeshDistribute requires an internal-type patch when fields are
-// registered (findInternalPatch). The on-disk case must not carry one
-// (it clashes with the non-conformal solver machinery), so a transient
-// zero-size internalPolyPatch is added to the private mesh copy after
-// field loading (fvMesh::addPatch extends every registered field's
-// boundary) and removed again before writing. Same insertion pattern
-// as createNonConformalCouples.
+// fvMeshDistribute needs an internal-type patch to park exposed faces
+// on (findInternalPatch). The case on disk must not carry one, so a
+// zero-size internalPolyPatch is added to the private mesh copy for the
+// distribution and removed before writing, inserted the way
+// createNonConformalCouples does.
 static const word dmrTransientPatchName("dmrTransientInternal");
 
 static bool dmrAddTransientInternalPatch(fvMesh& mesh)
@@ -971,17 +1022,11 @@ static void dmrRemoveTransientInternalPatch(fvMesh& mesh)
 
 // Run the distributor and return one destination per cell.
 //
-// ptscotch returns a SIZE-1 list for a ZERO-CELL mesh, which
-// fvMeshDistribute rejects with
-//     "Size of distribution:1 mesh nCells:0"   (fvMeshDistribute.C:1819)
-// Zero-cell meshes are normal on the grow path: loadOrCreateMesh fabricates
-// them on the ranks that hold no data yet, so every grow onto new ranks hit
-// this (MN5, 2026-07-26, 448 -> 560). Serial scotch happens to return an
-// empty list and so never showed the problem.
-//
-// decompose() is collective, so it cannot be skipped on the empty ranks -
-// they must call it with everyone else. The result is corrected afterwards
-// instead: a mesh with no cells has, trivially, an empty distribution.
+// ptscotch returns a one-entry list for a zero-cell mesh, which
+// fvMeshDistribute rejects ("Size of distribution:1 mesh nCells:0").
+// Zero-cell meshes are normal on a grow, on the ranks that hold no data
+// yet. decompose() is collective, so the empty ranks must still call it;
+// the result is corrected afterwards instead.
 static labelList dmrDecompose
 (
     decompositionMethod& distributor,
@@ -992,8 +1037,6 @@ static labelList dmrDecompose
 
     if (mesh.nCells() == 0 && decomp.size() != 0)
     {
-        // Logged so a run can PROVE the guard is present and firing: its
-        // absence in the output means an older libfoamDmr is loaded.
         Pout<< "DMR: distributor returned " << decomp.size()
             << " entries for a 0-cell mesh; truncating to 0" << endl;
 
@@ -1004,27 +1047,17 @@ static labelList dmrDecompose
 }
 
 
-// Partitioning method used for the in-process redistributes. ptscotch is
-// the parallel one: it registers ONLY as a distributor, which is exactly
-// this job, whereas scotch also registers as decomposePar's serial
-// decomposer. On MN5 a 2800 -> 1792 reconfiguration of a 100M-cell case
-// sat in scotch's decompose() for over an hour without emitting anything
-// (2026-07-26).
+// Partitioning method for the in-process redistributions. ptscotch is
+// the parallel partitioner; serial scotch does not scale (a 100M-cell
+// case sat in its decompose() for over an hour).
 static const char* const dmrDistributorName = "ptscotch";
 
 
-// In-memory twin of the disk fresh-load: build a clean, non-registered
-// fvMesh from the LIVE solver mesh's primitives instead of re-reading
-// what we just checkpointed. Same construction fvMeshDistribute itself
-// uses for received meshes (fvMeshDistribute.C receiveMesh: from-
-// primitives fvMesh + polyPatch list + addFvPatches, no parallel
-// comms), and the same primitives its sendMesh transmits
-// (points/faces/faceOwner/faceNeighbour), so allOwner is per-face and
-// allNeighbour per-internal-face.
-//
-// register=false and the real region name mirror the disk fresh-load
-// exactly: the clone must not appear in runTime's registry beside the
-// live mesh, but must still write to the region's own directory.
+// Build a non-registered fvMesh from the live solver mesh's primitives,
+// instead of re-reading what was just checkpointed. Same construction
+// fvMeshDistribute::receiveMesh uses. Not registered, so it does not sit
+// in runTime's registry beside the live mesh, but named after the region
+// so it writes to the region's directory.
 static autoPtr<fvMesh> dmrCloneLiveMesh
 (
     const fvMesh& live,
@@ -1058,11 +1091,11 @@ static autoPtr<fvMesh> dmrCloneLiveMesh
     );
     fvMesh& clone = clonePtr();
 
-    // Rebuild the boundary from the live patches. clone(bm) is virtual,
-    // so each patch type copies its own state: processorPolyPatch keeps
-    // myProcNo/neighbProcNo, cyclics keep their transform, etc. Sizes
-    // and start faces carry over unchanged because the topology is
-    // identical by construction.
+    // Rebuild the boundary from the live patches; clone() keeps each
+    // patch type's own state (processor neighbours, cyclic transforms).
+    // Every rank clones its own live mesh, so the patches' cached state
+    // is consistent across ranks, which the collective below relies on
+    // (contrast dmrRedistributeSwapMesh).
     const polyBoundaryMesh& livePatches = live.poly().boundary();
 
     List<polyPatch*> patches(livePatches.size());
@@ -1072,23 +1105,12 @@ static autoPtr<fvMesh> dmrCloneLiveMesh
             livePatches[patchi].clone(clone.poly().boundary()).ptr();
     }
 
-    // validBoundary = true, i.e. run polyBoundaryMesh::topoChange() and
-    // calcGeometry() on the clone. That is a collective, and every rank
-    // is here in lockstep, so it is safe. It is also REQUIRED, not merely
-    // consistent: processorPolyPatch's clone constructor leaves
-    // neighbFaceCentres_/neighbFaceAreas_/neighbFaceCellCentres_ EMPTY
-    // (only the topoChange exchange fills them), and any cyclic-type
-    // patch field evaluates at construction (cyclicFvPatchField's
-    // dictionary constructor ends with evaluate()), which computes
-    // interpolation weights for EVERY patch and, on a conformal mesh,
-    // reads those three lists through processorFvPatch::makeWeights.
-    // With them empty, coupledFvPatch::makeWeights indexes past the end
-    // and the clone dies with SIGSEGV while the fields are still being
-    // rebuilt (engine2Valve2D, nonConformalCyclic patch fields, first
-    // shrink). Cases without cyclic patch fields never evaluate at
-    // construction, which is why cavity/drivAer/movingCone never saw it.
-    // fvMeshDistribute::receiveMesh gets away with `false` because it
-    // maps fields rather than constructing them from dictionaries.
+    // validBoundary true (collective topoChange and calcGeometry) is
+    // required: a cloned processorPolyPatch has empty neighbour geometry
+    // until topoChange exchanges it, and a cyclic-type patch field
+    // evaluates at construction, computing weights for every patch from
+    // that geometry. receiveMesh can pass false because it maps fields
+    // instead of constructing them.
     clone.addFvPatches(patches, true);
 
     return clonePtr;
@@ -1097,28 +1119,15 @@ static autoPtr<fvMesh> dmrCloneLiveMesh
 
 // Copy the live solver's checkpoint fields of one type onto the clone.
 //
-// ONLY the AUTO_WRITE set is taken, and that filter is the correctness
-// invariant of the whole clone path: it is exactly what runTime.write()
-// would have emitted, i.e. exactly what the disk fresh-load would have
-// read back. The live registry additionally carries solver-derived and
-// cached state (rAU, HbyA, gradients, functionObject fields, retained
-// tmps) which is NO_WRITE and may differ between ranks;
-// fvMeshDistribute enumerates registered fields through fieldNames()
-// -> checkEqualWordList(), a gather/scatter-collective that FATALs
-// unless every rank presents an identical list, so letting that state
-// through is precisely what makes distribute() fail on a live mesh.
+// Only AUTO_WRITE fields, i.e. exactly what a checkpoint write would
+// emit. The live registry also holds solver state (rAU, HbyA, cached
+// gradients...) that may differ between ranks, and fvMeshDistribute
+// fails unless every rank presents the same field list.
 //
-// Transport is a stream round-trip into the field's dictionary form and
-// back through the GeoField(IOobject, mesh, dictionary) constructor —
-// the same mechanism the grow path uses to rebuild fields on ranks that
-// had none, and the same representation a disk write/read pair goes
-// through. It is used in preference to a direct value copy because the
-// from-components constructor clones patch fields via
-// PatchField::clone(iF), which retains the SOURCE patch reference
-// (GeometricBoundaryField.C): the fields would still point into the
-// live mesh's boundary. Going through the dictionary rebuilds genuine
-// patch fields on the clone's own patches, carrying each BC's full
-// state (refValue, valueFraction, gradient, ...), not just its values.
+// Copied through the field's dictionary form rather than by value: a
+// value copy clones the patch fields with clone(iF), which keeps the
+// live mesh's patch reference. The dictionary rebuilds them on the
+// clone's patches with each condition's full state.
 template<class GeoField>
 static void dmrCloneFields
 (
@@ -1192,9 +1201,7 @@ static void dmrDemoteFieldsOfType
 
     forAll(names, i)
     {
-        // Transient: restored immediately after the write below. The
-        // registry hands out const access, but the write option is
-        // bookkeeping, not field data.
+        // Restored right after the write; only the write option changes
         GeoField& f = const_cast<GeoField&>(*fields[names[i]]);
 
         if (f.writeOpt() == IOobject::AUTO_WRITE)
@@ -1206,21 +1213,13 @@ static void dmrDemoteFieldsOfType
 }
 
 
-// The reconfiguration checkpoint and the redistribute write the same
-// fields twice: once in the old layout, then again in the new one. When
-// the redistribute sources them from memory nothing ever reads that
-// first copy, so it is pure duplicated I/O.
+// The redistribution writes the fields in the new layout, so writing
+// them in the old layout at the checkpoint as well is wasted I/O. The
+// checkpoint itself cannot be skipped (it writes uniform/time, among
+// others), so the fields are taken out of it: demote, write, restore.
 //
-// It cannot simply be skipped: runTime.writeNow() also emits the state
-// the redistribute does NOT produce, notably uniform/time (time index
-// and deltaT, i.e. restart continuity). So instead of dropping the
-// write, drop the fields FROM it — demote them here, write, restore.
-// Everything else Time writes still goes out.
-//
-// Accepted consequence: with no old-layout field copy on disk, a
-// redistribute that aborts leaves the previous natural write as the
-// newest checkpoint, so the relaunch loses that one interval instead of
-// resuming at the reconfiguration instant.
+// Consequence: if the redistribution aborts, the newest complete
+// checkpoint is the previous natural write.
 static void dmrDemoteCheckpointFields
 (
     const fvMesh& mesh,
@@ -1245,23 +1244,6 @@ static void dmrDemoteCheckpointFields
 }
 
 
-// Construct a fresh fvMesh from disk (non-registered, so it doesn't clash
-// with the live mesh still in runTime's registry), load every field type
-// into it, run fvMeshDistribute, and write the new layout. Mirrors the
-// body of redistributePar.C's main() — calling fvMeshDistribute against
-// this clean mesh avoids the receiver-side deadlock that happens when it
-// is called against a mesh carrying live solver state. The region argument
-// is the polyMesh name (polyMesh::defaultRegion for single-region cases,
-// or one of the case's named regions for foamMultiRun).
-//
-// targetRanks narrows the DESTINATION width below the running world size.
-// Zero, the reconfiguration paths, means "take numberOfSubdomains from the
-// dict as it stands", i.e. redistribute across the whole world. A positive
-// value, the uniform-write path, sends everything to the first targetRanks
-// ranks and leaves the rest empty. Either way the operation is collective
-// over the whole world and needs no ranks beyond the ones already running,
-// because fvMeshDistribute's requirement is max(source, target) ranks and
-// the source width is the world width in both cases.
 // Children currently writing an output time, one per region per write.
 static std::vector<pid_t>& dmrWriterPids()
 {
@@ -1270,12 +1252,8 @@ static std::vector<pid_t>& dmrWriterPids()
 }
 
 
-// Off by setting FOAM_DMR_ASYNC_WRITE=0. This exists because fork under
-// an MPI runtime is the one part of the design that depends on the
-// runtime behaving (some builds warn or misbehave when a process forks
-// with registered memory), so there has to be a way to take it out of the
-// picture while diagnosing something else. It changes timing only: the
-// bytes written are identical either way.
+// Off with FOAM_DMR_ASYNC_WRITE=0, for MPI runtimes that misbehave when
+// a process forks. Changes timing only, not what is written.
 static bool dmrAsyncWriteEnabled()
 {
     static const bool enabled = []()
@@ -1287,10 +1265,8 @@ static bool dmrAsyncWriteEnabled()
 }
 
 
-// Written LAST, after the data, by whoever wrote it: an output directory
-// without it came from a write that died partway, so the time is suspect.
-// With the asynchronous write this is the ONLY way to tell a finished
-// time from one still being written, because the solver has moved on.
+// Written last, after the data. An output time without it is incomplete
+// or still being written by an asynchronous writer.
 static void dmrWriteCompleteSentinel
 (
     const Time& runTime,
@@ -1305,12 +1281,9 @@ static void dmrWriteCompleteSentinel
 }
 
 
-// Reap the writers from the previous output time.
-//
-// Must be called before anything that would race them: the next write to
-// the same directories, a reconfiguration (which tears down this process
-// group entirely), and the end of the run. Cheap in the normal case,
-// where they finished many timesteps ago.
+// Reap the writers of the previous output time. Needed before the next
+// write, a reconfiguration (which ends this process group) and the end
+// of the run.
 static void dmrWaitForWriters()
 {
     std::vector<pid_t>& pids = dmrWriterPids();
@@ -1333,12 +1306,8 @@ static void dmrWaitForWriters()
 }
 
 
-// Dump the boundary a mesh presents to fvMeshDistribute. Diagnostic
-// only, off unless FOAM_DMR_DUMP_PATCHES is set: it exists to compare
-// the region path, which redistributes this case 25 times a run, with
-// the swap-mesh path, which fails in the coupled-face ordering walk.
-// The swap-mesh side of the comparison is read from the piece's
-// boundary file on disk and needs no instrumentation.
+// Diagnostic: print the boundary a mesh presents to fvMeshDistribute.
+// Off unless FOAM_DMR_DUMP_PATCHES is set.
 static void dmrDumpPatches(const fvMesh& mesh, const char* what)
 {
     static const bool on = (std::getenv("FOAM_DMR_DUMP_PATCHES") != nullptr);
@@ -1365,11 +1334,9 @@ static void dmrDumpPatches(const fvMesh& mesh, const char* what)
 }
 
 
-// Hand the cloned fields to the clone's registry, which then owns and
-// deletes them with the clone. The clone outlives the PtrLists
-// dmrCloneFields fills (it is returned to callers that write it later),
-// and a field owned by a list that has gone out of scope has already
-// checked itself out: the write finds a mesh with no fields on it.
+// Hand the cloned fields to the clone's registry. The clone outlives the
+// lists dmrCloneFields fills, and a field deleted with its list checks
+// itself out, so the clone would be written without fields.
 template<class FieldType>
 static void dmrStoreFields(PtrList<FieldType>& fields)
 {
@@ -1380,6 +1347,19 @@ static void dmrStoreFields(PtrList<FieldType>& fields)
 }
 
 
+// Clone one region of the live mesh with its checkpoint fields and
+// redistribute the clone. Calling fvMeshDistribute on a clean mesh avoids
+// the deadlock it hits on a mesh carrying live solver state.
+//
+// targetRanks = 0 (reconfiguration) uses numberOfSubdomains from the
+// dictionary, i.e. the whole new world. A positive value (uniform write)
+// sends everything to the first targetRanks ranks. Either way it is
+// collective over the running world, which is wide enough because
+// fvMeshDistribute needs max(source, target) ranks.
+//
+// Only the shrink and the uniform write use this, both of which still
+// hold the live mesh. A grow has none (its processes are new) and reads
+// through loadOrCreateMesh instead.
 static autoPtr<fvMesh> dmrRedistributeToClone
 (
     Time& runTime,
@@ -1389,13 +1369,6 @@ static autoPtr<fvMesh> dmrRedistributeToClone
     const label targetRanks
 )
 {
-    // Always from the live mesh in memory, never re-read from the
-    // checkpoint on disk. The two callers both hold it: the shrink runs
-    // in the DYING group, which is still resident, and the uniform write
-    // runs in the solver itself. Grow is the one case with no live mesh
-    // to clone (its group is a fresh set of processes and the ranks that
-    // held the data are gone), and it has its own reader built for that,
-    // loadOrCreateMesh, which tolerates ranks holding nothing.
     autoPtr<fvMesh> meshPtr(dmrCloneLiveMesh(live, runTime, regionName));
     fvMesh& mesh = meshPtr();
 
@@ -1440,10 +1413,8 @@ static autoPtr<fvMesh> dmrRedistributeToClone
     dmrCloneFields(live, mesh, mesh, surfSymmTensors);
     dmrCloneFields(live, mesh, mesh, surfTensors);
 
-    // Point fields (e.g. pointDisplacement on moving meshes). Their mesh
-    // type is pointMesh, not fvMesh, so they clone against pointMesh::New.
-    // fvMeshDistribute maps every field registered on the mesh, so these
-    // must be cloned (and thereby registered) before distribute() runs.
+    // Point fields (e.g. pointDisplacement), on the pointMesh. They must
+    // be registered before distribute() to be transported.
     pointMesh& pMesh = const_cast<pointMesh&>(pointMesh::New(mesh));
 
     PtrList<pointScalarField>          pointScalars;
@@ -1487,41 +1458,12 @@ static autoPtr<fvMesh> dmrRedistributeToClone
 
     const bool addedPatch = dmrAddTransientInternalPatch(mesh);
 
-    // Drop the fvMesh geometry caches before the redistribute. Without
-    // this, a rank that hands away ALL its cells dies with SIGFPE inside
-    // fvMeshDistribute::distribute(), and the reason is a dangling slice,
-    // not a degenerate mesh:
-    //
-    //   - Sf/magSf/C/Cf on an fvMesh are shallow slices over
-    //     primitiveMesh::faceAreas() etc. (SlicedGeometricField ->
-    //     UList::shallowCopy), built on demand and cached in the fvMesh.
-    //   - Every topology change inside distribute() goes through
-    //     polyTopoChange::changeMesh -> polyMesh::resetPrimitives ->
-    //     initMesh -> primitiveMesh::reset -> clearOut(), which FREES the
-    //     arrays those slices point at, and never calls the virtual
-    //     fvMesh::topoChange that would have dropped the slices too.
-    //   - The only fv-level invalidation on the path is fvMesh::addPatch,
-    //     reached from addProcPatches. A rank left with no cells has no
-    //     neighbours, adds no processor patch, and is never cleared.
-    //   - correctCoupledPatchFields then asks for deltaCoeffs, which
-    //     evaluates every patch's fvPatch::nf() = Sf()/magSf() through
-    //     the stale slices: the old size (hundreds of faces on a mesh that
-    //     now has none) over freed memory. Whether that memory holds an
-    //     exact zero is up to the allocator, which is why it is
-    //     intermittent, shrink-only, and independent of the geometry.
-    //
-    // Instrumented and confirmed on the stock redistributePar reproducer
-    // (movingCone, 4 -> 2, moved state): the emptied ranks show
-    // nFaces=0 with a magSf slice of size 805 reading negative and zero
-    // areas, while ranks that keep cells are fully consistent. Clearing
-    // here makes distribute() rebuild the slices from the current
-    // primitives when it first needs them, and it does not rebuild them
-    // earlier than that, so the clear holds through to the fault point.
-    // Verified: the reproducer goes from exit 136 to exit 0 with FP
-    // trapping ON, checkMesh OK, all fields finite.
-    //
-    // This belongs upstream (clear fv geometry after repatch, or route
-    // the changes through fvMesh::topoChange); reported with the above.
+    // Drop the fvMesh geometry caches first. Sf, magSf, C and Cf are
+    // slices over primitiveMesh arrays; the topology changes inside
+    // distribute() free those arrays without clearing the slices, and on
+    // a rank that gives away all its cells nothing else clears them
+    // either (it adds no processor patch). The stale slices are then read
+    // over freed memory: an intermittent SIGFPE on shrink.
     mesh.clearGeom();
 
     dmrDumpPatches(mesh, "region-before-distribute");
@@ -1539,11 +1481,9 @@ static autoPtr<fvMesh> dmrRedistributeToClone
 }
 
 
-// Clone, redistribute and WRITE one region. The uniform write uses this.
-// The multi-region shrink does not: it keeps every region's clone alive
-// until all are written, because non-conformal couplings between regions
-// have to be re-stitched across the new layout before anything is
-// written (dmrRestitchClones).
+// Clone, redistribute and write one region (the uniform write). The
+// shrink keeps all clones alive instead, to re-stitch couplings between
+// regions before writing (dmrRestitchClones).
 static void dmrRunFreshRedistribute
 (
     Time& runTime,
@@ -1559,41 +1499,20 @@ static void dmrRunFreshRedistribute
     );
     fvMesh& mesh = meshPtr();
 
-    // Ranks outside the target layout received no cells, so they have
-    // nothing to emit. Returning here rather than writing an empty mesh
-    // and deleting it afterwards also removes the only reason the write
-    // and the cleanup ever had to be ordered against each other.
+    // Ranks outside the target layout hold no cells and write nothing
     if (targetRanks > 0 && Pstream::myProcNo() >= targetRanks)
     {
         return;
     }
 
-    // The uniform write's output is emitted by a FORKED CHILD so the time
-    // loop does not wait for the disk. Reasons this is a fork and not a
-    // thread, and not a second MPI world:
-    //
-    //  - a thread cannot do it. Every Pstream operation draws on process-
-    //    global state (UPstream::msgType_, worldComm, the communicator
-    //    stacks), so two threads inside OpenFOAM interleave message tags
-    //    and mismatch each other's exchanges. OpenFOAM's own async writer,
-    //    OFstreamCollator, respects the same boundary: it gathers on the
-    //    calling thread and lets the thread do nothing but write bytes.
-    //  - a spawned MPI world can do it, and did, but it needs ranks it
-    //    does not have. At solver width on full nodes that doubled the
-    //    processes per node and exhausted MN5's SysV segment limit.
-    //  - fork gives the isolation of a process for free: the child owns a
-    //    private copy of every one of those globals, and because it does
-    //    NO MPI it allocates no new segments, which is the resource the
-    //    limit actually counts.
-    //
-    // Writing is safe in the child because it is pure local file I/O:
-    // fileOperation::writeObject is mkDir + NewOFstream + writeHeader +
-    // writeData, with no Pstream anywhere on the uncollated path. The
-    // child's pages are copy-on-write and it only reads them, so it costs
-    // page tables rather than a copy of the mesh.
-    //
-    // _exit, never exit: the child must not run atexit handlers or flush
-    // the parent's stdio, and must not reach MPI_Finalize.
+    // The uniform write is done by a forked child so the time loop does
+    // not wait for the disk. Not a thread: Pstream state is process-global
+    // and two threads would mix message tags. Not a spawned MPI world: it
+    // doubles the processes per node and exhausted the SysV segment limit
+    // on full nodes. The child does no MPI, only local file I/O (the
+    // uncollated write has no Pstream in it), and shares the parent's
+    // pages copy-on-write. _exit, not exit: no atexit handlers, no stdio
+    // flush, no MPI_Finalize.
     if (targetRanks > 0 && dmrAsyncWriteEnabled())
     {
         dmrWaitForWriters();
@@ -1626,14 +1545,10 @@ static void dmrRunFreshRedistribute
         return;
     }
 
-    // constant/<region>/polyMesh/points is the motion reference: SHARED
-    // with the run, not private to this output time. Rewriting it in the
-    // written layout is right when the solver is about to be replaced
-    // (the reconfiguration paths, targetRanks == 0), and is corruption at
-    // a natural write, where those same processor directories keep
-    // serving a solver that is still running at its own width. The
-    // transported reference reaches the time directory either way, as the
-    // points0 field mesh.write() has just emitted.
+    // constant/<region>/polyMesh/points is the motion reference shared
+    // with the running solver. Rewrite it only when the solver is about
+    // to be replaced (reconfiguration), never at a natural write. The
+    // reference is in the time directory either way, as points0.
     if (targetRanks == 0)
     {
         dmrWritePoints0Constant(mesh);
@@ -1641,15 +1556,12 @@ static void dmrRunFreshRedistribute
 }
 
 
-// Sweep the fvMeshStitcher caches (fvMesh/polyFaces, a label surface
-// field fvMeshDistribute cannot transport) from this rank's processor
-// directory, at both the given time and the constant instance. The
-// cache is derivable: when absent (READ_IF_PRESENT), the stitcher
-// reconnects from geometry at the next startup. Must run only after
-// ALL regions have been redistributed: sibling regions re-read each
-// other's caches through mapped/NCC patches during fresh-load, so a
-// per-region sweep starves the next region's construction. No-op for
-// non-NCC cases.
+// Delete the fvMeshStitcher caches (fvMesh/polyFaces, which
+// fvMeshDistribute cannot transport) from this rank's directory, at the
+// given time and at constant. Without them the stitcher reconnects from
+// geometry at startup. Run only after all regions are redistributed:
+// regions read each other's caches through mapped patches. No-op
+// without non-conformal couplings.
 static void dmrSweepStitchCaches
 (
     Time& runTime,
@@ -1676,18 +1588,11 @@ static void dmrSweepStitchCaches
         if (!keepTimeCache && isDir(cacheT)) rmDir(cacheT);
         if (isDir(cacheC)) rmDir(cacheC);
 
-        // tetBasePtIs is the same class of derivable cache, with a
-        // sharper failure mode: a generation that ran sampling-type
-        // functionObjects allocates it, so its checkpoint writeNow
-        // WRITES it (polyMeshIO propagates writeOpt); the fresh-load
-        // re-reads it (READ_IF_PRESENT in the polyMesh ctor),
-        // fvMeshDistribute never remaps it (0 references), and
-        // mesh.write() re-emits STALE OLD-LAYOUT tet data — but only
-        // on the ranks that had data, so at restart those ranks skip
-        // the collective findFaceBasePts that the others enter:
-        // off-by-N collective desync (movingCone, 2026-07-13).
-        // Absent, every rank recomputes it collectively and
-        // consistently.
+        // tetBasePtIs is also a derivable cache, and fvMeshDistribute
+        // does not remap it. A stale copy exists only on the ranks that
+        // had data, which at restart then skip the collective
+        // findFaceBasePts that the others enter. Absent, every rank
+        // recomputes it together.
         const fileName meshDirT =
             runTime.path()/timeName/regionDir/"polyMesh";
         const fileName meshDirC =
@@ -1699,19 +1604,13 @@ static void dmrSweepStitchCaches
 }
 
 
-// Swap-mesh transport (fvMeshTopoChangers::meshToMesh). The topo
-// changer reads constant/meshes/<meshTime>[/<region>]/polyMesh per
-// rank, lazily, at each swap time, and mesh().swap() makes the swap
-// mesh's decomposition BECOME the solver decomposition; after a
-// reconfiguration the pieces must therefore exist, complete, in the
-// current world size (ranks added by a grow have none, and after a
-// shrink the pieces beyond the new world size would silently drop
-// their cells at the next swap).
+// Swap meshes (fvMeshTopoChangers::meshToMesh). The solver reads
+// constant/meshes/<meshTime>[/<region>]/polyMesh per rank at each swap
+// time and adopts its decomposition, so after a reconfiguration the
+// pieces must exist in the new world size.
 //
-
-// Slice one serial swap mesh (constant/meshes/<meshTime>[/<region>] at
-// the case root) into nNew pieces, in parallel, replacing the per-mesh
-// decomposePar this used to fork. Collective over the current world.
+// Slice one serial swap mesh (at the case root) into nNew pieces, in
+// parallel. Collective over the current world.
 static void dmrRedistributeSwapMesh
 (
     Time& runTime,
@@ -1729,29 +1628,15 @@ static void dmrRedistributeSwapMesh
       : fileName(regionName)/polyMesh::meshSubDir;
     const fileName pieceDir = runTime.path()/runTime.constant()/local/meshSubDir;
 
-    // SLICE the untouched serial mesh; do not re-arrange the existing
-    // pieces. The two are different operations and only the first is
-    // wanted here. constant/meshes/<t> at the case root is static
-    // reference data that no reconfiguration ever changes, so there is a
-    // whole mesh to cut up and nothing to reconcile. Re-arranging the
-    // pieces instead means merging a layout built for the old rank count
-    // and cutting it again, which has to carry over the bookkeeping that
-    // ties those pieces together, including patches whose names encode
-    // the old rank pairing ("0to3"). On the engine's sliding interfaces
-    // that does not survive: one side of a coupling came out with 44
-    // faces against an empty partner (mesh 120, 2026-09-13).
+    // Slice the serial mesh, which never changes, rather than re-arrange
+    // the existing pieces: re-arranging has to reconcile the old layout's
+    // couplings, and the engine's sliding interfaces do not survive it.
     //
-    // This is upstream's own documented recipe for using
-    // redistributePar as a parallel decomposePar: give the undecomposed
-    // mesh to one rank, leave the others empty, and distribute (see the
-    // header of redistributePar.C). The recipe says to COPY the mesh
-    // into processor0 and it means it: the file handler's fall-through
-    // from a processor directory to the case root applies only to global
-    // files, and mesh files are not global
-    // (uncollatedFileOperation.C, the globalFile condition around line
-    // 88). A serial mesh carries no processor patches at all, so the
-    // asymmetric-collective hazard that empty ranks would otherwise
-    // create does not arise.
+    // This is redistributePar's documented use as a parallel
+    // decomposePar: the undecomposed mesh on one rank, the others empty.
+    // The mesh has to be copied into the master's processor directory,
+    // since the file handler falls back to the case root only for global
+    // files, and mesh files are not global.
     const fileName serialDir =
         fileName(runTime.globalPath())/runTime.constant()/local;
     const fileName localDir = runTime.path()/runTime.constant()/local;
@@ -1831,19 +1716,14 @@ static void dmrRedistributeSwapMesh
     }
 
 
-    // The master reads the serial mesh and the mesh that gets distributed
-    // is rebuilt from its primitives on every rank, as the region path
-    // does (dmrCloneLiveMesh); the zones are copied over further down.
+    // The master reads the serial mesh; the mesh that gets distributed is
+    // rebuilt from its primitives on every rank, as in dmrCloneLiveMesh,
+    // and the zones are copied over further down.
     //
-    // Only the master has a mesh to read, so this phase is inherently
-    // asymmetric: it must emit no parallel traffic at all. Without this
-    // the ranks with nothing to read run ahead into the collective
-    // inside addFvPatches while the master is still reading, their
-    // messages cross, and the run dies with MPI_ERR_TRUNCATE in
-    // MPI_Recv (engine swap mesh 120, 2026-09-13). Same guard
-    // loadOrCreateMesh uses when it fabricates meshes on some ranks
-    // only. Parallel running is restored before addFvPatches, which is
-    // collective and which every rank then enters together.
+    // Only the master reads, so parallel communication is switched off
+    // until every rank reaches the collective addFvPatches, as
+    // loadOrCreateMesh does. Otherwise the empty ranks' messages cross
+    // the master's read.
     const bool oldParRun = Pstream::parRun();
     Pstream::parRun() = false;
 
@@ -1905,22 +1785,13 @@ static void dmrRedistributeSwapMesh
     );
 
     {
-        // Every rank builds its patches the same way, from the boundary
-        // entries, the master keeping its face counts and the others
-        // getting none. The master must NOT clone the patches of the mesh
-        // it read: that read ran serially (parRun false above), so it has
-        // already computed each patch's geometry, and some patches cache
-        // that result and skip the whole calculation next time,
-        // collectives included. wedgePolyPatch::calcGeometry returns at
-        // once when its axis is set, before three reductions, so a cloned
-        // wedge on the master against freshly built ones elsewhere put the
-        // ranks out of step inside addFvPatches: the master went on to the
-        // bool reduction of checkDefinition while the others sent the
-        // label reduction of the wedge, and the master's 1-byte receive
-        // got a 4-byte message (MPI_ERR_TRUNCATE, movingCone, measured
-        // 2026-10-11: axis set on rank 0, vector::rootMax on ranks 1-3).
-        // Upstream's loadOrCreateMesh avoids this the same way: every rank
-        // constructs its patches fresh before the first collective.
+        // Every rank builds its patches fresh from the boundary entries,
+        // the master keeping its face counts. The master must not clone
+        // the patches of the mesh it read: that serial read already
+        // computed their geometry, and some patches cache it and then skip
+        // the calculation, collectives included (wedgePolyPatch with its
+        // axis set). Cloned on the master and fresh elsewhere, the ranks
+        // fall out of step inside addFvPatches (MPI_ERR_TRUNCATE).
         List<polyPatch*> patches(patchEntries.size());
         label nPatches = 0;
 
@@ -1976,11 +1847,9 @@ static void dmrRedistributeSwapMesh
     fvMesh& mesh = meshPtr();
 
 
-    // The clone is built from primitives, which carries no zones, so the
-    // master's zones are copied over from the mesh it read. Without this
-    // the pieces lose them, and the engine's swap meshes carry real face
-    // zones (baffles_ev_port and friends) that decomposePar did put in
-    // its pieces and that the solver needs after a swap.
+    // A mesh built from primitives has no zones, so the master's are
+    // copied from the mesh it read (the engine's swap meshes carry face
+    // zones the solver needs after a swap).
     if (readPtr.valid())
     {
         const pointZoneList& rpz = readPtr().pointZones();
@@ -2014,9 +1883,8 @@ static void dmrRedistributeSwapMesh
 
     readPtr.clear();
 
-    // Zone names from the master; empty zones of those names on the
-    // ranks without a piece, so the zone sync inside distribute sees the
-    // same names everywhere
+    // Empty zones of the same names on the ranks without a mesh, so
+    // distribute sees the same zones everywhere
     wordList pointZoneNames(mesh.pointZones().toc());
     Pstream::scatter(pointZoneNames);
     wordList faceZoneNames(mesh.faceZones().toc());
@@ -2068,25 +1936,17 @@ static void dmrRedistributeSwapMesh
         )
     );
 
-    // The geometric overload, decompose(mesh, cellCentres), which is
-    // what redistributePar uses for exactly this situation (all cells on
-    // one rank, the rest empty). The weights overload was tried here
-    // during an earlier, refuted experiment and leaves every cell on the
-    // master, so the mesh is never actually split.
+    // Geometric decomposition, as redistributePar uses when all cells
+    // start on one rank (the weights overload leaves them all there)
     const labelList finalDecomp = dmrDecompose(distributor(), mesh);
 
-    // The transient internal patch is needed here too, fields or not:
-    // without an internal-type patch fvMeshDistribute parks the faces
-    // exposed by the move on the first non-empty patch, which on these
-    // meshes is a non-conformal (coupled) one, and the coupled-face
-    // reordering after the move then fails ("The ordering walk did not
-    // hit every face exactly once", coupledPolyPatch::order, engine
-    // swap mesh 0, 2026-09-10; the same failure that was first seen in
-    // July and attributed to the merge)
+    // Needed even without fields: otherwise exposed faces are parked on
+    // the first non-empty patch, a coupled one on the engine, and the
+    // coupled-face reordering fails
     const bool addedPatch = dmrAddTransientInternalPatch(mesh);
 
-    // Same invariant as everywhere else: no stale geometry slices into
-    // fvMeshDistribute
+    // No stale geometry slices into fvMeshDistribute (see
+    // dmrRedistributeToClone)
     mesh.clearGeom();
 
     fvMeshDistribute(mesh).distribute(finalDecomp);
@@ -2096,29 +1956,20 @@ static void dmrRedistributeSwapMesh
         dmrRemoveTransientInternalPatch(mesh);
     }
 
-    // The ranks the new world does not have are emptied by the
-    // decomposition and their directories are removed by the caller
+    // Ranks beyond the new world are left empty; the caller removes them
     if (Pstream::myProcNo() < nNew)
     {
-        // A redistribution leaves the mesh's instance at the current
-        // time, so without this the pieces land in <time>/meshes/<t>
-        // instead of constant/meshes/<t> and the swap meshes on disk
-        // never change. The region path does the same with its own
-        // write time.
+        // Distribution leaves the instance at the current time; the
+        // pieces belong in constant/meshes/<t>
         mesh.setInstance(runTime.constant());
 
         mesh.write();
 
-
-        // The serial original is copied in whole on the master before
-        // the slice; it carries a cellProc field that a piece must not
-        // keep, and it would otherwise make a piece look like the whole
-        // mesh
+        // Left over from the serial copy on the master
         rm(pieceDir/"cellProc");
 
-        // Leftovers of the previous decomposition that the write does
-        // not overwrite: zone files when the mesh has none, and the
-        // stock addressing files, which no longer describe anything
+        // Left over from the previous decomposition, which the write does
+        // not overwrite
         if
         (
             mesh.pointZones().empty()
@@ -2228,33 +2079,21 @@ static void dmrRedistributeSwapMeshes(Time& runTime, const label nNew)
 
 // * * * * * * * * * Uniform (MIN-layout) output write  * * * * * * * * * * //
 //
-// A malleable run writes its natural output in whatever layout it
-// happens to be running at, so the time series ends up decomposed
-// N ways at one time and N' ways at the next: not a readable case,
-// because a decomposed case has ONE decomposition across all times.
+// A malleable run would otherwise write each output time in whatever
+// layout it is running at, and a decomposed case must have one
+// decomposition across all times. So every natural write is emitted in
+// the MIN layout (policy-min nodes x procs-per-node), which the run can
+// always produce: a clone of each live mesh is redistributed to MIN and
+// written by a forked child (dmrUniformWriteInPlace).
 //
-// The fix is to emit every natural write in the layout the run is
-// always able to produce, MIN = policy-min nodes x procs-per-node,
-// without ever gathering onto rank 0. To keep the solver running while
-// that happens, the write is handed to a SECOND MPI WORLD spawned for
-// the purpose: the live world copies its state to it rank-for-rank,
-// the helper redistributes to MIN and writes, then frees its memory and
-// exits. The solver does not write this step itself and does not wait.
-//
-// The two worlds are the same size N because fvMeshDistribute needs
-// max(N_src, N_dst) ranks and MIN <= N, so the handoff is a straight
-// 1:1 rank-to-rank copy with no re-decomposition in flight. Nothing
-// goes through disk on the way. Verified separately (2026-07-25) that
-// a spawned process runs as a full OpenFOAM application with its own
-// MPI_COMM_WORLD, so Pstream and fvMeshDistribute behave normally
-// inside the helper; the parent intercommunicator is used only for the
-// handoff, via raw MPI byte transfer.
+// dmrSpawnUniformWrite and dmrRelayoutFromParent are an earlier version
+// that did this in a spawned MPI world. They are retained but not
+// called: on full nodes the extra processes exhausted the SysV segment
+// limit.
 
-// Target world size for the uniform output: policy-min NODES times
-// procs-per-node. Taken from the environment because that is how the
-// launcher configures DMR itself (DMR_DEFAULT_POLICY_MIN /
-// DMR_PROCS_PER_NODE); the library exposes a setter for the policy
-// minimum but no getter.
+// Target world size for the uniform output: policy-min nodes times
+// procs-per-node, from the environment the launcher configures DMR with
+// (DMR has no getter for the policy minimum).
 static int dmrMinWorldSize()
 {
     const char* minNodes = std::getenv("DMR_DEFAULT_POLICY_MIN");
@@ -2267,11 +2106,10 @@ static int dmrMinWorldSize()
 }
 
 
-// Emit every natural write in the MIN layout via a spawned helper, so
-// the output series shares one decomposition and is directly readable.
-// On by default; set FOAM_DMR_UNIFORM_WRITE=0 to write in the running
-// layout instead (which leaves the series unreadable across
-// reconfigurations, but needs no MPI_Comm_spawn).
+// Emit every natural write in the MIN layout, so the output series has
+// one decomposition. On by default; FOAM_DMR_UNIFORM_WRITE=0 writes in
+// the running layout instead, which leaves the series unreadable across
+// reconfigurations.
 static bool dmrUniformWriteEnabled()
 {
     static const bool enabled = []()
@@ -2284,16 +2122,10 @@ static bool dmrUniformWriteEnabled()
 
 
 // Whether superseded DMR-forced checkpoints are deleted as the run
-// proceeds. On by default; set FOAM_DMR_KEEP_CHECKPOINTS=1 to retain
-// every one of them, which is only useful for debugging a restart.
-//
-// This is separate from the uniform write on purpose. Retention has
-// nothing to do with the layout writes land in: the newest checkpoint is
-// the state the next generation restarts from and older ones are read by
-// nothing. Tying the two together costs a full mesh plus fields per
-// reconfiguration, per rank, for the whole run, which is what exhausted
-// the filesystem on MareNostrum on 2026-09-29 at the tenth checkpoint of
-// a run that wanted about fifty.
+// proceeds. On by default; FOAM_DMR_KEEP_CHECKPOINTS=1 keeps them all,
+// for debugging a restart. Independent of the uniform write: only the
+// newest checkpoint is ever read, and keeping the rest costs a full mesh
+// and fields per reconfiguration, enough to fill a filesystem.
 static bool dmrPurgeCheckpointsEnabled()
 {
     static const bool enabled = []()
@@ -2305,33 +2137,16 @@ static bool dmrPurgeCheckpointsEnabled()
 }
 
 
-// The intercommunicator of the helper world that is still writing, or
-// MPI_COMM_NULL when none is outstanding. At most ONE helper is alive at
-// a time (see dmrWaitForHelper).
+// Spawned-helper uniform write: retained, not called (see the section
+// header). The helper world still writing, or MPI_COMM_NULL.
 static MPI_Comm dmrHelperComm = MPI_COMM_NULL;
 
 
-// Wait for the outstanding helper to finish, if there is one.
-//
-// MPI_Comm_disconnect is collective over BOTH worlds and returns only
-// once each side has called it. The helper calls it as its LAST action,
-// so the parent calling it here blocks exactly until the helper has
-// finished writing. That is the whole synchronisation mechanism: no
-// extra protocol, no polling.
-//
-// The parent deliberately does NOT call this at the natural write - that
-// would make the handoff synchronous again. It is called only where a
-// still-running helper would otherwise be destroyed:
-//
-//   * before spawning a replacement (bounds the system to one helper,
-//     so helpers cannot accumulate if writes outpace them);
-//   * at every exit of dmrCheckpoint, because dmr_reconfigure() tears
-//     down and restarts the DVM the helper lives in;
-//   * at dmrFinalize, for the same reason at end of run.
-//
-// By then the parent has already done its own checkpoint and
-// redistribute work, which is independent of the helper's, so in
-// practice the helper finished long ago and this returns immediately.
+// Wait for the outstanding helper, if any. MPI_Comm_disconnect returns
+// once both worlds have called it, and the helper calls it last, so this
+// blocks until the helper has finished writing. Called only where a
+// running helper would otherwise be killed: before spawning another, at
+// a reconfiguration and at the end of the run.
 static void dmrWaitForHelper()
 {
     if (dmrHelperComm == MPI_COMM_NULL)
@@ -2339,15 +2154,8 @@ static void dmrWaitForHelper()
         return;
     }
 
-    // A helper that died leaves this collective unsatisfied. Ask for the
-    // error to be returned rather than aborting the solver, so the
-    // failure is diagnosable; it cannot rescue a genuinely hung peer,
-    // which is why the helper also drops a .complete sentinel for
-    // after-the-fact checking.
-    //
-    // No attempt is made to save and restore the previous handler: this
-    // communicator is destroyed by the disconnect below, and the default
-    // is a predefined handler that must not be freed.
+    // Return errors rather than abort the solver if the helper died. The
+    // communicator is destroyed below, so the handler is not restored.
     MPI_Comm_set_errhandler(dmrHelperComm, MPI_ERRORS_RETURN);
 
     const int rc = MPI_Comm_disconnect(&dmrHelperComm);
@@ -2359,17 +2167,13 @@ static void dmrWaitForHelper()
             << " (code " << rc << "). The output time it was writing may"
             << " be incomplete; check for its .complete sentinel." << endl;
 
-        // On failure the handle may be left valid. Drop it rather than
-        // retry: a second attempt would block on the same dead peer, and
-        // hanging the solver is worse than leaking one communicator.
+        // Drop the handle rather than retry and block on a dead peer
         dmrHelperComm = MPI_COMM_NULL;
     }
 }
 
 
-// Scope guard so the wait cannot be missed on an exit path added later:
-// dmrCheckpoint returns from several places, and every one of them is
-// immediately followed by dmr_reconfigure() killing the helper.
+// Scope guard so no exit path of dmrCheckpoint misses the wait
 namespace
 {
 struct dmrHelperBarrier
@@ -2399,11 +2203,8 @@ static std::string dmrRecvBlob(MPI_Comm inter, int peer)
 }
 
 
-// Serialise this rank's slice of one field type into the fields blob,
-// as a sub-dictionary per field. Only the AUTO_WRITE set is sent: it is
-// exactly what a natural write would have emitted, and it keeps the
-// live registry's derived/cached state (which differs between ranks)
-// out of the helper, for the same reason the clone path filters it.
+// Serialise this rank's fields of one type, a sub-dictionary per field.
+// AUTO_WRITE only, as in dmrCloneFields.
 template<class GeoField>
 static void dmrWriteFieldsBlob(const fvMesh& mesh, OStringStream& os)
 {
@@ -2476,11 +2277,7 @@ void dmrSpawnUniformWrite(Time& runTime, bool allRegions)
         return;
     }
 
-    // At most one helper at a time. If the previous one is somehow still
-    // writing when the next output time arrives, wait for it here rather
-    // than accumulating helper worlds (and their processes, and their
-    // intercommunicators) without bound. Normally a no-op: the helper
-    // finished many timesteps ago.
+    // At most one helper at a time
     dmrWaitForHelper();
 
     const int minSize = dmrMinWorldSize();
@@ -2529,15 +2326,10 @@ void dmrSpawnUniformWrite(Time& runTime, bool allRegions)
     std::vector<char> helperBuf(helper.begin(), helper.end());
     helperBuf.push_back('\0');
 
-    // Provision the helper exactly the way DMR provisions its own spawned
-    // processes (dmr_core.c, the MPI_Comm_spawn_multiple call): the
-    // PMIX_* keys add the hosts and slots for the NEW processes and allow
-    // them to overload the cores. They apply only to the spawned world, so
-    // the solver's own placement is untouched and DMR's node accounting
-    // (identify_nodes -> MPI_Comm_split_type on its INTERNAL_COMM_WORLD)
-    // still sees the run exactly as before. Passing MPI_INFO_NULL instead
-    // is what made the spawn fail with "all nodes already filled" once the
-    // allocation was exactly filled by the solver.
+    // Provision the helper as DMR provisions its own spawned processes
+    // (dmr_core.c): the PMIX_* keys add hosts and slots for the new
+    // processes and allow overloading. With MPI_INFO_NULL the spawn fails
+    // ("all nodes already filled") when the solver fills the allocation.
     MPI_Info spawnInfo = MPI_INFO_NULL;
     {
         char procName[MPI_MAX_PROCESSOR_NAME];
@@ -2591,9 +2383,8 @@ void dmrSpawnUniformWrite(Time& runTime, bool allRegions)
     MPI_Comm inter = MPI_COMM_NULL;
     std::vector<int> errcodes(worldSize, 0);
 
-    // A refused spawn must degrade to "this output time stays in the
-    // running layout", never kill the solver: the default
-    // MPI_ERRORS_ARE_FATAL would abort before the return code is read.
+    // A refused spawn leaves this output time in the running layout; it
+    // must not abort the solver
     MPI_Errhandler oldHandler = MPI_ERRHANDLER_NULL;
     MPI_Comm_get_errhandler(MPI_COMM_WORLD, &oldHandler);
     MPI_Comm_set_errhandler(MPI_COMM_WORLD, MPI_ERRORS_RETURN);
@@ -2635,12 +2426,8 @@ void dmrSpawnUniformWrite(Time& runTime, bool allRegions)
 
     // Header: what the helper needs before it can interpret the rest
     {
-        // Quoted: a time name like "0.05" would otherwise read back as
-        // a scalar rather than a word
-        // 17 significant digits = max_digits10 for an IEEE double, the
-        // minimum that round-trips a double through text exactly.
-        // deltaT below sets the step the run resumes with, and
-        // OpenFOAM's default writePrecision of 6 would round it.
+        // Time name quoted so "0.05" reads back as a word. 17 digits so
+        // deltaT round-trips exactly.
         OStringStream os;
         os.precision(17);
         os  << "time" << token::SPACE << string(runTime.name())
@@ -2699,11 +2486,8 @@ void dmrSpawnUniformWrite(Time& runTime, bool allRegions)
         }
     }
 
-    // Hand off and carry on. The intercommunicator is deliberately NOT
-    // disconnected here: disconnect is collective and would block until
-    // the helper finished, making the write synchronous again. It is
-    // kept so the wait can happen later, at the one point where the
-    // helper would otherwise be killed (see dmrWaitForHelper).
+    // Not disconnected here, which would block until the helper finished;
+    // dmrWaitForHelper does that later
     dmrHelperComm = inter;
 
     if (Pstream::master())
@@ -2720,17 +2504,9 @@ void dmrSpawnUniformWrite(Time& runTime, bool allRegions)
 }
 
 
-// A DMR-forced checkpoint is restart state, not output: it carries
-// whatever layout the reconfiguration produced, so it is unreadable as
-// part of the uniform output series, and at real mesh sizes the
-// accumulated copies are a serious waste of disk.
-//
-// Mark each one with a sentinel and drop every SUPERSEDED one from this
-// rank's own processor directory (no cross-rank collisions). The newest
-// is always kept: it IS the state the next generation restarts from.
-// Same policy as the serial path's sweep in dmrCheckpoint, applied to
-// the processor trees. OpenFOAM time names must be ordered as floats,
-// not as strings, or "0.17" sorts before "0.085".
+// A DMR-forced checkpoint is restart state, not output. Mark each with a
+// sentinel and delete all but the newest (the restart state) from this
+// rank's directory. Times are ordered as numbers, not strings.
 static void dmrPurgeSupersededCheckpoints
 (
     const Time& runTime,
@@ -2783,44 +2559,31 @@ static void dmrPurgeSupersededCheckpoints
 
 void dmrUniformWriteInPlace(Time& runTime, bool allRegions)
 {
-    // The region set comes from the registry below rather than from this
-    // flag: every live fvMesh has to be redistributed, because the
-    // MIN-layout series is only readable as a case if all of them are.
+    // Every live region is written regardless: the series is only
+    // readable if all of them are in the MIN layout
     (void)allRegions;
 
     const label minRanks = dmrMinWorldSize();
     const std::string timeName = runTime.name();
 
-    // Live meshes, in an order that is identical on every rank: everything
-    // below is collective, so the regions must be visited in lockstep.
+    // Same order on every rank: everything below is collective
     wordList regionNames;
     {
         HashTable<fvMesh*> liveRegions(runTime.lookupClass<fvMesh>());
         regionNames = liveRegions.sortedToc();
     }
 
-    // Preconditions, checked BEFORE the first collective so that a case
-    // this path cannot serve degrades to an ordinary write rather than
-    // half-writing. Past this point there is no fallback: a failure
-    // inside fvMeshDistribute leaves the ranks at different points in a
-    // collective sequence, and continuing from there is not recoverable.
+    // Fall back to an ordinary write before the first collective; past
+    // it, a failure is not recoverable
     if (minRanks < 1 || regionNames.empty())
     {
         runTime.write();
         return;
     }
 
-    // Redistribute a CLONE of each live mesh down to the MIN layout.
-    //
-    // This is the difference between a natural write and the forced
-    // checkpoint DMR takes before a reconfiguration. There the solver is
-    // about to be torn down, so the live mesh may be consumed. Here the
-    // time loop continues immediately afterwards at the running width, so
-    // the live mesh must come through untouched. dmrCloneLiveMesh gives a
-    // separate, non-registered fvMesh built from the live mesh's
-    // primitives; fvMeshDistribute only ever sees that clone, and the
-    // clone dies with the autoPtr on return. The live mesh is neither
-    // redistributed nor re-instanced nor written.
+    // Redistribute a clone of each live mesh to the MIN layout. The
+    // solver carries on at its own width, so the live mesh is never
+    // touched.
     forAll(regionNames, i)
     {
         dmrRunFreshRedistribute
@@ -2833,24 +2596,16 @@ void dmrUniformWriteInPlace(Time& runTime, bool allRegions)
         );
     }
 
-    // The non-field state, uniform/time, which the clones do not carry.
-    //
-    // NOT runTime.write(), and not runTime.writeNow(): in the helper
-    // world those were safe because its registry held nothing but the
-    // clones, whereas here runTime owns the LIVE meshes and their fields.
-    // Either call would walk that registry and emit the running N-way
-    // layout on top of the MIN-way layout just written, into the same
-    // directories. writeTimeDict is the narrow part that is actually
-    // wanted.
+    // uniform/time, which the clones do not carry. Not runTime.write():
+    // that would also write the live meshes in the running layout over
+    // the MIN layout just written.
     runTime.writeTimeDict();
 
     // Derivable caches, as after any redistribute
     dmrSweepStitchCaches(runTime, timeName, regionNames);
 
-    // Ranks outside the MIN layout received no cells, so there is nothing
-    // of theirs in this output time. They do not write it at all (the
-    // write above is skipped for them), which leaves only a directory a
-    // previous generation may have left behind.
+    // Ranks outside the MIN layout write nothing; remove any directory a
+    // previous generation left for this time
     if (Pstream::myProcNo() >= minRanks)
     {
         const fileName stale(runTime.path()/timeName);
@@ -2860,15 +2615,9 @@ void dmrUniformWriteInPlace(Time& runTime, bool allRegions)
         }
     }
 
-    // One barrier, and it is not there to order file accesses: each rank
-    // touches only its own processor directory, and the writers are now
-    // separate processes anyway. It keeps the write's SKEW out of the CE
-    // reading. The work above is uncollective filesystem work, so ranks
-    // leave it at different times, and without a barrier that spread is
-    // absorbed by the next timestep's first collective, where TALP
-    // charges it to the solver rather than to the write. CE is what the
-    // controller reconfigures on, so a write must not be able to depress
-    // it.
+    // Not for file ordering: it keeps the ranks' skew from the file work
+    // above out of the next timestep, where TALP would charge it to the
+    // solver and lower the CE the controller reconfigures on
     MPI_Barrier(MPI_COMM_WORLD);
 }
 
@@ -2883,38 +2632,18 @@ void dmrWrite(Time& runTime, bool allRegions)
      && runTime.writeTime()
      && worldSize > dmrMinWorldSize();
 
-    // On the uniform path the solver does its own I/O, but writes the
-    // MIN-layout copy rather than its running layout: a plain
-    // runTime.write() here would emit the N-way state into the very
-    // directories the MIN-way state is going to, and the two would
-    // interleave.
     if (uniform)
     {
         dmrUniformWriteInPlace(runTime, allRegions);
         return;
     }
 
-    // At MIN width the running layout already IS the target, so this is
-    // an ordinary write. It must still emit its own polyMesh.
-    //
-    // OpenFOAM resolves a time directory that carries no mesh by searching
-    // backwards for the nearest one that does, and under the uniform-write
-    // regime the nearest one is a mesh this run is not using: the uniform
-    // write re-decomposes from scratch at every output time, whereas the
-    // layout the solver is actually running at came from the last
-    // reconfiguration. Both are MIN-wide, so nothing looks wrong, but they
-    // assign different cells to each rank and give the patches different
-    // sizes. The fields then read against the wrong partition, which
-    // surfaces far away as a boundary field whose value list does not
-    // match its patch. Writing the mesh makes every output time
-    // self-contained, which is the invariant the whole series relies on.
-    //
-    // setInstance, not a bare write flag: it re-arms points AND topology
-    // for writing (setPointsWrite/setTopologyWrite, which polyMesh clears
-    // after each write so a static mesh is emitted once) and points them
-    // at this time directory rather than the one the mesh was read from.
-    // It touches only IOobject instances and write options, never
-    // topology or geometry, so the running solver is unaffected.
+    // At MIN width the running layout is the target: an ordinary write,
+    // but with its own mesh. Otherwise a reader takes the nearest earlier
+    // mesh, which may be a different MIN-wide decomposition from a
+    // uniform write, and reads the fields against the wrong partition.
+    // setInstance re-arms points and topology for writing to this time
+    // without touching the mesh itself.
     if (dmrUniformWriteEnabled() && runTime.writeTime())
     {
         HashTable<fvMesh*> liveRegions(runTime.lookupClass<fvMesh>());
@@ -2926,11 +2655,8 @@ void dmrWrite(Time& runTime, bool allRegions)
 
     runTime.write();
 
-    // Same marker the asynchronous writer drops, so that "has .complete"
-    // is a single test a consumer can apply to EVERY output time rather
-    // than one that happens to hold only for the times written while the
-    // run was above MIN. This path is synchronous, so reaching here is
-    // itself the proof the time is finished.
+    // Same marker the asynchronous writer drops, so every output time can
+    // be checked the same way
     if (dmrUniformWriteEnabled() && runTime.writeTime())
     {
         dmrWriteCompleteSentinel(runTime, runTime.name());
@@ -2980,15 +2706,8 @@ void dmrRelayoutFromParent(Time& runTime)
     runTime.setTime(instant(timeName), timeIndex);
     runTime.setDeltaT(deltaT);
 
-    // Drain every blob up front so the transfer itself is over quickly.
-    // The disconnect is deliberately left to the END of this function:
-    // it is collective with the parent, and the parent uses it as its
-    // "helper has finished" signal (dmrWaitForHelper). Concurrency comes
-    // from WHEN THE PARENT WAITS - only at a reconfiguration, after its
-    // own checkpoint and redistribute work - not from disconnecting
-    // early here. Disconnecting early would leave this process writing
-    // with no way for the parent to know, and the DVM teardown at
-    // dmr_reconfigure() would kill it mid-write.
+    // Receive everything first. The disconnect comes last: the parent
+    // uses it as the "finished writing" signal (dmrWaitForHelper).
     List<string> meshBlobs(regionNames.size());
     List<string> fieldBlobs(regionNames.size());
 
@@ -3244,17 +2963,12 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
 
     const label nRegions = regionNames.size();
 
-    // Same structure as the shrink (dmrShrinkInPlace): every region
-    // through each phase before the next, because the non-conformal
-    // couplings between regions need all of them at once, for the stitch
-    // that lets the fields be read in the sizes the checkpoint has, and
-    // for the re-stitch on the new layout before the write.
+    // As in the shrink, every region goes through each phase before the
+    // next: couplings between regions need all of them at once.
     //
-    // Phase 1: every region's mesh, loaded (or fabricated empty on the
-    // ranks the grow added) and REGISTERED under the region name, so
-    // that the mapped walls find their neighbours when stitched. The
-    // meshes stay conformal and unstitched here: loadOrCreateMesh does
-    // not post-construct.
+    // Phase 1: every region's mesh, loaded (or created empty on the new
+    // ranks) and registered under its name, so mapped walls find their
+    // neighbours when stitched.
     PtrList<fvMesh> meshes(nRegions);
     List<fileName> meshSubDirs(nRegions);
     List<fileName> masterInstDirs(nRegions);
@@ -3307,13 +3021,9 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
         );
         fvMesh& mesh = meshes[regioni];
 
-        // loadOrCreateMesh's dummy zones must never reach the written
-        // mesh: the unoriented dummyFaceZone FATALs in a later
-        // fvMeshDistribute zone sync (flipMap). The utility's own sync
-        // clears them, but they have been observed to survive into the
-        // write; purge by name. Dummies never coexist with real zones
-        // (the sync replaces them when real zones exist), so this is a
-        // no-op on every legitimate case.
+        // loadOrCreateMesh's dummy zones can survive into the mesh, and
+        // the unoriented dummyFaceZone fails a later zone sync. They never
+        // coexist with real zones, so removing them by name is safe.
         if (mesh.faceZones().findIndex("dummyFaceZone") != -1)
         {
             Pout<< "DMR-GROW[r" << Pstream::myProcNo()
@@ -3324,10 +3034,8 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
         }
     }
 
-    // Phase 2: stitch the regions together, from geometry. The maps on
-    // disk are the old world's (their mapped-wall offset tables are
-    // sized for it) and are not loaded. Cases without non-conformal
-    // patches never touch the stitcher, as on the shrink side.
+    // Phase 2: stitch the regions from geometry; the maps on disk are
+    // sized for the old world and are not loaded
     const bool stitched = dmrHasNonConformalPatches(meshes);
     if (stitched)
     {
@@ -3335,9 +3043,8 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
         dmrConnectAll(regionNames, meshes);
     }
 
-    // Phase 3: the fields, read in the sizes the checkpoint has (written
-    // unconformed, by the shrink or by the solver), and handed to each
-    // mesh's registry so the redistribute transports them
+    // Phase 3: the fields, read stitched, and registered so the
+    // redistribution transports them
     forAll(regionNames, regioni)
     {
         const boolList& haveMesh = haveMeshes[regioni];
@@ -3398,16 +3105,14 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
         dmrStoreFields(pointTensors);
     }
 
-    // Phase 4: conform for the redistribution (fvMeshDistribute requires
-    // it)
+    // Phase 4: conform, as fvMeshDistribute requires
     if (stitched)
     {
         dmrConformAll(regionNames, meshes);
     }
 
-    // Phase 4b: the ranks the grow added get zero-sized copies of every
-    // field from the master, and the motion reference is resolved, now
-    // that every region is conformal again (see dmrReadFieldsGrow)
+    // Phase 4b: zero-sized fields for the new ranks and the motion
+    // reference, now that every region is conformal
     forAll(regionNames, regioni)
     {
         const word& regionName = regionNames[regioni];
@@ -3451,16 +3156,9 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
                 false
             );
 
-            // fvMeshSubset::interpolate on a point field lazily
-            // constructs the subset mesh's pointMesh, whose
-            // constructor (pointBoundaryMesh::calcGeometry) is
-            // COLLECTIVE, but interpolate is only called on the
-            // master (zero-field sends), deadlocking every other rank
-            // in the following scatter. Stock redistributePar has the
-            // same defect whenever point fields are present (gdb
-            // stacks, movingCone, 2026-07-12). Constructing the
-            // pointMesh collectively up front makes the master-only
-            // path a pure cache hit.
+            // Interpolating a point field constructs the subset's
+            // pointMesh, which is collective, but only the master
+            // interpolates. Construct it here on every rank first.
             (void)pointMesh::New(subsetterPtr().subMesh());
 
             dmrSendZeroFieldsGrow<volScalarField>(haveMesh, mesh, subsetterPtr());
@@ -3587,14 +3285,9 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
             rm(meshDir/"cellZones");
         }
 
-        // loadOrCreateMesh wrote a dummy zero-cell mesh (with dummy
-        // point/face/cell zones) at the staged instance on the ranks
-        // that had no data. The real mesh now lives at timeName, but
-        // the dummy files persist and a later fresh-load's zone
-        // findInstance walks back into them (unoriented dummyFaceZone
-        // FATALs in fvMeshDistribute's zone sync). Remove them; if the
-        // staged instance IS the write time, remove only the dummy
-        // zone files beside the real mesh.
+        // On the new ranks loadOrCreateMesh wrote a dummy mesh with dummy
+        // zones at the staged instance, which a later read could find.
+        // Remove it, or only its zone files if it is this time's mesh.
         if (!haveMesh[Pstream::myProcNo()])
         {
             const fileName dummyDir =
@@ -3616,16 +3309,13 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
     // The meshes leave the registry before the solver builds its own
     meshes.clear();
 
-    // Sweep the old-layout caches BEFORE the swap-mesh transport: if
-    // the latter fails, the relaunched generation must never read a
-    // stale mixed-layout stitcher cache (engine, 2026-07-13). The map
-    // just written for the new layout is kept.
+    // Old-layout caches go before the swap meshes, so a relaunch after a
+    // failure there never reads them. The map just written is kept.
     dmrSweepStitchCaches(runTime, timeName, regionNames, stitched);
 
     dmrRedistributeSwapMeshes(runTime, Pstream::nProcs());
 
-    // As on the shrink side: this is now the restart state, so older
-    // forced checkpoints are superseded
+    // This is now the restart state
     if (dmrPurgeCheckpointsEnabled())
     {
         dmrPurgeSupersededCheckpoints(runTime, timeName);
@@ -3635,8 +3325,8 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
 
     if (Pstream::master())
     {
-        // Consume the meta so a later fresh launch of this case (or the
-        // next generation) cannot mistake it for an in-flight grow
+        // Consume the meta so a later launch does not take it for a grow
+        // in progress
         std::rename
         (
             (casePath + "/log.dmr/.world.meta").c_str(),
@@ -3656,41 +3346,24 @@ void dmrGrowRedistribute(Time& runTime, bool allRegions)
 }
 
 
-// The coupling faces after the re-stitch. fvMeshStitcher::resizePatchFields
-// (run by connect) applies setSizeFieldMapper, which by its own description
-// "does not actually map values", so at this point every non-conformal
-// patch field of every field holds uninitialised memory: measured on
-// engine2Valve2D as values of 4e+252, denormals and a NaN in phi and
-// rhoUf, and in the refValue/refGradient/valueFraction and gradient
-// entries of T and p. The solver's per-timestep path maps those faces
-// back from the conformedFvPatchField wrappers an earlier disconnect
-// installed; the clones' fields were born conformal and have none (and
-// conformedFvPatchField::unconform refCasts, so that path cannot be run
-// on them). What follows is upstream's own construction for each kind of
-// field when it has no conformed data to map from:
+// Values on the coupling faces after the re-stitch. The stitcher resizes
+// patch fields without mapping values, so every non-conformal patch
+// field holds uninitialised memory. The solver normally maps them back
+// from conformed wrappers; the clones never had any. So each kind of
+// field gets the value upstream itself uses when there is nothing to map
+// from:
 //
-//   - volume fields: the adjacent cell value, "a tolerable approximation"
-//     in conformedFvPatchField::unconform for calculated conditions.
-//     Mixed and fixed-gradient conditions carry extra entries that their
-//     dictionary constructors read back at restart (coupledTemperature
-//     requires refValue/refGradient/valueFraction, fixedFluxPressure
-//     reads gradient when present), set here consistently with the
-//     value; the condition's own updateCoeffs recomputes them at the
-//     first step.
-//   - face velocities (Uf, rhoUf): the interpolated volume velocity, as
-//     fvMeshStitcher::postUnconformVolFields and fvMeshTopoChangers::
-//     meshToMesh::interpolateUfs do. Upstream resolves rhoUf through a
-//     rhoU field the solver registers only while a topology change is
-//     in progress and never writes; the clone has rho and U instead.
-//   - fluxes (phi): Sf & Uf, the reconstruction the solver modules apply
-//     after a topology change (isothermalFluid::moveMesh). The flux the
-//     live mesh carried on those faces cannot be transported (it lives on
-//     faces the conformal clone does not have); the first pressure
-//     corrector after the restart rewrites it.
+//   - volume fields: the adjacent cell value (as in
+//     conformedFvPatchField::unconform). Mixed and fixed-gradient
+//     conditions also get consistent refValue/refGrad/valueFraction or
+//     gradient, which their constructors read at restart.
+//   - face velocities (Uf, rhoUf): the interpolated volume velocity (as
+//     in meshToMesh::interpolateUfs).
+//   - fluxes (phi): Sf & Uf (as the solvers do after a topology change);
+//     the first pressure corrector rewrites it.
 //
-// Any other surface field with coupling faces is a convention with no
-// rule here and stops the run by name rather than being written
-// uninitialised.
+// Any other surface field on coupling faces stops the run by name
+// rather than being written uninitialised.
 template<class Type>
 static void dmrFillNonConformalVolFields(fvMesh& mesh)
 {
@@ -3847,14 +3520,10 @@ static void dmrCheckNoNonConformalSurfaceFields(fvMesh& mesh)
 
 
 // Make the polyFaces map loadable by the new world. A mapped wall's entry
-// is a nonConformalMappedPolyFacesFvsPatchLabelField carrying a
-// per-processor offset table sized Pstream::nProcs() of the world that
-// stitched it, i.e. the OLD one here, and the restart's
-// nonConformalMappedFvPatchBase::map walks that table and sends to every
-// entry (engine 4 -> 2: segfault in UOPstream::write to ranks 2 and 3).
-// The ranks the new world does not have hold no cells of the clone, so
-// their blocks are empty and the table is simply cut at nNew; the
-// surviving ranks keep their numbers. polyFacesBfRef() is private to
+// carries a per-processor offset table sized for the world that stitched
+// it, i.e. the old one, and the restart sends to every entry in it. The
+// ranks beyond nNew hold no cells of the clone, so their blocks are
+// empty and the table is cut at nNew. polyFacesBfRef() is private to
 // fvMesh, hence the cast on a clone this code owns.
 static void dmrTruncateMappedProcOffsets(fvMesh& mesh, const label nNew)
 {
@@ -3913,59 +3582,9 @@ static bool dmrHasNonConformalPatches(const PtrList<fvMesh>& clones)
 }
 
 
-// Re-stitch the redistributed clones at the destination, so that what is
-// written is what the solver itself writes and what its restart reads.
-// Returns false, having touched nothing, for cases without non-conformal
-// patches.
-//
-// The redistribute transports the CONFORMAL state: fvMeshDistribute
-// requires it, and the clone is built from polyMesh primitives, which
-// stay conformal even while the live fvMesh is stitched (the stitched
-// state lives at the fvMesh level, as polyFacesBf plus full Sf/Cf). A
-// conformal write puts `nonuniform List 0()` on every non-conformal patch
-// field. A fresh fvMesh unconforms itself in postConstruct BEFORE any
-// field is read, so its patches already carry their coupling faces (43 on
-// the fluid-liner wall of engine2Valve2D after a 4 -> 2 shrink), and
-// `Field("value", dict, 43)` rejects a 0-element list. The reader accepts
-// `uniform` at any size, which is how the tutorial's 0/ fields survive
-// the same stitch, but an empty field cannot be written as uniform, so
-// this cannot be fixed at the write.
-//
-// OpenFOAM's own runtime load balancer never meets this: fvMesh::distribute
-// requires a conformal mesh, fvMeshStitcher::distribute is empty, and the
-// re-stitch simply happens at the next move(), in memory. Doing the same
-// here, before the write, reproduces the solver's own output: conformal
-// topology plus fields sized to the destination's stitch.
-//
-// The polyFaces map IS written, with its mapped-wall offset tables cut to
-// the new world (dmrTruncateMappedProcOffsets). The restart needs a
-// loadable map: measured on the solver's own writes, serial and 2-rank,
-// a restart with the map present runs on, and one with no map anywhere
-// (this time or an earlier one) re-stitches from geometry, completes one
-// step and dies at the second mesh update in the solver's own
-// conformedFvPatchField::unconform (movingWallSlipVelocity on an error
-// patch, "unmapped elements"). A map one write old was accepted through
-// the instance lookup, so the map's exact time is not what matters.
-//
-// The call is the STARTUP form, connect(changing=false): it resizes the
-// non-conformal patch fields to the new sizes and nothing more, which is
-// what the solver does to fields it has just read. The per-timestep form,
-// changing=true, additionally maps values back through the
-// conformedFvPatchField wrappers that only an earlier disconnect()
-// installs; the clones' fields were born conformal, have no wrappers,
-// and it would refCast-fail on them. The values those resized faces need
-// are then filled explicitly (see dmrFillNonConformalVolFields).
-//
-// It is multi-region: a mapped wall couples only if its neighbour region
-// is found by NAME in the Time registry (patchCoupleds ->
-// nonConformalMappedWallFvPatch::haveNbr), and regionNames() is the
-// transitive closure over those walls. The live meshes hold the names, so
-// they are checked out and the clones checked in for the duration, and
-// the swap is undone before the group exits. Legitimate here and only
-// here: on the shrink path the group is about to die.
 // A stationary stitcher on every mesh: no changers, no zones, and no
-// connect yet (the built-in type; the changing one needs
-// libfvMeshStitchers and a dynamicMeshDict). Once per mesh.
+// connect yet (the changing stitcher needs libfvMeshStitchers and a
+// dynamicMeshDict). Once per mesh.
 static void dmrPostConstructAll(PtrList<fvMesh>& meshes)
 {
     forAll(meshes, i)
@@ -4004,10 +3623,9 @@ static void dmrConnectAll(const wordList& regionNames, PtrList<fvMesh>& meshes)
 }
 
 
-// The reverse: conform every region (fvMeshDistribute requires it). With
-// changing=false the non-conformal patch fields are resized to zero and
-// their values dropped, which is the same information the shrink's
-// conformal clone never has; both sides rebuild it after the re-stitch.
+// The reverse: conform every region, as fvMeshDistribute requires. The
+// coupling-face values are dropped and rebuilt after the re-stitch, as
+// on the shrink side.
 static void dmrConformAll(const wordList& regionNames, PtrList<fvMesh>& meshes)
 {
     forAll(meshes, i)
@@ -4071,6 +3689,25 @@ static void dmrFillAfterStitch
 }
 
 
+// Re-stitch the redistributed clones on the new layout before writing, so
+// what is written is what the solver itself would write. Returns false,
+// touching nothing, without non-conformal patches.
+//
+// The redistribution moves the conformal state, so a plain write leaves
+// zero-size values on the non-conformal patches, while a restarted mesh
+// stitches itself before reading fields and expects the coupled sizes.
+// OpenFOAM's own load balancer re-stitches at the next move(); this does
+// the same before the write.
+//
+// The startup form, connect(changing=false), only resizes the patch
+// fields; the values are filled afterwards (dmrFillAfterStitch). The
+// polyFaces map is written too, with its offset tables cut to the new
+// world: a restart without a loadable map fails at its second mesh
+// update.
+//
+// Mapped walls find their neighbour region by name in the registry, so
+// the live meshes are checked out and the clones checked in for the
+// duration (acceptable only because this group is about to exit).
 static bool dmrRestitchClones
 (
     const wordList& regionNames,
@@ -4088,11 +3725,9 @@ static bool dmrRestitchClones
 
     dmrPostConstructAll(clones);
 
-    // Swap the registry: region names now resolve to the redistributed
-    // meshes, which is what the neighbour lookups have to see
-    // regIOobject:: qualified: objectRegistry, also a base of fvMesh,
-    // declares checkIn(regIOobject&)/checkOut(regIOobject&) and hides the
-    // zero-argument self-registration inherited from regIOobject
+    // Region names now resolve to the redistributed meshes. Qualified
+    // with regIOobject:: because objectRegistry's checkIn/checkOut
+    // overloads hide the self-registration ones.
     forAll(clones, i)
     {
         lives[i].regIOobject::checkOut();
@@ -4115,16 +3750,11 @@ static bool dmrRestitchClones
 }
 
 
-// The grow hook runs between createTime and createMesh, before the
-// solver is selected, and the conditions the checkpoint fields carry
-// live in the solver modules' link dependencies (coupledTemperature in
-// the thermophysical transport library the fluid module links). Without
-// them a coupled condition reads as genericFvPatchField, which carries
-// its entries blindly and can be neither resized nor filled by type
-// (engine grow, 2026-09-10: "size of field refValue (76) is not the same
-// size as the patch (0)" from genericFvPatchField). Load what solver::New
-// will load, from the same controlDict entries foamMultiRun and foamRun
-// read.
+// The grow hook runs before the solver is selected, so the libraries
+// that define the fields' boundary conditions (e.g. coupledTemperature)
+// are not loaded yet, and those conditions would be read as generic
+// patch fields that cannot be resized. Load what solver::New will load,
+// from the same controlDict entries foamRun and foamMultiRun read.
 static void dmrLoadSolverLibraries(const Time& runTime)
 {
     const dictionary& controlDict = runTime.controlDict();
@@ -4165,15 +3795,13 @@ static void dmrRestoreRegistry(UPtrList<fvMesh>& lives, PtrList<fvMesh>& clones)
 }
 
 
-// SHRINK on the OLD group:
-// 1. Flush the live solver state to processor*/timeName/ (writeNow), with
-//    the fields deferred to the redistribute.
-// 2. Update decomposeParDict for the new world size + scotch.
-// 3. Redistribute every live region into a clone (in memory, never off
-//    disk), re-stitch the clones together on the new layout when the case
-//    has non-conformal couplings, write them.
-// 4. Sweep processor{N_new..N_old-1}/ - those are empty after the
-//    redistribute and the NEW group will only look at 0..N_new-1.
+// Shrink, on the old group:
+// 1. Checkpoint everything but the fields (writeNow).
+// 2. Set decomposeParDict for the new world size.
+// 3. Redistribute every live region into a clone in memory, re-stitch
+//    the clones on the new layout if the case has non-conformal
+//    couplings, and write them. Then the swap meshes.
+// 4. Remove processor{N_new..N_old-1}, which the new group never reads.
 static void dmrShrinkInPlace
 (
     Time& runTime,
@@ -4185,11 +3813,7 @@ static void dmrShrinkInPlace
     const std::string casePath = runTime.globalPath();
     const std::string timeName = runTime.name();
 
-    // Snapshot the live region names BEFORE anything writes or
-    // redistributes. Each dmrRunFreshRedistribute builds a
-    // non-registered fvMesh that never enters the registry, so taking
-    // the live mesh table once up front avoids any
-    // iterator-vs-mutation hazard.
+    // Live region names, taken once before anything changes the registry
     wordList regionNames;
     {
         HashTable<fvMesh*> liveRegions(runTime.lookupClass<fvMesh>());
@@ -4201,10 +3825,8 @@ static void dmrShrinkInPlace
         }
     }
 
-    // The redistribute sources the fields from memory and rewrites every
-    // one of them in the new layout, so writing them here in the old
-    // layout first is redundant I/O; keep the rest of the checkpoint
-    // (uniform/time above all).
+    // Checkpoint without the fields, which the redistribution writes in
+    // the new layout (see dmrDemoteCheckpointFields)
     DynamicList<regIOobject*> demoted;
     forAll(regionNames, i)
     {
@@ -4245,7 +3867,6 @@ static void dmrShrinkInPlace
           + std::to_string(demoted.size()) + " field(s) deferred to the"
             " redistribute)"
         );
-        dmrWriteWorldMeta(casePath, world);
         dmrLifecycleLog
         (
             casePath,
@@ -4274,12 +3895,8 @@ static void dmrShrinkInPlace
 
     const double redistStart = MPI_Wtime();
 
-    // The live meshes are still resident on this (dying) group, so each
-    // region's checkpoint is reproduced in memory rather than read back
-    // off disk. Every region is redistributed into a clone and the clones
-    // are kept together until all are written: non-conformal couplings
-    // between regions are re-stitched across the NEW layout before the
-    // write, and that needs all of them at once.
+    // Every region into a clone from memory; all clones are kept until
+    // written, since the re-stitch needs all regions at once
     UPtrList<fvMesh> lives(regionNames.size());
     forAll(regionNames, i)
     {
@@ -4316,20 +3933,15 @@ static void dmrShrinkInPlace
 
     const double redistEnd = MPI_Wtime();
 
-    // Sweep the old-layout caches BEFORE the swap-mesh transport: if
-    // the latter fails, the relaunched generation must never read a
-    // stale mixed-layout stitcher cache (engine, 2026-07-13). The map
-    // the destination re-stitch just wrote at this time is for the new
-    // layout and is what the restart must load, so it is kept.
+    // Old-layout caches go before the swap meshes, so a relaunch after a
+    // failure there never reads them. The map just written is kept.
     dmrSweepStitchCaches(runTime, timeName, regionNames, restitched);
 
-    // The swap meshes, while every rank the reconfiguration is about to
-    // retire still holds its own directory: the step is collective and
-    // each rank clears its stale pieces in it.
+    // Before the retired ranks' directories go: the step is collective
+    // and each rank clears its own stale pieces
     dmrRedistributeSwapMeshes(runTime, world.nNew);
 
-    // Delete the processor dirs beyond the new world size: the new group
-    // only reads 0..nNew-1 and nothing written there is needed again.
+    // The new group only reads processor0..nNew-1
     MPI_Barrier(MPI_COMM_WORLD);
     if (Pstream::master())
     {
@@ -4341,15 +3953,19 @@ static void dmrShrinkInPlace
     }
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // This checkpoint is now the restart state; older ones are dead
-    // weight, whatever layout the natural writes are landing in
+    // This is now the restart state
     if (dmrPurgeCheckpointsEnabled())
     {
         dmrPurgeSupersededCheckpoints(runTime, timeName);
     }
 
+    // Every rank is done; only now may the next group start from this
+    MPI_Barrier(MPI_COMM_WORLD);
+
     if (Pstream::master())
     {
+        dmrWriteWorldMeta(casePath, world);
+
         char elapsed[32];
         std::snprintf(elapsed, sizeof(elapsed), "%.3f", redistEnd - redistStart);
 
@@ -4370,18 +3986,24 @@ static void dmrShrinkInPlace
 
 void dmrCheckpoint(Time& runTime, bool allRegions)
 {
-    // Everything below is followed by dmr_reconfigure(), which tears this
-    // process group down. Any asynchronous writer still running would be
-    // killed mid-file, leaving an output time with no .complete marker.
-    // Reaped on the way OUT, so this rank's own checkpoint and
-    // redistribute overlap the writers rather than serialising with them:
-    // there is no data dependency, they are finishing a PREVIOUS output
-    // time while this handles the current reconfiguration. A scope guard,
-    // so it also covers the early returns below and any added later.
+    // dmr_reconfigure follows and ends this process group, so running
+    // asynchronous writers are reaped on the way out (a scope guard, for
+    // every return path). Not on the way in: they write an earlier time
+    // and can overlap this work.
     struct WriterJoin
     {
         ~WriterJoin() { dmrWaitForWriters(); }
     } writerJoin;
+
+    // The world meta is the next group's proof that this reconfiguration
+    // completed: it is written only once the data is in place, so any
+    // meta from an earlier reconfiguration goes first. A group launched
+    // after this one fails then finds none and stops (dmrRestart) instead
+    // of running on a partial layout.
+    if (Pstream::master())
+    {
+        Foam::rm(runTime.globalPath()/"log.dmr"/".world.meta");
+    }
 
     DmrWorldInfo world;
     const bool worldOk = dmrQueryWorldInfo(world);
@@ -4395,9 +4017,8 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
 
     if (worldOk && world.dir == DmrDir::Grow)
     {
-        // The NEW group has the max(N_old, N_new) ranks, so the data
-        // move happens there (dmrGrowRedistribute, hooked after
-        // createTime). The dying group only flushes its state.
+        // The new group has the max(N_old, N_new) ranks, so the data moves
+        // there (dmrGrowRedistribute). This group only checkpoints.
         runTime.writeNow();
         MPI_Barrier(MPI_COMM_WORLD);
 
@@ -4427,15 +4048,10 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
         return;
     }
 
-    // Unknown direction. Nothing correct is left to do: the redistribute
-    // has to know which way the world is changing, and a checkpoint
-    // written for the wrong target does not match the group that will
-    // read it. Flush what we have, say why, and stop.
-    //
-    // dmr_get_analytics() reports only the LATEST event, and the CE
-    // policy emits DMR_EVENT_TALP_CHECK_CE_ACC after the
-    // start-of-reconfiguration event dmrQueryWorldInfo switches on. That
-    // is the known way to arrive here.
+    // Unknown direction: there is no correct target layout, so checkpoint
+    // and stop. Known cause: dmr_get_analytics() reports only the latest
+    // event, and the CE policy can overwrite the start-of-reconfiguration
+    // event with DMR_EVENT_TALP_CHECK_CE_ACC.
     runTime.writeNow();
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -4473,13 +4089,10 @@ void dmrCheckpoint(Time& runTime, bool allRegions)
 
 void dmrRestart(const std::string& casePath, bool allRegions)
 {
-    // Read direction + N_old written by the OLD group at checkpoint.
-    // Collective; broadcasts to every rank.
+    // Direction and sizes written by the old group. Collective.
     DmrWorldInfo world;
     const bool worldOk = dmrReadWorldMeta(casePath, world);
 
-    // Subprocesses spawned here run in isolated MPI environments, so
-    // there is no interaction with DMR_INTERCOMM.
     int newSize, myRank;
     MPI_Comm_size(MPI_COMM_WORLD, &newSize);
     MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
@@ -4519,7 +4132,8 @@ void dmrRestart(const std::string& casePath, bool allRegions)
             dmrLifecycleLog
             (
                 casePath,
-                "Restart: no .world.meta (first run or stale)."
+                "Restart: no .world.meta, so the previous group did not"
+                " complete its reconfiguration."
             );
         }
 
@@ -4529,17 +4143,15 @@ void dmrRestart(const std::string& casePath, bool allRegions)
             "numberOfSubdomains", std::to_string(newSize)
         );
 
-        // Force scotch: geometric decomposers (hierarchical, simple)
-        // require n-coefficients that no longer hold once DMR has
-        // changed the process count.
+        // Geometric decomposers need coefficients that no longer hold
+        // once the process count changes
         dmrUpdateDictEntry
         (
             casePath, "system/decomposeParDict",
             "decomposer", "scotch"
         );
 
-        // NewDistributor (used by the in-process redistributes) reads
-        // its own 'distributor' key, separate from 'decomposer'.
+        // NewDistributor reads its own key
         dmrUpdateDictEntry
         (
             casePath, "system/decomposeParDict",
@@ -4552,15 +4164,12 @@ void dmrRestart(const std::string& casePath, bool allRegions)
             "startFrom", "latestTime"
         );
 
-        // TODO multi-region: per-region system/<region>/decomposeParDict
-        // and controlDict overrides are not handled. The root dicts
-        // suffice for the -allRegions cases tested so far.
+        // TODO: per-region system/<region>/decomposeParDict overrides are
+        // not handled
 
         if (worldOk && world.dir == DmrDir::Shrink)
         {
-            // OLD group has already written processor0..N_new-1/ via
-            // fvMeshDistribute. decomposePar would overwrite that from
-            // the stale serial dirs.
+            // The old group already wrote processor0..N_new-1
             dmrLifecycleLog
             (
                 casePath,
@@ -4578,32 +4187,30 @@ void dmrRestart(const std::string& casePath, bool allRegions)
         }
         else
         {
-            // Both directions place the data themselves. There is no
-            // third way to obtain it: only the direction says which group
-            // holds it and which layout it is in.
+            // No meta: the old group failed before finishing, so the data
+            // on disk may be in neither layout (see dmrCheckpoint)
             dmrLifecycleLog
             (
                 casePath,
-                "FATAL: reconfiguration direction unknown at restart"
-                " (no world meta from the old group)."
+                "FATAL: the previous reconfiguration did not complete;"
+                " not starting on a partial layout."
             );
 
             std::fprintf
             (
                 stderr,
-                "DMR: FATAL - reconfiguration direction unknown at"
-                " restart; refusing to guess the layout of '%s'.\n",
+                "DMR: FATAL - the previous reconfiguration did not"
+                " complete; not starting on a partial layout of '%s'."
+                " See the previous group's error above.\n",
                 casePath.c_str()
             );
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
     }
 
-    // GROW pre-step, collective: ranks beyond the old world have no
-    // processor directory yet, and Time::setControls FATALs unless
-    // every rank resolves the same startFrom-latestTime instant. Each
-    // new rank stages its processor dir with an EMPTY restart-time
-    // dir; mesh and fields arrive later via dmrGrowRedistribute.
+    // Grow: every rank must resolve the same latestTime, so each new rank
+    // gets an empty restart-time directory; mesh and fields arrive in
+    // dmrGrowRedistribute.
     if (worldOk && world.dir == DmrDir::Grow)
     {
         const std::string t = dmrLatestProcTimeName(casePath);
@@ -4638,21 +4245,14 @@ void dmrRestart(const std::string& casePath, bool allRegions)
 
 void dmrFinalize(const std::string& casePath, bool /*allRegions*/)
 {
-    // End of run: the asynchronous writers must finish before this
-    // process group exits, or the last output time is left half written.
+    // The last output time must not be left half written
     dmrWaitForWriters();
 
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // Nothing to do. The run's output is already written in the uniform
-    // MIN layout by the natural-write path, so it is directly readable as
-    // a decomposed case: there is nothing to reconstruct. The serial
-    // reconstructPar that used to run here was removed deliberately — it
-    // is a rank-0 gather, exactly the bottleneck this pipeline exists to
-    // eliminate, and its -rm plus the processor-directory cleanup that
-    // followed it would delete the very series that was produced.
-    // Superseded DMR-forced checkpoints are already dropped as they are
-    // superseded (dmrPurgeSupersededCheckpoints), so nothing accumulates.
+    // The output is already in the MIN layout, readable as a decomposed
+    // case, so there is nothing to reconstruct (a serial reconstructPar
+    // here would be the rank-0 gather this design avoids)
     if (Pstream::master())
     {
         dmrLifecycleLog
